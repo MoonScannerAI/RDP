@@ -297,7 +297,11 @@ mod tests {
 
     #[test]
     fn pipeline_config_follows_settings() {
-        let c = HostConfig { target_fps: 30, bitrate_kbps: 4_000, ..Default::default() };
+        let c = HostConfig {
+            target_fps: 30,
+            bitrate_kbps: 4_000,
+            ..Default::default()
+        };
         let p = c.pipeline();
         assert_eq!(p.target_fps, 30);
         assert_eq!(p.bitrate_kbps, 4_000);

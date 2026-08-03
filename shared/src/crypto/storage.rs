@@ -87,7 +87,10 @@ fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > 64 {
         return Err(Error::Invalid("storage key length".into()));
     }
-    if !key.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
         return Err(Error::Invalid("storage key must be [a-z0-9_]".into()));
     }
     Ok(())
@@ -108,11 +111,11 @@ fn entropy_for(key: &str) -> Vec<u8> {
 
 #[cfg(windows)]
 mod dpapi {
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
-    use windows::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CryptProtectData, CryptUnprotectData,
-    };
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
+    };
 
     use crate::error::{Error, Result};
 
@@ -122,7 +125,10 @@ mod dpapi {
     /// constness here is sound; the blob lives only for the duration of the
     /// call and borrows `data`.
     fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
-        CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 }
+        CRYPT_INTEGER_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        }
     }
 
     /// Copy an output blob into a `Vec` and release the DPAPI allocation.
@@ -149,7 +155,9 @@ mod dpapi {
     /// Encrypt `plaintext` with DPAPI.
     pub fn protect(plaintext: &[u8], entropy: &[u8], flags: u32) -> Result<Vec<u8>> {
         if plaintext.is_empty() {
-            return Err(Error::Invalid("dpapi: refusing to protect empty data".into()));
+            return Err(Error::Invalid(
+                "dpapi: refusing to protect empty data".into(),
+            ));
         }
         let input = blob(plaintext);
         let ent = blob(entropy);
@@ -157,8 +165,16 @@ mod dpapi {
         // SAFETY: `input`/`ent` point at live slices for the duration of the
         // call; `out` is a valid writable blob we take ownership of below.
         unsafe {
-            CryptProtectData(&input, PCWSTR::null(), Some(&ent), None, None, flags, &mut out)
-                .map_err(|e| Error::Crypto(format!("CryptProtectData failed: {e}")))?;
+            CryptProtectData(
+                &input,
+                PCWSTR::null(),
+                Some(&ent),
+                None,
+                None,
+                flags,
+                &mut out,
+            )
+            .map_err(|e| Error::Crypto(format!("CryptProtectData failed: {e}")))?;
             Ok(take_blob(&mut out))
         }
     }
@@ -202,7 +218,11 @@ pub fn protect(plaintext: &[u8], scope: DpapiScope, key: &str) -> Result<Vec<u8>
 /// Decrypt a DPAPI blob produced by [`protect`] with the same scope and key.
 pub fn unprotect(ciphertext: &[u8], scope: DpapiScope, key: &str) -> Result<Secret<Vec<u8>>> {
     validate_key(key)?;
-    Ok(Secret::new(dpapi::unprotect(ciphertext, &entropy_for(key), scope.flags())?))
+    Ok(Secret::new(dpapi::unprotect(
+        ciphertext,
+        &entropy_for(key),
+        scope.flags(),
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +247,10 @@ impl DpapiFileStore {
     pub fn host() -> Result<Self> {
         let base = std::env::var_os("ProgramData")
             .ok_or_else(|| Error::Crypto("ProgramData is not set".into()))?;
-        Ok(Self::new(Path::new(&base).join(APP_DIR), DpapiScope::Machine))
+        Ok(Self::new(
+            Path::new(&base).join(APP_DIR),
+            DpapiScope::Machine,
+        ))
     }
 
     /// Store for client secrets: `%APPDATA%\DirectDesk`, user scope.
@@ -240,7 +263,10 @@ impl DpapiFileStore {
     /// Store rooted at an explicit directory. Used by tests and by the service
     /// when a data directory is configured.
     pub fn new(dir: impl Into<PathBuf>, scope: DpapiScope) -> Self {
-        Self { dir: dir.into(), scope }
+        Self {
+            dir: dir.into(),
+            scope,
+        }
     }
 
     /// The directory this store writes into.
@@ -371,7 +397,11 @@ impl SecretStore for MemoryStore {
 
     fn write(&self, key: &str, plaintext: &[u8]) -> Result<()> {
         validate_key(key)?;
-        if let Some(old) = self.items.lock().insert(key.to_string(), plaintext.to_vec()) {
+        if let Some(old) = self
+            .items
+            .lock()
+            .insert(key.to_string(), plaintext.to_vec())
+        {
             let mut old = old;
             old.zeroize();
         }
@@ -425,7 +455,10 @@ mod tests {
         assert_eq!(s.len(), 1);
 
         s.write("k", b"replaced").unwrap();
-        assert_eq!(s.read("k").unwrap().unwrap().expose().as_slice(), b"replaced");
+        assert_eq!(
+            s.read("k").unwrap().unwrap().expose().as_slice(),
+            b"replaced"
+        );
         assert_eq!(s.len(), 1);
 
         s.delete("k").unwrap();
@@ -436,7 +469,8 @@ mod tests {
     #[test]
     fn memory_store_debug_redacts_values() {
         let s = MemoryStore::new();
-        s.write("host_identity", b"super-secret-key-material").unwrap();
+        s.write("host_identity", b"super-secret-key-material")
+            .unwrap();
         let d = format!("{s:?}");
         assert!(d.contains("host_identity"), "{d}");
         assert!(d.contains("REDACTED"), "{d}");
@@ -508,10 +542,26 @@ mod tests {
         assert!(store.read("host_identity").unwrap().is_none());
         store.write("host_identity", b"payload-1").unwrap();
         assert!(store.exists("host_identity").unwrap());
-        assert_eq!(store.read("host_identity").unwrap().unwrap().expose().as_slice(), b"payload-1");
+        assert_eq!(
+            store
+                .read("host_identity")
+                .unwrap()
+                .unwrap()
+                .expose()
+                .as_slice(),
+            b"payload-1"
+        );
 
         store.write("host_identity", b"payload-2").unwrap();
-        assert_eq!(store.read("host_identity").unwrap().unwrap().expose().as_slice(), b"payload-2");
+        assert_eq!(
+            store
+                .read("host_identity")
+                .unwrap()
+                .unwrap()
+                .expose()
+                .as_slice(),
+            b"payload-2"
+        );
 
         // The bytes on disk are not the plaintext.
         let raw = std::fs::read(dir.join("host_identity.dpapi")).unwrap();

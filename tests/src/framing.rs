@@ -279,7 +279,9 @@ pub fn decode_frame_record(bytes: &[u8]) -> Result<EncodedFrame> {
     let frame_id = u32::from_le_bytes(bytes[0..4].try_into().expect("checked"));
     let flags = bytes[4];
     if flags & !1 != 0 {
-        return Err(Error::Invalid(format!("unknown frame record flags {flags:#x}")));
+        return Err(Error::Invalid(format!(
+            "unknown frame record flags {flags:#x}"
+        )));
     }
     let timestamp_ms = u32::from_le_bytes(bytes[5..9].try_into().expect("checked"));
     Ok(EncodedFrame {

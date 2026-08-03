@@ -10,11 +10,13 @@
 //! * [`renderer`]     — latest-wins frame slot + letterboxed egui presentation.
 //! * [`input_capture`]— low-level keyboard hook, release chord, pointer mapping.
 //! * [`session`]      — the channel seam between UI and transport.
+//! * [`connect`]      — supervisor that spawns/cancels the transport driver.
 //! * [`pipeline`]     — background decode / loopback-demo frame sources.
 //! * [`ui`]           — the eframe application shell.
 //! * [`config`]       — `%APPDATA%\DirectDesk\client.json` (no secrets).
 
 pub mod config;
+pub mod connect;
 pub mod decoder;
 pub mod input_capture;
 pub mod net;

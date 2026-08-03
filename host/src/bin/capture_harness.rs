@@ -273,7 +273,11 @@ fn pipeline(shared: &Arc<Shared>) -> anyhow::Result<()> {
         } else {
             "CPU BT.709".into()
         };
-        hud.encoder_input = if gpu_texture_input { "GPU texture".into() } else { "CPU NV12".into() };
+        hud.encoder_input = if gpu_texture_input {
+            "GPU texture".into()
+        } else {
+            "CPU NV12".into()
+        };
         hud.width = w;
         hud.height = h;
         hud.state = "running".into();
@@ -290,7 +294,8 @@ fn pipeline(shared: &Arc<Shared>) -> anyhow::Result<()> {
 
     let mut win = Window::default();
     let mut seq = 0u64;
-    let (mut tot_cap, mut tot_enc, mut tot_dec, mut tot_key, mut tot_bytes) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut tot_cap, mut tot_enc, mut tot_dec, mut tot_key, mut tot_bytes) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
 
     while !shared.stop.load(Ordering::Relaxed) {
         if shared.want_key.swap(false, Ordering::Relaxed) {
@@ -428,7 +433,12 @@ fn pipeline(shared: &Arc<Shared>) -> anyhow::Result<()> {
                 }
 
                 seq += 1;
-                *shared.frame.lock() = Some(Presented { rgba: rgba.clone(), w: pw, h: ph, seq });
+                *shared.frame.lock() = Some(Presented {
+                    rgba: rgba.clone(),
+                    w: pw,
+                    h: ph,
+                    seq,
+                });
                 let mut hud = shared.hud.lock();
                 hud.dec_width = pic.width;
                 hud.dec_height = pic.height;
@@ -715,7 +725,11 @@ impl eframe::App for HarnessApp {
                 ui.strong("ms:");
                 ui.label(format!(
                     "capture {:.2} | convert {:.2} | encode {:.2} | decode {:.2} | present {:.2}",
-                    hud.ms_capture, hud.ms_convert, hud.ms_encode, hud.ms_decode, hud.ms_present_prep
+                    hud.ms_capture,
+                    hud.ms_convert,
+                    hud.ms_encode,
+                    hud.ms_decode,
+                    hud.ms_present_prep
                 ));
             });
             ui.horizontal_wrapped(|ui| {

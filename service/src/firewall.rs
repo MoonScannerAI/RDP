@@ -88,13 +88,20 @@ pub struct WindowsFirewall {
 impl WindowsFirewall {
     /// Manage the production `DirectDesk` group for `host_exe`.
     pub fn new(host_exe: PathBuf) -> Self {
-        Self { group: RULE_GROUP.to_string(), host_exe, default_profiles: Profiles::default() }
+        Self {
+            group: RULE_GROUP.to_string(),
+            host_exe,
+            default_profiles: Profiles::default(),
+        }
     }
 
     /// Create the DirectDesk inbound rules, replacing any existing rules in the
     /// group so the result is exactly what this version defines (idempotent).
     pub fn ensure_rules(&self, profiles: Profiles) -> anyhow::Result<()> {
-        anyhow::ensure!(profiles.bits() != 0, "at least one firewall profile must be selected");
+        anyhow::ensure!(
+            profiles.bits() != 0,
+            "at least one firewall profile must be selected"
+        );
         let _com = ComGuard::mta()?;
         let rules = self.rules()?;
 
@@ -156,8 +163,14 @@ impl WindowsFirewall {
 
     fn rules(&self) -> anyhow::Result<INetFwRules> {
         // SAFETY: standard in-proc COM activation on a thread with an apartment.
-        let policy: INetFwPolicy2 = unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }
-            .map_err(|e| anyhow::anyhow!("could not create INetFwPolicy2 ({e}) — is the Windows Firewall service running?"))?;
+        let policy: INetFwPolicy2 =
+            unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }.map_err(
+                |e| {
+                    anyhow::anyhow!(
+                "could not create INetFwPolicy2 ({e}) — is the Windows Firewall service running?"
+            )
+                },
+            )?;
         // SAFETY: `policy` is a live interface pointer.
         let rules = unsafe { policy.Rules() }
             .map_err(|e| anyhow::anyhow!("could not open the firewall rule collection: {e}"))?;
@@ -170,7 +183,11 @@ impl WindowsFirewall {
 #[cfg(test)]
 impl WindowsFirewall {
     pub fn with_group(group: impl Into<String>, host_exe: PathBuf) -> Self {
-        Self { group: group.into(), host_exe, default_profiles: Profiles::default() }
+        Self {
+            group: group.into(),
+            host_exe,
+            default_profiles: Profiles::default(),
+        }
     }
 
     pub fn group(&self) -> &str {
@@ -245,7 +262,9 @@ fn remove_group(rules: &INetFwRules, group: &str) -> anyhow::Result<usize> {
         match unsafe { rules.Remove(&BSTR::from(name.as_str())) } {
             Ok(()) => removed += 1,
             Err(e) => {
-                return Err(anyhow::anyhow!("could not remove firewall rule {name:?}: {e}"));
+                return Err(anyhow::anyhow!(
+                    "could not remove firewall rule {name:?}: {e}"
+                ));
             }
         }
     }
@@ -359,7 +378,9 @@ mod tests {
 
     #[test]
     fn rule_metadata_is_scoped_and_honest() {
-        let fw = WindowsFirewall::new(PathBuf::from(r"C:\Program Files\DirectDesk\DirectDeskHost.exe"));
+        let fw = WindowsFirewall::new(PathBuf::from(
+            r"C:\Program Files\DirectDesk\DirectDeskHost.exe",
+        ));
         assert_eq!(fw.group(), "DirectDesk");
         assert_eq!(fw.host_exe().file_name().unwrap(), "DirectDeskHost.exe");
         assert!(RULE_NAME_UDP.contains("UDP"));
@@ -377,7 +398,10 @@ mod tests {
         let fw = test_fw();
         match fw.group_rule_names() {
             Ok(names) => {
-                eprintln!("[firewall] enumerated OK; {TEST_GROUP} currently has {} rules", names.len());
+                eprintln!(
+                    "[firewall] enumerated OK; {TEST_GROUP} currently has {} rules",
+                    names.len()
+                );
             }
             Err(e) => {
                 eprintln!("[firewall] SKIPPED (COM/firewall not reachable in this context): {e}");
@@ -400,8 +424,14 @@ mod tests {
         match fw.ensure_rules(Profiles::PRIVATE) {
             Ok(()) => {
                 let names = fw.group_rule_names().expect("query after create");
-                assert!(names.iter().any(|n| n == RULE_NAME_UDP), "UDP rule missing: {names:?}");
-                assert!(names.iter().any(|n| n == RULE_NAME_TCP), "TCP rule missing: {names:?}");
+                assert!(
+                    names.iter().any(|n| n == RULE_NAME_UDP),
+                    "UDP rule missing: {names:?}"
+                );
+                assert!(
+                    names.iter().any(|n| n == RULE_NAME_TCP),
+                    "TCP rule missing: {names:?}"
+                );
                 assert!(fw.rules_present_checked().unwrap());
 
                 // Idempotent: running it again leaves exactly two rules.

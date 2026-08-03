@@ -34,11 +34,15 @@
 //! allocates a single byte of body. See [`channel_limit`].
 //!
 //! Control and input bodies are exactly what [`crate::protocol::encode_framed`]
-//! produces. Video bodies are a small postcard [`MediaHeader`] followed by the
-//! raw encoded bytes — TCP is reliable and ordered, so the QUIC path's
-//! fragmentation and reassembly are pure overhead here, but the frame's
-//! identity (`frame_id`, `keyframe`, `timestamp_ms`) still has to survive, and
-//! the decoder still needs it.
+//! produces. A video frame is split into **segments** of at most [`SEGMENT_MAX`]
+//! bytes, each carried as its own Media-channel message: a small postcard
+//! [`MediaHeader`] (frame identity plus `segment_index` / `segment_count` /
+//! `last`) followed by that slice of the encoded bytes. TCP is reliable and
+//! ordered, so — unlike the QUIC path's out-of-order fragment reassembly — the
+//! segments of a frame always arrive contiguous and in index order; the receiver
+//! ([`MediaReassembler`]) only has to concatenate them and guard against a frame
+//! that was abandoned mid-flight. The reason to segment at all is *not*
+//! reliability, it is priority — see below.
 //!
 //! # Priority: the whole point of this module
 //!
@@ -60,12 +64,16 @@
 //!    rate-limited exactly like [`crate::transport::reassembly`] rate-limits its
 //!    keyframe requests.
 //!
-//! **The one honest limit.** Priority is applied at message boundaries. A video
-//! frame already being written cannot be preempted mid-message without
-//! corrupting the stream, so an input event can be delayed by at most *one*
-//! in-flight frame — never by the queue behind it, which is the difference
-//! between tens of milliseconds and seconds. The loopback test
-//! `input_beats_the_queued_video_backlog` pins that behaviour down.
+//! **The one honest limit.** Priority is applied at message boundaries, and a
+//! message is now a single *segment*, not a whole frame. [`writer_loop`] drains
+//! control and input before **every** segment, so an input event can be delayed
+//! by at most *one* in-flight segment ([`SEGMENT_MAX`], ~64 KiB) — never by the
+//! rest of a 2 MiB keyframe, and never by the queue behind it. That is the
+//! difference between a few milliseconds and, on a slow uplink, hundreds. The
+//! loopback tests `input_beats_the_queued_video_backlog` and
+//! `input_interleaves_within_a_multi_segment_frame` pin that behaviour down,
+//! measuring the delivery order to prove input rides out ahead of the bulk of a
+//! frame that is already being transmitted.
 //!
 //! # Keepalive
 //!
@@ -83,8 +91,8 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -92,21 +100,21 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::crypto::identity::TlsIdentity;
 use crate::crypto::tls::{self, ServerPinning};
-use crate::crypto::{EXPORTER_CONTEXT, EXPORTER_LABEL, Exporter, SpkiHash};
+use crate::crypto::{Exporter, SpkiHash, EXPORTER_CONTEXT, EXPORTER_LABEL};
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ALPN, Channel, ControlMsg, InputMsg, MAX_AUTH_MSG, MAX_CONTROL_MSG, decode_strict,
-    encode_framed, parse_frame_len,
+    decode_strict, encode_framed, parse_frame_len, Channel, ControlMsg, InputMsg, ALPN,
+    MAX_AUTH_MSG, MAX_CONTROL_MSG,
 };
 use crate::stats::{ConnStats, TransportRoute};
 use crate::transport::session::{
-    Session, SessionConfig, SessionEvent, SessionReceivers, ewma_jitter,
+    ewma_jitter, Session, SessionConfig, SessionEvent, SessionReceivers,
 };
 use crate::transport::{channel_tag, parse_channel_tag};
 use crate::video::{EncodedFrame, MAX_FRAME_BYTES};
@@ -115,7 +123,24 @@ use crate::video::{EncodedFrame, MAX_FRAME_BYTES};
 pub const FRAME_HEADER_LEN: usize = 5;
 
 /// Cap on a media message body: a whole encoded frame plus its small header.
+///
+/// A single segment is far smaller than this ([`SEGMENT_MAX`] plus a header), but
+/// the cap stays frame-sized so the reader's pre-allocation guard tolerates a
+/// peer that legitimately sends a large single-segment frame, and so
+/// [`channel_limit`] keeps its "a `Ping` must never make us allocate a video
+/// buffer" invariant. Per-frame byte accounting is enforced during reassembly.
 pub const MAX_MEDIA_MSG: usize = MAX_FRAME_BYTES + 64;
+
+/// Largest payload a single media segment carries.
+///
+/// Sized to [`MAX_CONTROL_MSG`] (64 KiB) deliberately: a video segment is then
+/// never larger than the largest control or input message, so an input event
+/// queued while a frame is mid-flight waits behind at most one segment on the
+/// wire — tens of KiB, a few milliseconds even on a constrained uplink — instead
+/// of a whole 2 MiB keyframe. It is small enough that the writer revisits the
+/// control/input queues often, and large enough that the per-segment header
+/// (~18 bytes postcard) and TLS record framing stay well under 0.1% overhead.
+pub const SEGMENT_MAX: usize = MAX_CONTROL_MSG;
 
 /// TCP connect + TLS handshake timeout.
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
@@ -166,10 +191,14 @@ impl TcpParams {
     /// Reject configurations that would stall or spin.
     pub fn validate(&self) -> Result<()> {
         if self.connect_timeout_ms == 0 {
-            return Err(Error::Invalid("tcp connect timeout must be non-zero".into()));
+            return Err(Error::Invalid(
+                "tcp connect timeout must be non-zero".into(),
+            ));
         }
         if self.video_queue_depth == 0 {
-            return Err(Error::Invalid("tcp video queue depth must be non-zero".into()));
+            return Err(Error::Invalid(
+                "tcp video queue depth must be non-zero".into(),
+            ));
         }
         Ok(())
     }
@@ -189,7 +218,11 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_attempts: 5, initial_backoff_ms: 250, max_backoff_ms: 4_000 }
+        Self {
+            max_attempts: 5,
+            initial_backoff_ms: 250,
+            max_backoff_ms: 4_000,
+        }
     }
 }
 
@@ -200,7 +233,9 @@ impl RetryPolicy {
             return 0;
         }
         let shift = (attempt - 2).min(31);
-        self.initial_backoff_ms.saturating_mul(1u64 << shift).min(self.max_backoff_ms)
+        self.initial_backoff_ms
+            .saturating_mul(1u64 << shift)
+            .min(self.max_backoff_ms)
     }
 }
 
@@ -208,11 +243,16 @@ impl RetryPolicy {
 // Wire format
 // ---------------------------------------------------------------------------
 
-/// The metadata that rides in front of a video frame's bytes.
+/// The metadata that rides in front of one *segment* of a video frame.
 ///
-/// Postcard-encoded and varint-packed, so it costs 3–7 bytes in practice. The
-/// body is `MediaHeader || frame bytes`; the decoder recovers the split from
-/// postcard's own framing, not from a fixed offset.
+/// Postcard-encoded and varint-packed, so it costs a handful of bytes in
+/// practice. The body is `MediaHeader || segment bytes`; the decoder recovers
+/// the split from postcard's own framing, not from a fixed offset. Every segment
+/// of a frame repeats the frame's identity (`frame_id`, `keyframe`,
+/// `timestamp_ms`) so a receiver can detect a segment that contradicts the frame
+/// it is assembling, and carries its position (`segment_index` of
+/// `segment_count`, plus a redundant `last` flag) so reassembly needs no
+/// look-ahead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaHeader {
     /// Sender's frame counter. Wraps.
@@ -221,6 +261,14 @@ pub struct MediaHeader {
     pub keyframe: bool,
     /// Sender-monotonic capture timestamp in milliseconds. Wraps.
     pub timestamp_ms: u32,
+    /// 0-based position of this segment within the frame.
+    pub segment_index: u16,
+    /// Total number of segments the frame was split into. Always `>= 1`.
+    pub segment_count: u16,
+    /// True on the final segment, i.e. `segment_index + 1 == segment_count`.
+    /// Redundant with the two counts, and cross-checked against them, but it lets
+    /// the reader recognise completion without arithmetic on hostile input.
+    pub last: bool,
 }
 
 /// The pre-allocation length cap for a channel.
@@ -239,7 +287,9 @@ pub fn channel_limit(channel: Channel) -> usize {
 /// Encode a control-plane or input message as a tagged, length-prefixed frame.
 pub fn encode_tagged<T: Serialize>(channel: Channel, msg: &T) -> Result<Vec<u8>> {
     if matches!(channel, Channel::Media) {
-        return Err(Error::Invalid("use encode_media for the media channel".into()));
+        return Err(Error::Invalid(
+            "use encode_media for the media channel".into(),
+        ));
     }
     let framed = encode_framed(msg)?;
     let mut out = Vec::with_capacity(1 + framed.len());
@@ -248,50 +298,279 @@ pub fn encode_tagged<T: Serialize>(channel: Channel, msg: &T) -> Result<Vec<u8>>
     Ok(out)
 }
 
-/// Encode one [`EncodedFrame`] as a single tagged, length-prefixed frame.
+/// Encode one [`EncodedFrame`] as an ordered list of tagged, length-prefixed
+/// Media-channel messages — one per [`SEGMENT_MAX`]-byte segment.
 ///
-/// No fragmentation: TCP already delivers a byte stream in order, so splitting
-/// a frame would only add header overhead and a reassembly step that can never
-/// fail.
-pub fn encode_media(frame: &EncodedFrame) -> Result<Vec<u8>> {
+/// Each returned buffer is a complete wire message (`tag || len || MediaHeader ||
+/// segment bytes`). Emitting them as *separate* messages is the whole point: the
+/// writer yields to the control and input queues between segments, so a large
+/// frame can never head-of-line-block an input event by more than one segment.
+/// A single-segment frame produces a one-element list, so small frames pay no
+/// segmentation cost beyond a two-field-larger header.
+pub fn encode_media_segments(frame: &EncodedFrame) -> Result<Vec<Vec<u8>>> {
     if frame.data.is_empty() {
         return Err(Error::Invalid("empty frame".into()));
     }
     if frame.data.len() > MAX_FRAME_BYTES {
-        return Err(Error::Oversized { got: frame.data.len(), limit: MAX_FRAME_BYTES });
+        return Err(Error::Oversized {
+            got: frame.data.len(),
+            limit: MAX_FRAME_BYTES,
+        });
     }
-    let header = postcard::to_stdvec(&MediaHeader {
-        frame_id: frame.frame_id,
-        keyframe: frame.keyframe,
-        timestamp_ms: frame.timestamp_ms,
-    })?;
-    let body_len = header.len() + frame.data.len();
-    if body_len > MAX_MEDIA_MSG {
-        return Err(Error::Oversized { got: body_len, limit: MAX_MEDIA_MSG });
+    let count = frame.data.len().div_ceil(SEGMENT_MAX);
+    debug_assert!(count >= 1, "a non-empty frame has at least one segment");
+    if count > u16::MAX as usize {
+        // Unreachable while MAX_FRAME_BYTES / SEGMENT_MAX <= 32, but keep the
+        // wire-format's own limit honest rather than silently truncating a cast.
+        return Err(Error::Oversized {
+            got: count,
+            limit: u16::MAX as usize,
+        });
     }
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + body_len);
-    out.push(channel_tag(Channel::Media)?);
-    out.extend_from_slice(&(body_len as u32).to_le_bytes());
-    out.extend_from_slice(&header);
-    out.extend_from_slice(&frame.data);
+    let tag = channel_tag(Channel::Media)?;
+    let mut out = Vec::with_capacity(count);
+    for (i, chunk) in frame.data.chunks(SEGMENT_MAX).enumerate() {
+        let header = postcard::to_stdvec(&MediaHeader {
+            frame_id: frame.frame_id,
+            keyframe: frame.keyframe,
+            timestamp_ms: frame.timestamp_ms,
+            segment_index: i as u16,
+            segment_count: count as u16,
+            last: i + 1 == count,
+        })?;
+        let body_len = header.len() + chunk.len();
+        if body_len > MAX_MEDIA_MSG {
+            return Err(Error::Oversized {
+                got: body_len,
+                limit: MAX_MEDIA_MSG,
+            });
+        }
+        let mut msg = Vec::with_capacity(FRAME_HEADER_LEN + body_len);
+        msg.push(tag);
+        msg.extend_from_slice(&(body_len as u32).to_le_bytes());
+        msg.extend_from_slice(&header);
+        msg.extend_from_slice(chunk);
+        out.push(msg);
+    }
     Ok(out)
 }
 
-/// Decode a media message body back into a frame.
-pub fn decode_media(body: &[u8]) -> Result<EncodedFrame> {
+/// Decode one media message body into its [`MediaHeader`] and segment payload.
+///
+/// Validates only what is intrinsic to a single segment: the counts are
+/// self-consistent (`segment_index < segment_count`, `last` agrees with the
+/// index), and the payload is non-empty and within [`MAX_FRAME_BYTES`]. Whether
+/// the segment fits the *frame in progress* is the reassembler's job.
+pub fn decode_media_segment(body: &[u8]) -> Result<(MediaHeader, &[u8])> {
     let (header, rest) = postcard::take_from_bytes::<MediaHeader>(body)?;
+    if header.segment_count == 0 {
+        return Err(Error::Invalid("media segment_count is zero".into()));
+    }
+    if header.segment_index >= header.segment_count {
+        return Err(Error::Invalid(format!(
+            "media segment_index {} >= segment_count {}",
+            header.segment_index, header.segment_count
+        )));
+    }
+    if header.last != (header.segment_index + 1 == header.segment_count) {
+        return Err(Error::Invalid(
+            "media segment last-flag contradicts its index".into(),
+        ));
+    }
     if rest.is_empty() {
-        return Err(Error::Invalid("media message carries no frame data".into()));
+        return Err(Error::Invalid("media segment carries no data".into()));
     }
     if rest.len() > MAX_FRAME_BYTES {
-        return Err(Error::Oversized { got: rest.len(), limit: MAX_FRAME_BYTES });
+        return Err(Error::Oversized {
+            got: rest.len(),
+            limit: MAX_FRAME_BYTES,
+        });
     }
-    Ok(EncodedFrame {
-        frame_id: header.frame_id,
-        keyframe: header.keyframe,
-        timestamp_ms: header.timestamp_ms,
-        data: rest.to_vec(),
-    })
+    Ok((header, rest))
+}
+
+/// One frame being reassembled from its in-order segments.
+struct PartialMedia {
+    frame_id: u32,
+    keyframe: bool,
+    timestamp_ms: u32,
+    segment_count: u16,
+    /// The next `segment_index` expected; equals the number of segments stored.
+    next_index: u16,
+    buf: Vec<u8>,
+}
+
+/// Reassembles the reliable-channel media segments of one connection back into
+/// whole [`EncodedFrame`]s.
+///
+/// The reliable, ordered channel makes this far simpler than the datagram
+/// [`crate::transport::reassembly::Reassembler`]: at most one frame is ever in
+/// flight, its segments arrive in index order, and none are lost. The only
+/// events to handle are a frame that never finished before a *newer* frame began
+/// (latest-wins on the reliable path too — a stale half-frame is useless to the
+/// decoder), a gap in the frame-id sequence (the sender's latest-wins queue
+/// dropped whole frames), and hostile or corrupt segments. Any of the first two
+/// arms a keyframe demand; the last is refused without disturbing an unrelated
+/// frame in progress, exactly like the datagram path.
+#[derive(Default)]
+struct MediaReassembler {
+    active: Option<PartialMedia>,
+    /// Frame id whose first segment we last accepted, for gap detection.
+    last_started: Option<u32>,
+    /// Partial frames abandoned since the last drain.
+    drops: u64,
+    /// Whether a drop or gap since the last drain should raise a keyframe demand.
+    idr: bool,
+}
+
+impl MediaReassembler {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one decoded segment. Returns the completed frame when this segment
+    /// was the last one, `Ok(None)` while a frame is still assembling, or `Err`
+    /// for a segment that cannot belong to any frame we could deliver. Errors
+    /// never poison an unrelated frame in progress; the caller logs and carries
+    /// on.
+    fn push(&mut self, header: MediaHeader, payload: &[u8]) -> Result<Option<EncodedFrame>> {
+        if header.segment_index == 0 {
+            Ok(self.begin_frame(header, payload))
+        } else {
+            self.continue_frame(header, payload)
+        }
+    }
+
+    /// Start assembling a new frame from its opening segment.
+    fn begin_frame(&mut self, header: MediaHeader, payload: &[u8]) -> Option<EncodedFrame> {
+        // A frame still assembling when a newer one starts never completed: drop
+        // it. On the reliable path the sender emits a frame's segments
+        // contiguously, so this only fires on an abandoned/renumbered stream, but
+        // handling it keeps a stale half-frame from ever reaching the decoder.
+        if self.active.take().is_some() {
+            self.drops += 1;
+            self.idr = true;
+        }
+        // A jump in the frame-id sequence means the sender dropped whole frames
+        // (its own latest-wins queue). The decode chain has a hole; ask for a
+        // fresh anchor. The first frame ever seen has no predecessor and is not a
+        // gap.
+        if let Some(prev) = self.last_started {
+            if header.frame_id != prev.wrapping_add(1) {
+                self.idr = true;
+            }
+        }
+        self.last_started = Some(header.frame_id);
+
+        if header.segment_count == 1 {
+            return Some(EncodedFrame {
+                frame_id: header.frame_id,
+                keyframe: header.keyframe,
+                timestamp_ms: header.timestamp_ms,
+                data: payload.to_vec(),
+            });
+        }
+        let mut buf = Vec::with_capacity(payload.len());
+        buf.extend_from_slice(payload);
+        self.active = Some(PartialMedia {
+            frame_id: header.frame_id,
+            keyframe: header.keyframe,
+            timestamp_ms: header.timestamp_ms,
+            segment_count: header.segment_count,
+            next_index: 1,
+            buf,
+        });
+        None
+    }
+
+    /// Append a non-opening segment to the frame in progress.
+    fn continue_frame(
+        &mut self,
+        header: MediaHeader,
+        payload: &[u8],
+    ) -> Result<Option<EncodedFrame>> {
+        // Copy out everything we need so the immutable borrow ends before any
+        // mutation of `self.active` below.
+        let (frame_id, segment_count, keyframe, timestamp_ms, next_index, cur_len) =
+            match self.active.as_ref() {
+                Some(a) => (
+                    a.frame_id,
+                    a.segment_count,
+                    a.keyframe,
+                    a.timestamp_ms,
+                    a.next_index,
+                    a.buf.len(),
+                ),
+                None => {
+                    // A mid-frame segment with no frame in progress: its opening
+                    // segment was lost or dropped. Unusable, and a hole in the
+                    // decode chain.
+                    self.idr = true;
+                    return Err(Error::Invalid(
+                        "media segment continues a frame that never started".into(),
+                    ));
+                }
+            };
+
+        if header.frame_id != frame_id
+            || header.segment_count != segment_count
+            || header.keyframe != keyframe
+            || header.timestamp_ms != timestamp_ms
+        {
+            // The segment does not belong to the frame we are assembling. On an
+            // ordered stream that means corruption; abandon the partial.
+            self.active = None;
+            self.drops += 1;
+            self.idr = true;
+            return Err(Error::Invalid(
+                "media segment contradicts the frame in progress".into(),
+            ));
+        }
+        if header.segment_index != next_index {
+            self.active = None;
+            self.drops += 1;
+            self.idr = true;
+            return Err(Error::Invalid(format!(
+                "media segment {} arrived out of order (expected {next_index})",
+                header.segment_index
+            )));
+        }
+        let total = cur_len.saturating_add(payload.len());
+        if total > MAX_FRAME_BYTES {
+            self.active = None;
+            self.drops += 1;
+            self.idr = true;
+            return Err(Error::Oversized {
+                got: total,
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+
+        let active = self.active.as_mut().expect("active frame present");
+        active.buf.extend_from_slice(payload);
+        active.next_index += 1;
+        if active.next_index == active.segment_count {
+            let done = self.active.take().expect("active frame present");
+            return Ok(Some(EncodedFrame {
+                frame_id: done.frame_id,
+                keyframe: done.keyframe,
+                timestamp_ms: done.timestamp_ms,
+                data: done.buf,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Number of partial frames dropped since the previous call; clears it.
+    fn take_drops(&mut self) -> u64 {
+        std::mem::take(&mut self.drops)
+    }
+
+    /// Whether a drop or gap since the previous call should raise a keyframe
+    /// demand; clears it.
+    fn take_idr(&mut self) -> bool {
+        std::mem::take(&mut self.idr)
+    }
 }
 
 /// Read one tagged frame, refusing an oversized length before allocating.
@@ -401,8 +680,11 @@ impl TlsTcpConn {
             TlsStream::Client(s) => s.get_ref().1.peer_certificates(),
             TlsStream::Server(s) => s.get_ref().1.peer_certificates(),
         };
-        let chain = certs.ok_or_else(|| Error::Crypto("connection has no peer certificate".into()))?;
-        let first = chain.first().ok_or_else(|| Error::Crypto("empty certificate chain".into()))?;
+        let chain =
+            certs.ok_or_else(|| Error::Crypto("connection has no peer certificate".into()))?;
+        let first = chain
+            .first()
+            .ok_or_else(|| Error::Crypto("empty certificate chain".into()))?;
         crate::crypto::spki_sha256_from_cert_der(first.as_ref())
     }
 
@@ -413,17 +695,17 @@ impl TlsTcpConn {
             .write_all(&bytes)
             .await
             .map_err(|e| Error::Transport(format!("tcp write: {e}")))?;
-        self.stream.flush().await.map_err(|e| Error::Transport(format!("tcp flush: {e}")))
+        self.stream
+            .flush()
+            .await
+            .map_err(|e| Error::Transport(format!("tcp flush: {e}")))
     }
 
     /// Read one tagged message, refusing anything over `limit`.
     ///
     /// Returns the channel it arrived on so the caller can reject traffic that
     /// does not belong in the current phase.
-    pub async fn read_framed<T: DeserializeOwned>(
-        &mut self,
-        limit: usize,
-    ) -> Result<(Channel, T)> {
+    pub async fn read_framed<T: DeserializeOwned>(&mut self, limit: usize) -> Result<(Channel, T)> {
         let (channel, body) = read_tagged_capped(&mut self.stream, limit).await?;
         Ok((channel, decode_strict::<T>(&body)?))
     }
@@ -440,7 +722,9 @@ impl TlsTcpConn {
     pub async fn read_auth<T: DeserializeOwned>(&mut self) -> Result<T> {
         let (channel, msg) = self.read_framed::<T>(MAX_AUTH_MSG).await?;
         if channel != Channel::Control {
-            return Err(Error::Protocol(format!("auth message on the {channel:?} channel")));
+            return Err(Error::Protocol(format!(
+                "auth message on the {channel:?} channel"
+            )));
         }
         Ok(msg)
     }
@@ -449,7 +733,9 @@ impl TlsTcpConn {
 /// Bind a fallback listener. Use [`crate::protocol::DEFAULT_TCP_PORT`] unless
 /// the user configured otherwise.
 pub async fn listener(bind: SocketAddr) -> Result<TcpListener> {
-    TcpListener::bind(bind).await.map_err(|e| Error::Transport(format!("tcp bind {bind}: {e}")))
+    TcpListener::bind(bind)
+        .await
+        .map_err(|e| Error::Transport(format!("tcp bind {bind}: {e}")))
 }
 
 /// Build the host-side TLS acceptor once, for the lifetime of the listener.
@@ -482,7 +768,11 @@ pub async fn accept(
     .map_err(|_| Error::Transport(format!("tls handshake with {peer} timed out")))?
     .map_err(|e| Error::Transport(format!("tls handshake with {peer}: {e}")))?;
 
-    let conn = TlsTcpConn { stream: TlsStream::Server(tls), peer, server: true };
+    let conn = TlsTcpConn {
+        stream: TlsStream::Server(tls),
+        peer,
+        server: true,
+    };
     check_alpn(&conn)?;
     Ok(conn)
 }
@@ -510,14 +800,20 @@ pub async fn connect(
     // The handshake gets whatever is left of the budget, not a fresh one.
     let remaining = timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
-        return Err(Error::Transport(format!("no time left for the tls handshake with {addr}")));
+        return Err(Error::Transport(format!(
+            "no time left for the tls handshake with {addr}"
+        )));
     }
     let tls = tokio::time::timeout(remaining, connector.connect(tls::sni()?, sock))
         .await
         .map_err(|_| Error::Transport(format!("tls handshake with {addr} timed out")))?
         .map_err(|e| Error::Transport(format!("tls handshake with {addr}: {e}")))?;
 
-    let conn = TlsTcpConn { stream: TlsStream::Client(tls), peer: addr, server: false };
+    let conn = TlsTcpConn {
+        stream: TlsStream::Client(tls),
+        peer: addr,
+        server: false,
+    };
     check_alpn(&conn)?;
     Ok(conn)
 }
@@ -533,7 +829,9 @@ pub async fn connect_with_retry(
     retry: RetryPolicy,
 ) -> Result<TlsTcpConn> {
     if retry.max_attempts == 0 {
-        return Err(Error::Invalid("retry policy must allow at least one attempt".into()));
+        return Err(Error::Invalid(
+            "retry policy must allow at least one attempt".into(),
+        ));
     }
     let mut last = Error::Transport("no connection attempt was made".into());
     for attempt in 1..=retry.max_attempts {
@@ -649,6 +947,7 @@ impl VideoQueue {
 #[derive(Debug, Default)]
 struct Counters {
     video_frames_dropped_local: AtomicU64,
+    video_frames_reassembly_dropped: AtomicU64,
     idr_signals: AtomicU64,
     bytes_tx: AtomicU64,
     bytes_rx: AtomicU64,
@@ -684,7 +983,9 @@ impl Shared {
 
     fn mark_closed(&self, reason: &str) {
         if !self.closed.swap(true, Ordering::SeqCst) {
-            self.emit(SessionEvent::Closed { reason: reason.to_string() });
+            self.emit(SessionEvent::Closed {
+                reason: reason.to_string(),
+            });
         }
         self.video_out.close();
         self.shutdown.store(true, Ordering::SeqCst);
@@ -791,13 +1092,22 @@ impl TcpSession {
             params.idle_timeout_ms,
         )));
         if config.heartbeat_ms > 0 {
-            tasks.push(tokio::spawn(heartbeat_loop(shared.clone(), config.heartbeat_ms)));
+            tasks.push(tokio::spawn(heartbeat_loop(
+                shared.clone(),
+                config.heartbeat_ms,
+            )));
         }
         if config.stats_interval_ms > 0 {
-            tasks.push(tokio::spawn(stats_loop(shared.clone(), config.stats_interval_ms)));
+            tasks.push(tokio::spawn(stats_loop(
+                shared.clone(),
+                config.stats_interval_ms,
+            )));
         }
 
-        let session = Self { shared, tasks: Mutex::new(tasks) };
+        let session = Self {
+            shared,
+            tasks: Mutex::new(tasks),
+        };
         let receivers = SessionReceivers {
             control: control_in_rx,
             input: input_in_rx,
@@ -809,7 +1119,10 @@ impl TcpSession {
 
     /// Number of video frames dropped locally because the send queue was full.
     pub fn frames_dropped_local(&self) -> u64 {
-        self.shared.counters.video_frames_dropped_local.load(Ordering::Relaxed)
+        self.shared
+            .counters
+            .video_frames_dropped_local
+            .load(Ordering::Relaxed)
     }
 
     /// Number of times a drop raised [`SessionEvent::KeyframeNeeded`] for the
@@ -817,6 +1130,18 @@ impl TcpSession {
     /// signal is rate-limited.
     pub fn idr_signals(&self) -> u64 {
         self.shared.counters.idr_signals.load(Ordering::Relaxed)
+    }
+
+    /// Partial video frames abandoned by the receive-side reassembler: a newer
+    /// frame's segments began before the current frame finished, or a segment
+    /// was malformed, out of order, or contradicted the frame in progress. Each
+    /// such drop leaves a hole in the decode chain and arms a rate-limited
+    /// [`SessionEvent::KeyframeNeeded`].
+    pub fn frames_reassembly_dropped(&self) -> u64 {
+        self.shared
+            .counters
+            .video_frames_reassembly_dropped
+            .load(Ordering::Relaxed)
     }
 
     /// Bytes written to and read from the socket, including framing.
@@ -846,7 +1171,9 @@ impl TcpSession {
     /// reason, so on TCP the structured `Bye` is the *only* way the peer learns
     /// why — which makes this the path every normal shutdown should take.
     pub async fn close_graceful(&self, reason: &str, grace: Duration) {
-        let _ = self.shared.control_out.try_send(ControlMsg::Bye { reason: reason.to_string() });
+        let _ = self.shared.control_out.try_send(ControlMsg::Bye {
+            reason: reason.to_string(),
+        });
         let deadline = Instant::now() + grace;
         while self.shared.control_out.capacity() < self.shared.control_out.max_capacity()
             && Instant::now() < deadline
@@ -906,7 +1233,10 @@ impl Session for TcpSession {
             // `RequestKeyframe` aimed at the peer, which would ask the wrong
             // party for the wrong thing.
             if self.shared.arm_idr() {
-                self.shared.counters.idr_signals.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .counters
+                    .idr_signals
+                    .fetch_add(1, Ordering::Relaxed);
                 self.shared.emit(SessionEvent::KeyframeNeeded);
             }
         }
@@ -917,9 +1247,13 @@ impl Session for TcpSession {
         // Synchronous: queue the `Bye` and ask the writer to drain and hang up.
         // The writer flushes what is already queued before shutting the socket,
         // so the `Bye` usually makes it out even on this path.
-        let _ = self.shared.control_out.try_send(ControlMsg::Bye { reason: reason.to_string() });
+        let _ = self.shared.control_out.try_send(ControlMsg::Bye {
+            reason: reason.to_string(),
+        });
         if !self.shared.closed.swap(true, Ordering::SeqCst) {
-            self.shared.emit(SessionEvent::Closed { reason: reason.to_string() });
+            self.shared.emit(SessionEvent::Closed {
+                reason: reason.to_string(),
+            });
         }
         self.shared.video_out.close();
         self.shared.request_shutdown();
@@ -988,38 +1322,116 @@ async fn next_outbound(
     }
 }
 
+/// Write one buffer and flush it, updating the byte counter. Returns `false`
+/// once the socket is dead (the session is already marked closed); the caller
+/// must then stop.
+async fn write_all_counted(
+    shared: &Shared,
+    writer: &mut WriteHalf<TlsStream<TcpStream>>,
+    bytes: &[u8],
+) -> bool {
+    if let Err(e) = writer.write_all(bytes).await {
+        shared.emit(SessionEvent::Warning {
+            detail: format!("tcp write: {e}"),
+        });
+        shared.mark_closed("tcp write failed");
+        return false;
+    }
+    shared
+        .counters
+        .bytes_tx
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    if let Err(e) = writer.flush().await {
+        shared.emit(SessionEvent::Warning {
+            detail: format!("tcp flush: {e}"),
+        });
+        shared.mark_closed("tcp flush failed");
+        return false;
+    }
+    true
+}
+
+/// Encode and send a control/input message. Returns `false` only on a fatal
+/// socket error (the caller must stop); an *encode* failure is a local bug, not
+/// a reason to kill a working session, so it is warned about and swallowed.
+async fn send_tagged<T: Serialize>(
+    shared: &Shared,
+    writer: &mut WriteHalf<TlsStream<TcpStream>>,
+    channel: Channel,
+    msg: &T,
+) -> bool {
+    match encode_tagged(channel, msg) {
+        Ok(bytes) => write_all_counted(shared, writer, &bytes).await,
+        Err(e) => {
+            shared.emit(SessionEvent::Warning {
+                detail: format!("encode: {e}"),
+            });
+            true
+        }
+    }
+}
+
 async fn writer_loop(
     shared: Arc<Shared>,
     mut writer: WriteHalf<TlsStream<TcpStream>>,
     mut control_rx: mpsc::Receiver<ControlMsg>,
     mut input_rx: mpsc::Receiver<InputMsg>,
 ) {
+    // Segments of the video frame currently being transmitted. They are strictly
+    // lower priority than control and input, so those queues are drained before
+    // *each* segment below — that is what bounds an input event's delay to one
+    // segment instead of a whole frame. A new frame is only pulled from
+    // `video_out` once this is empty, so a frame is never interleaved with
+    // another frame's segments, only with higher-priority control/input.
+    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+
     loop {
-        let bytes = match next_outbound(&shared, &mut control_rx, &mut input_rx).await {
-            Outbound::Control(m) => encode_tagged(Channel::Control, &m),
-            Outbound::Input(m) => encode_tagged(Channel::Input, &m),
-            Outbound::Media(f) => encode_media(&f),
-            Outbound::Stop => break,
-        };
-        let bytes = match bytes {
-            Ok(b) => b,
-            Err(e) => {
-                // An unencodable message is a local bug, not a reason to kill a
-                // working session.
-                shared.emit(SessionEvent::Warning { detail: format!("encode: {e}") });
-                continue;
+        // Strict priority, re-evaluated before every segment.
+        if let Ok(m) = control_rx.try_recv() {
+            if !send_tagged(&shared, &mut writer, Channel::Control, &m).await {
+                return;
             }
-        };
-        if let Err(e) = writer.write_all(&bytes).await {
-            shared.emit(SessionEvent::Warning { detail: format!("tcp write: {e}") });
-            shared.mark_closed("tcp write failed");
-            return;
+            continue;
         }
-        shared.counters.bytes_tx.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        if let Err(e) = writer.flush().await {
-            shared.emit(SessionEvent::Warning { detail: format!("tcp flush: {e}") });
-            shared.mark_closed("tcp flush failed");
-            return;
+        if let Ok(m) = input_rx.try_recv() {
+            if !send_tagged(&shared, &mut writer, Channel::Input, &m).await {
+                return;
+            }
+            continue;
+        }
+        // Shutdown is checked after control/input so a queued `Bye` (or a last
+        // key-up) still reaches the peer. Any half-sent frame is abandoned — we
+        // are closing, and a stale partial frame is useless to the peer.
+        if shared.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Some(seg) = pending.pop_front() {
+            if !write_all_counted(&shared, &mut writer, &seg).await {
+                return;
+            }
+            continue;
+        }
+        // Nothing pending and nothing higher priority is ready: block for work.
+        match next_outbound(&shared, &mut control_rx, &mut input_rx).await {
+            Outbound::Control(m) => {
+                if !send_tagged(&shared, &mut writer, Channel::Control, &m).await {
+                    return;
+                }
+            }
+            Outbound::Input(m) => {
+                if !send_tagged(&shared, &mut writer, Channel::Input, &m).await {
+                    return;
+                }
+            }
+            Outbound::Media(f) => match encode_media_segments(&f) {
+                // Queue the segments; the loop head sends them one at a time,
+                // draining control/input in between.
+                Ok(segs) => pending.extend(segs),
+                Err(e) => shared.emit(SessionEvent::Warning {
+                    detail: format!("encode: {e}"),
+                }),
+            },
+            Outbound::Stop => break,
         }
     }
     // A clean half-close is how the peer's reader learns this was deliberate
@@ -1035,6 +1447,7 @@ async fn reader_loop(
     video_tx: mpsc::Sender<EncodedFrame>,
     idle_timeout_ms: u64,
 ) {
+    let mut media = MediaReassembler::new();
     loop {
         let read = if idle_timeout_ms > 0 {
             match tokio::time::timeout(
@@ -1090,8 +1503,9 @@ async fn reader_loop(
                 // Validate before handing an event to something that injects it.
                 if let InputMsg::Event(ev) = &msg {
                     if let Err(e) = crate::input::validate_event(ev) {
-                        shared
-                            .emit(SessionEvent::Warning { detail: format!("bad input event: {e}") });
+                        shared.emit(SessionEvent::Warning {
+                            detail: format!("bad input event: {e}"),
+                        });
                         continue;
                     }
                 }
@@ -1101,19 +1515,41 @@ async fn reader_loop(
                 }
             }
             Channel::Media => {
-                match decode_media(&body) {
-                    Ok(frame) => {
-                        // Receive-side backpressure stays droppable: a frame the
-                        // decoder cannot keep up with is not worth stalling the
-                        // control channel for.
-                        if video_tx.try_send(frame).is_err() {
-                            shared.emit(SessionEvent::Warning {
-                                detail: "video receive queue full; frame dropped".into(),
-                            });
+                match decode_media_segment(&body) {
+                    Ok((header, payload)) => match media.push(header, payload) {
+                        Ok(Some(frame)) => {
+                            // Receive-side backpressure stays droppable: a frame
+                            // the decoder cannot keep up with is not worth
+                            // stalling the control channel for.
+                            if video_tx.try_send(frame).is_err() {
+                                shared.emit(SessionEvent::Warning {
+                                    detail: "video receive queue full; frame dropped".into(),
+                                });
+                            }
                         }
-                    }
-                    Err(e) => shared
-                        .emit(SessionEvent::Warning { detail: format!("bad video frame: {e}") }),
+                        Ok(None) => {}
+                        Err(e) => shared.emit(SessionEvent::Warning {
+                            detail: format!("bad video segment: {e}"),
+                        }),
+                    },
+                    Err(e) => shared.emit(SessionEvent::Warning {
+                        detail: format!("bad video segment: {e}"),
+                    }),
+                }
+                // A dropped partial or a frame-id gap leaves the decoder without
+                // a valid reference. Count the drops and raise a rate-limited
+                // keyframe demand — the same signal the datagram reassembler
+                // raises on a lost fragment.
+                let drops = media.take_drops();
+                if drops > 0 {
+                    shared
+                        .counters
+                        .video_frames_reassembly_dropped
+                        .fetch_add(drops, Ordering::Relaxed);
+                }
+                if media.take_idr() && shared.arm_idr() {
+                    shared.counters.idr_signals.fetch_add(1, Ordering::Relaxed);
+                    shared.emit(SessionEvent::KeyframeNeeded);
                 }
             }
         }
@@ -1128,7 +1564,11 @@ async fn handle_control(
 ) -> bool {
     match msg {
         ControlMsg::Ping { token } => {
-            if shared.control_out.try_send(ControlMsg::Pong { token }).is_err() {
+            if shared
+                .control_out
+                .try_send(ControlMsg::Pong { token })
+                .is_err()
+            {
                 shared.emit(SessionEvent::Warning {
                     detail: "could not answer Ping: control queue full".into(),
                 });
@@ -1153,13 +1593,16 @@ async fn handle_control(
                     stats.jitter_ms = ewma_jitter(stats.jitter_ms, stats.rtt_ms, rtt_ms);
                     stats.rtt_ms = rtt_ms;
                 }
-                None => shared
-                    .emit(SessionEvent::Warning { detail: format!("unmatched Pong token {token}") }),
+                None => shared.emit(SessionEvent::Warning {
+                    detail: format!("unmatched Pong token {token}"),
+                }),
             }
             true
         }
         ControlMsg::Bye { reason } => {
-            shared.emit(SessionEvent::PeerClosed { reason: reason.clone() });
+            shared.emit(SessionEvent::PeerClosed {
+                reason: reason.clone(),
+            });
             shared.mark_closed(&format!("peer said bye: {reason}"));
             false
         }
@@ -1168,8 +1611,9 @@ async fn handle_control(
             if crate::stats::validate_stats(&peer) {
                 tx.send(ControlMsg::Stats(peer)).await.is_ok()
             } else {
-                shared
-                    .emit(SessionEvent::Warning { detail: "discarded implausible peer stats".into() });
+                shared.emit(SessionEvent::Warning {
+                    detail: "discarded implausible peer stats".into(),
+                });
                 true
             }
         }
@@ -1193,9 +1637,14 @@ async fn heartbeat_loop(shared: Arc<Shared>, interval_ms: u64) {
             return;
         }
         *shared.pending_ping.lock() = Some((token, Instant::now()));
-        if shared.control_out.try_send(ControlMsg::Ping { token }).is_err() {
-            shared
-                .emit(SessionEvent::Warning { detail: "heartbeat skipped: control queue full".into() });
+        if shared
+            .control_out
+            .try_send(ControlMsg::Ping { token })
+            .is_err()
+        {
+            shared.emit(SessionEvent::Warning {
+                detail: "heartbeat skipped: control queue full".into(),
+            });
         }
         token = token.wrapping_add(1);
     }
@@ -1229,8 +1678,10 @@ async fn stats_loop(shared: Arc<Shared>, interval_ms: u64) {
             // reporting a guess would be dishonest. RTT comes from the
             // heartbeat, which measures the whole path including the peer.
             stats.loss = 0.0;
-            stats.frames_dropped =
-                shared.counters.video_frames_dropped_local.load(Ordering::Relaxed) as u32;
+            stats.frames_dropped = shared
+                .counters
+                .video_frames_dropped_local
+                .load(Ordering::Relaxed) as u32;
             stats.keyframes_requested = shared.counters.idr_signals.load(Ordering::Relaxed) as u32;
             *stats
         };
@@ -1265,13 +1716,27 @@ mod tests {
     #[test]
     fn params_validation() {
         assert!(TcpParams::default().validate().is_ok());
-        assert!(TcpParams { connect_timeout_ms: 0, ..Default::default() }.validate().is_err());
-        assert!(TcpParams { video_queue_depth: 0, ..Default::default() }.validate().is_err());
+        assert!(TcpParams {
+            connect_timeout_ms: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(TcpParams {
+            video_queue_depth: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
     fn retry_backoff_grows_then_caps() {
-        let r = RetryPolicy { max_attempts: 8, initial_backoff_ms: 250, max_backoff_ms: 4_000 };
+        let r = RetryPolicy {
+            max_attempts: 8,
+            initial_backoff_ms: 250,
+            max_backoff_ms: 4_000,
+        };
         assert_eq!(r.backoff_ms(1), 0, "the first attempt never waits");
         assert_eq!(r.backoff_ms(2), 250);
         assert_eq!(r.backoff_ms(3), 500);
@@ -1279,7 +1744,11 @@ mod tests {
         assert_eq!(r.backoff_ms(5), 2_000);
         assert_eq!(r.backoff_ms(6), 4_000);
         assert_eq!(r.backoff_ms(7), 4_000, "capped, not doubling forever");
-        assert_eq!(r.backoff_ms(u32::MAX), 4_000, "no overflow at absurd attempt counts");
+        assert_eq!(
+            r.backoff_ms(u32::MAX),
+            4_000,
+            "no overflow at absurd attempt counts"
+        );
     }
 
     #[test]
@@ -1305,44 +1774,197 @@ mod tests {
         assert!(encode_tagged(Channel::Media, &InputMsg::ReleaseAll).is_err());
     }
 
+    /// Strip the tag+len framing and decode one segment message body.
+    fn decode_seg(msg: &[u8]) -> (MediaHeader, Vec<u8>) {
+        assert_eq!(parse_channel_tag(msg[0]).unwrap(), Channel::Media);
+        let len = parse_frame_len(msg[1..5].try_into().unwrap(), MAX_MEDIA_MSG).unwrap();
+        assert_eq!(len, msg.len() - FRAME_HEADER_LEN);
+        let (header, payload) = decode_media_segment(&msg[FRAME_HEADER_LEN..]).unwrap();
+        (header, payload.to_vec())
+    }
+
+    /// Encode a frame, then reassemble it through a fresh reassembler.
+    fn roundtrip(frame: &EncodedFrame) -> EncodedFrame {
+        let segs = encode_media_segments(frame).expect("encode segments");
+        let mut r = MediaReassembler::new();
+        let mut out = None;
+        for msg in &segs {
+            let (header, payload) = decode_seg(msg);
+            if let Some(f) = r.push(header, &payload).expect("push segment") {
+                out = Some(f);
+            }
+        }
+        out.expect("frame completed")
+    }
+
     #[test]
     fn media_roundtrip_preserves_frame_identity() {
+        // A frame large enough to need several segments (~5000 / 65536 would be
+        // one, so force many by exceeding SEGMENT_MAX).
         let original = EncodedFrame {
             frame_id: 4_294_967_290,
             keyframe: true,
             timestamp_ms: 987_654,
-            data: (0..5_000u32).map(|i| (i % 251) as u8).collect(),
+            data: (0..(SEGMENT_MAX * 3 + 17) as u32)
+                .map(|i| (i % 251) as u8)
+                .collect(),
         };
-        let wire = encode_media(&original).unwrap();
-        assert_eq!(parse_channel_tag(wire[0]).unwrap(), Channel::Media);
-        let len = parse_frame_len(wire[1..5].try_into().unwrap(), MAX_MEDIA_MSG).unwrap();
-        assert_eq!(len, wire.len() - FRAME_HEADER_LEN);
-        let back = decode_media(&wire[FRAME_HEADER_LEN..]).unwrap();
+        let segs = encode_media_segments(&original).unwrap();
+        assert_eq!(segs.len(), 4, "3 full segments plus a remainder");
+        // Every segment is a well-formed, in-cap Media message no larger than
+        // one segment plus its header.
+        for (i, msg) in segs.iter().enumerate() {
+            let (header, payload) = decode_seg(msg);
+            assert_eq!(header.frame_id, original.frame_id);
+            assert_eq!(header.segment_index as usize, i);
+            assert_eq!(header.segment_count, 4);
+            assert_eq!(header.last, i == 3);
+            assert!(payload.len() <= SEGMENT_MAX);
+        }
+        let back = roundtrip(&original);
         assert_eq!(back.frame_id, original.frame_id);
         assert!(back.keyframe);
         assert_eq!(back.timestamp_ms, original.timestamp_ms);
         assert_eq!(back.data, original.data);
+
+        // A frame that fits in one segment stays a single message and completes
+        // on its opening segment.
+        let small = frame(7, 1000);
+        let one = encode_media_segments(&small).unwrap();
+        assert_eq!(one.len(), 1);
+        let back = roundtrip(&small);
+        assert_eq!(back.data, small.data);
     }
 
     #[test]
     fn media_encoder_rejects_empty_and_oversized_frames() {
-        let empty = EncodedFrame { frame_id: 1, keyframe: false, timestamp_ms: 0, data: vec![] };
-        assert!(encode_media(&empty).is_err());
+        let empty = EncodedFrame {
+            frame_id: 1,
+            keyframe: false,
+            timestamp_ms: 0,
+            data: vec![],
+        };
+        assert!(encode_media_segments(&empty).is_err());
         let huge = EncodedFrame {
             frame_id: 1,
             keyframe: false,
             timestamp_ms: 0,
             data: vec![0u8; MAX_FRAME_BYTES + 1],
         };
-        assert!(matches!(encode_media(&huge), Err(Error::Oversized { .. })));
-        // A body with a header but no payload is not a frame.
+        assert!(matches!(
+            encode_media_segments(&huge),
+            Err(Error::Oversized { .. })
+        ));
+        // A body with a header but no payload is not a segment.
         let header = postcard::to_stdvec(&MediaHeader {
             frame_id: 1,
             keyframe: false,
             timestamp_ms: 0,
+            segment_index: 0,
+            segment_count: 1,
+            last: true,
         })
         .unwrap();
-        assert!(decode_media(&header).is_err());
+        assert!(decode_media_segment(&header).is_err());
+        // A header whose last-flag disagrees with its counts is refused.
+        let bad = postcard::to_stdvec(&MediaHeader {
+            frame_id: 1,
+            keyframe: false,
+            timestamp_ms: 0,
+            segment_index: 0,
+            segment_count: 3,
+            last: true,
+        })
+        .unwrap();
+        let mut body = bad;
+        body.push(0x11); // one payload byte, so only the last-flag is wrong
+        assert!(decode_media_segment(&body).is_err());
+    }
+
+    #[test]
+    fn reassembler_handles_gaps_drops_and_corruption() {
+        // Helper: the segment messages for a frame, pre-decoded.
+        fn segs(id: u32, keyframe: bool, ts: u32, len: usize) -> Vec<(MediaHeader, Vec<u8>)> {
+            let f = EncodedFrame {
+                frame_id: id,
+                keyframe,
+                timestamp_ms: ts,
+                data: (0..len as u32).map(|i| (i % 251) as u8).collect(),
+            };
+            encode_media_segments(&f)
+                .unwrap()
+                .iter()
+                .map(|m| decode_seg(m))
+                .collect()
+        }
+
+        // A gap in frame ids (sender dropped whole frames) raises the IDR demand.
+        let mut r = MediaReassembler::new();
+        let a = segs(10, true, 10, SEGMENT_MAX * 2);
+        assert!(r.push(a[0].0, &a[0].1).unwrap().is_none());
+        assert!(r.push(a[1].0, &a[1].1).unwrap().is_some());
+        assert!(!r.take_idr(), "a clean first frame demands nothing");
+        let b = segs(13, false, 13, 32); // id jumped 10 -> 13
+        assert!(r.push(b[0].0, &b[0].1).unwrap().is_some());
+        assert!(r.take_idr(), "a frame-id gap must demand a keyframe");
+        assert_eq!(
+            r.take_drops(),
+            0,
+            "a gap with nothing half-built drops nothing"
+        );
+
+        // A newer frame starting mid-way drops the abandoned partial.
+        let mut r = MediaReassembler::new();
+        let c = segs(1, true, 1, SEGMENT_MAX * 3);
+        assert!(r.push(c[0].0, &c[0].1).unwrap().is_none());
+        assert!(r.push(c[1].0, &c[1].1).unwrap().is_none());
+        let d = segs(2, false, 2, 64);
+        assert!(
+            r.push(d[0].0, &d[0].1).unwrap().is_some(),
+            "single-seg frame 2 completes"
+        );
+        assert_eq!(r.take_drops(), 1, "the half-built frame 1 was dropped");
+        assert!(r.take_idr());
+
+        // Out-of-order and contradictory segments are refused; the frame in
+        // progress is abandoned but the connection survives.
+        let mut r = MediaReassembler::new();
+        let e = segs(5, false, 5, SEGMENT_MAX * 2);
+        assert!(r.push(e[0].0, &e[0].1).unwrap().is_none());
+        let mut wrong_ts = e[1].0;
+        wrong_ts.timestamp_ms = 999;
+        assert!(
+            r.push(wrong_ts, &e[1].1).is_err(),
+            "contradictory timestamp is rejected"
+        );
+        assert_eq!(r.take_drops(), 1);
+        assert!(r.take_idr());
+
+        // Per-frame byte cap: a segment that would push the frame over
+        // MAX_FRAME_BYTES is refused (forged 2-segment frame, each near cap).
+        let mut r = MediaReassembler::new();
+        let big = MAX_FRAME_BYTES - 8;
+        let h0 = MediaHeader {
+            frame_id: 9,
+            keyframe: true,
+            timestamp_ms: 9,
+            segment_index: 0,
+            segment_count: 2,
+            last: false,
+        };
+        assert!(r.push(h0, &vec![0u8; big]).unwrap().is_none());
+        let h1 = MediaHeader {
+            segment_index: 1,
+            last: true,
+            ..h0
+        };
+        let err = r.push(h1, &[0u8; 64]).unwrap_err();
+        assert!(
+            matches!(err, Error::Oversized { .. }),
+            "byte cap must trip: {err:?}"
+        );
+        assert_eq!(r.take_drops(), 1);
+        assert!(r.take_idr());
     }
 
     #[test]
@@ -1373,7 +1995,11 @@ mod tests {
         let waiter = tokio::spawn(async move { q3.pop().await.map(|f| f.frame_id) });
         tokio::task::yield_now().await;
         q.close();
-        assert_eq!(waiter.await.unwrap(), None, "a closed, drained queue ends the writer");
+        assert_eq!(
+            waiter.await.unwrap(),
+            None,
+            "a closed, drained queue ends the writer"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1399,7 +2025,11 @@ mod tests {
         let id = HostIdentity::generate("tcp-host").unwrap();
         let (host, client) = pair(&id, TcpParams::default()).await;
 
-        assert_eq!(client.alpn().as_deref(), Some(ALPN), "ALPN must match the QUIC path");
+        assert_eq!(
+            client.alpn().as_deref(),
+            Some(ALPN),
+            "ALPN must match the QUIC path"
+        );
         assert_eq!(host.alpn().as_deref(), Some(ALPN));
         assert_eq!(client.peer_spki_pin().unwrap(), *id.spki_sha256());
         assert!(host.is_server() && !client.is_server());
@@ -1423,7 +2053,11 @@ mod tests {
 
         let res = tokio::time::timeout(
             Duration::from_secs(10),
-            connect(addr, ServerPinning::Pinned(*impostor.spki_sha256()), &TcpParams::default()),
+            connect(
+                addr,
+                ServerPinning::Pinned(*impostor.spki_sha256()),
+                &TcpParams::default(),
+            ),
         )
         .await
         .expect("connect attempt should not hang");
@@ -1437,7 +2071,12 @@ mod tests {
         let (mut host, mut client) = pair(&id, TcpParams::default()).await;
 
         client
-            .write_framed(Channel::Control, &AuthMsg::PairStart { spake_msg: vec![0xAB; 33] })
+            .write_framed(
+                Channel::Control,
+                &AuthMsg::PairStart {
+                    spake_msg: vec![0xAB; 33],
+                },
+            )
             .await
             .expect("write auth");
         let msg: AuthMsg = host.read_auth().await.expect("read auth");
@@ -1460,7 +2099,11 @@ mod tests {
         let id = HostIdentity::generate("chan-host").unwrap();
         let (host, client) = pair(&id, TcpParams::default()).await;
 
-        let cfg = SessionConfig { heartbeat_ms: 100, stats_interval_ms: 100, ..Default::default() };
+        let cfg = SessionConfig {
+            heartbeat_ms: 100,
+            stats_interval_ms: 100,
+            ..Default::default()
+        };
         let (host_session, mut host_rx) =
             TcpSession::start(host, TcpParams::default(), cfg.clone()).expect("host session");
         let (client_session, mut client_rx) =
@@ -1476,7 +2119,9 @@ mod tests {
                 quality_mode: QualityMode::Balanced,
             })
             .expect("send control");
-        client_session.send_input(InputMsg::ReleaseAll).expect("send input");
+        client_session
+            .send_input(InputMsg::ReleaseAll)
+            .expect("send input");
 
         let msg = tokio::time::timeout(Duration::from_secs(10), host_rx.control.recv())
             .await
@@ -1490,16 +2135,25 @@ mod tests {
         assert!(matches!(input, InputMsg::ReleaseAll));
 
         // A frame far larger than any QUIC datagram, in one message.
-        host_session.send_video(frame(42, 300_000)).expect("send video");
+        host_session
+            .send_video(frame(42, 300_000))
+            .expect("send video");
         let got = tokio::time::timeout(Duration::from_secs(10), client_rx.video.recv())
             .await
             .expect("video timeout")
             .expect("video closed");
         assert_eq!(got.frame_id, 42);
-        assert!(!got.keyframe, "metadata must survive the trip, not be invented");
+        assert!(
+            !got.keyframe,
+            "metadata must survive the trip, not be invented"
+        );
         assert_eq!(got.timestamp_ms, 42 * 16);
         assert_eq!(got.data.len(), 300_000);
-        assert!(got.data.iter().enumerate().all(|(i, b)| *b == (i as u32 % 251) as u8));
+        assert!(got
+            .data
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == (i as u32 % 251) as u8));
 
         // The heartbeat should have produced a real RTT measurement.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1511,73 +2165,93 @@ mod tests {
         assert!(tx > 0 && rx > 0, "tx {tx} rx {rx}");
     }
 
-    /// The point of the module: a video backlog must never delay input.
+    /// The point of the module: a video backlog must never delay input, and with
+    /// segmentation input overtakes even the *segments* of a frame already on the
+    /// wire.
     ///
-    /// The host end deliberately never reads, so after the first frame the
-    /// client's writer is wedged inside `write_all` with the socket buffers
-    /// full — the worst case this transport has. The backlog and then the input
-    /// event are queued behind that wedge with no `await` in between, so on the
-    /// current-thread runtime the writer provably cannot have moved while they
-    /// were queued.
+    /// The host end deliberately never reads, so the client's writer is wedged
+    /// inside `write_all` part-way through frame 0's segments with the socket
+    /// buffers full — the worst case this transport has. The backlog and then the
+    /// input event are queued behind that wedge. Because the writer consults the
+    /// control/input queues before every segment, the input is written the moment
+    /// the wedged segment drains — ahead of frame 0's *remaining* segments and of
+    /// the entire backlog.
     ///
-    /// What must come out: the input event, then the two surviving frames.
+    /// What must come out first: some segments of frame 0 (only the ones already
+    /// committed to the socket buffer), then the input event, then the rest.
     #[tokio::test]
     async fn input_beats_the_queued_video_backlog() {
         const FRAMES: u32 = 24;
-        const FRAME_BYTES: usize = 512 * 1024;
+        const FRAME_BYTES: usize = 512 * 1024; // 8 segments per frame.
 
         let id = HostIdentity::generate("prio-host").unwrap();
         let (mut host, client) = pair(&id, TcpParams::default()).await;
 
         // No heartbeat and no stats: the only control traffic should be ours.
-        let cfg = SessionConfig { heartbeat_ms: 0, stats_interval_ms: 0, ..Default::default() };
+        let cfg = SessionConfig {
+            heartbeat_ms: 0,
+            stats_interval_ms: 0,
+            ..Default::default()
+        };
         let (session, mut rx) =
             TcpSession::start(client, TcpParams::default(), cfg).expect("client session");
 
         // Phase 1: wedge the writer. Half a megabyte cannot fit in loopback
-        // socket buffers, so the writer blocks part-way through frame 0 and
-        // stays there until the host reads — which it will not, yet.
-        session.send_video(frame(0, FRAME_BYTES)).expect("queue video");
+        // socket buffers, so the writer blocks part-way through frame 0's
+        // segments and stays there until the host reads — which it will not, yet.
+        session
+            .send_video(frame(0, FRAME_BYTES))
+            .expect("queue video");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Phase 2: pile up a backlog and then an input event behind the wedge.
         for n in 1..FRAMES {
-            session.send_video(frame(n, FRAME_BYTES)).expect("queue video");
+            session
+                .send_video(frame(n, FRAME_BYTES))
+                .expect("queue video");
         }
-        session.send_input(InputMsg::ReleaseAll).expect("queue input");
+        session
+            .send_input(InputMsg::ReleaseAll)
+            .expect("queue input");
 
         let dropped = session.frames_dropped_local();
         assert!(
             dropped >= u64::from(FRAMES) - DEFAULT_VIDEO_QUEUE_DEPTH as u64 - 2,
             "expected almost every frame to be dropped, got {dropped} of {FRAMES}"
         );
-        assert!(session.idr_signals() >= 1, "dropping frames must ask the encoder for an IDR");
+        assert!(
+            session.idr_signals() >= 1,
+            "dropping frames must ask the encoder for an IDR"
+        );
         let mut saw_keyframe_event = false;
         while let Ok(ev) = rx.events.try_recv() {
             if matches!(ev, SessionEvent::KeyframeNeeded) {
                 saw_keyframe_event = true;
             }
         }
-        assert!(saw_keyframe_event, "the drop must surface as a KeyframeNeeded event");
+        assert!(
+            saw_keyframe_event,
+            "the drop must surface as a KeyframeNeeded event"
+        );
 
-        // Now let the host drain, recording the order things arrive in.
-        let mut media_before_input = 0usize;
-        let mut media_after_input = 0usize;
-        let mut media_ids = Vec::new();
+        // Now let the host drain, recording the order segments arrive in.
+        let mut ids_before_input = Vec::new();
+        let mut all_ids = Vec::new();
         let mut saw_input = false;
-        for _ in 0..(FRAMES as usize + 4) {
-            let (channel, body) =
-                tokio::time::timeout(Duration::from_secs(10), host.read_any())
-                    .await
-                    .expect("read timeout")
-                    .expect("read failed");
+        for _ in 0..(FRAMES as usize * 8 + 8) {
+            let (channel, body) = tokio::time::timeout(Duration::from_secs(10), host.read_any())
+                .await
+                .expect("read timeout")
+                .expect("read failed");
             match channel {
                 Channel::Media => {
-                    media_ids.push(decode_media(&body).expect("decode media").frame_id);
-                    if saw_input {
-                        media_after_input += 1;
-                    } else {
-                        media_before_input += 1;
+                    let fid = decode_media_segment(&body)
+                        .expect("decode segment")
+                        .0
+                        .frame_id;
+                    all_ids.push(fid);
+                    if !saw_input {
+                        ids_before_input.push(fid);
                     }
                 }
                 Channel::Input => {
@@ -1588,10 +2262,12 @@ mod tests {
             }
         }
         assert!(saw_input, "the input event never arrived");
+        // The measured guarantee: nothing but frame 0 (the frame already on the
+        // wire) may precede the input — no backlog frame, not even a later
+        // segment of frame 0 beyond the one segment already committed.
         assert!(
-            media_before_input <= 1,
-            "input queued behind {media_before_input} video frames; \
-             at most one (the frame already on the wire) is acceptable"
+            ids_before_input.iter().all(|id| *id == 0),
+            "only the in-flight frame 0 may precede the input, got {ids_before_input:?}"
         );
 
         // Drain the tail so we can prove which frames survived.
@@ -1599,24 +2275,117 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(500), host.read_any()).await
         {
             if channel == Channel::Media {
-                media_ids.push(decode_media(&body).expect("decode media").frame_id);
-                media_after_input += 1;
+                all_ids.push(
+                    decode_media_segment(&body)
+                        .expect("decode segment")
+                        .0
+                        .frame_id,
+                );
             }
         }
 
-        assert!(media_after_input >= 1, "the surviving backlog must arrive after the input");
         assert!(
-            media_ids.len() <= DEFAULT_VIDEO_QUEUE_DEPTH + 1,
-            "the backlog must have been dropped, not buffered: {media_ids:?}"
+            all_ids.iter().any(|id| *id != 0),
+            "the surviving backlog must arrive after the input"
         );
-        // Latest-wins: whatever survived is the newest, never the oldest.
+        let mut distinct: Vec<u32> = all_ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        // Latest-wins: only frame 0 (already on the wire) and the two newest
+        // frames survive; the rest of the backlog was dropped, not buffered.
         assert!(
-            media_ids.contains(&(FRAMES - 2)) && media_ids.contains(&(FRAMES - 1)),
-            "the two newest frames must survive, got {media_ids:?}"
+            distinct.iter().all(|id| *id == 0 || *id >= FRAMES - 2),
+            "only the newest frames (or the one already on the wire) may survive: {distinct:?}"
         );
         assert!(
-            media_ids.iter().all(|id| *id == 0 || *id >= FRAMES - 2),
-            "only the newest frames (or one already on the wire) may survive: {media_ids:?}"
+            distinct.contains(&(FRAMES - 2)) && distinct.contains(&(FRAMES - 1)),
+            "the two newest frames must survive, got {distinct:?}"
+        );
+    }
+
+    /// Input must overtake a frame that is *mid-transmission*, not merely a queue
+    /// of whole frames. One 2 MiB frame is 32 segments; an input queued while it
+    /// is being written must ride out ahead of the bulk of those segments, its
+    /// delay bounded by the few already committed to the socket buffer — one
+    /// segment of writer latency — rather than the whole frame.
+    #[tokio::test]
+    async fn input_interleaves_within_a_multi_segment_frame() {
+        const FRAME_BYTES: usize = 2 * 1024 * 1024;
+        let segment_count = FRAME_BYTES.div_ceil(SEGMENT_MAX);
+        assert_eq!(segment_count, 32, "2 MiB at 64 KiB is 32 segments");
+
+        let id = HostIdentity::generate("mid-frame-host").unwrap();
+        let (mut host, client) = pair(&id, TcpParams::default()).await;
+
+        let cfg = SessionConfig {
+            heartbeat_ms: 0,
+            stats_interval_ms: 0,
+            ..Default::default()
+        };
+        let (session, _rx) =
+            TcpSession::start(client, TcpParams::default(), cfg).expect("client session");
+
+        // Queue the big frame. With the host not reading, the writer soon blocks
+        // mid-frame with the socket buffers full — only a handful of segments
+        // have been handed to the OS.
+        session
+            .send_video(frame(1, FRAME_BYTES))
+            .expect("queue video");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Queue an input behind the wedge. The writer checks the input queue
+        // between segments, so this cannot wait for the whole frame.
+        session
+            .send_input(InputMsg::ReleaseAll)
+            .expect("queue input");
+
+        let mut before = 0usize;
+        let mut after = 0usize;
+        let mut total_media = 0usize;
+        let mut saw_input = false;
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(10), host.read_any()).await;
+            let (channel, body) = match read {
+                Ok(Ok(v)) => v,
+                _ => break,
+            };
+            match channel {
+                Channel::Media => {
+                    let h = decode_media_segment(&body).expect("decode segment").0;
+                    assert_eq!(h.frame_id, 1);
+                    assert_eq!(h.segment_count as usize, segment_count);
+                    total_media += 1;
+                    if saw_input {
+                        after += 1;
+                    } else {
+                        before += 1;
+                    }
+                }
+                Channel::Input => saw_input = true,
+                Channel::Control => panic!("no control traffic was sent"),
+            }
+            if saw_input && total_media >= segment_count {
+                break;
+            }
+        }
+
+        assert!(saw_input, "the input event never arrived");
+        assert_eq!(
+            total_media, segment_count,
+            "the whole frame must still be delivered, in {segment_count} segments"
+        );
+        // MEASURED evidence that input's delay is ~one segment, not one frame:
+        // the input landed with the great majority of the frame's segments still
+        // behind it. `before` is only the segments already committed to the
+        // socket buffer when the input was queued (a handful of ~64 KiB
+        // segments), never all 32.
+        assert!(
+            before < after,
+            "input must beat most of the frame's segments (before={before}, after={after})"
+        );
+        assert!(
+            after >= segment_count / 2,
+            "the majority of the frame must arrive after the input (before={before}, after={after})"
         );
     }
 
@@ -1632,7 +2401,9 @@ mod tests {
             TcpSession::start(client, TcpParams::default(), SessionConfig::default())
                 .expect("client session");
 
-        host_session.close_graceful("host is going away", Duration::from_secs(2)).await;
+        host_session
+            .close_graceful("host is going away", Duration::from_secs(2))
+            .await;
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_bye = false;
@@ -1647,8 +2418,14 @@ mod tests {
                 Err(_) => continue,
             }
         }
-        assert!(saw_bye, "expected a structured ControlMsg::Bye from the peer");
-        assert!(client_session.is_closed(), "receiving Bye must close the session");
+        assert!(
+            saw_bye,
+            "expected a structured ControlMsg::Bye from the peer"
+        );
+        assert!(
+            client_session.is_closed(),
+            "receiving Bye must close the session"
+        );
         assert!(host_session.is_closed());
     }
 
@@ -1659,14 +2436,22 @@ mod tests {
         let id = HostIdentity::generate("cap-host").unwrap();
         let (host, mut client) = pair(&id, TcpParams::default()).await;
 
-        let cfg = SessionConfig { heartbeat_ms: 0, stats_interval_ms: 0, ..Default::default() };
+        let cfg = SessionConfig {
+            heartbeat_ms: 0,
+            stats_interval_ms: 0,
+            ..Default::default()
+        };
         let (host_session, mut host_rx) =
             TcpSession::start(host, TcpParams::default(), cfg).expect("host session");
 
         // Claim a 3 GiB media body. `parse_frame_len` must reject it on sight.
         let mut hostile = vec![channel_tag(Channel::Media).unwrap()];
         hostile.extend_from_slice(&(3_000_000_000u32).to_le_bytes());
-        client.stream.write_all(&hostile).await.expect("write hostile prefix");
+        client
+            .stream
+            .write_all(&hostile)
+            .await
+            .expect("write hostile prefix");
         client.stream.flush().await.expect("flush");
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1691,20 +2476,37 @@ mod tests {
             l.local_addr().unwrap()
         };
         let id = HostIdentity::generate("nobody").unwrap();
-        let retry =
-            RetryPolicy { max_attempts: 3, initial_backoff_ms: 1, max_backoff_ms: 4 };
-        let params = TcpParams { connect_timeout_ms: 500, ..Default::default() };
-        let err = connect_with_retry(dead, ServerPinning::Pinned(*id.spki_sha256()), &params, retry)
-            .await
-            .expect_err("nothing is listening");
+        let retry = RetryPolicy {
+            max_attempts: 3,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 4,
+        };
+        let params = TcpParams {
+            connect_timeout_ms: 500,
+            ..Default::default()
+        };
+        let err = connect_with_retry(
+            dead,
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+            retry,
+        )
+        .await
+        .expect_err("nothing is listening");
         let text = err.to_string();
         assert!(text.contains("after 3 attempts"), "{text}");
 
-        let none = RetryPolicy { max_attempts: 0, ..Default::default() };
-        assert!(
-            connect_with_retry(dead, ServerPinning::Pinned(*id.spki_sha256()), &params, none)
-                .await
-                .is_err()
-        );
+        let none = RetryPolicy {
+            max_attempts: 0,
+            ..Default::default()
+        };
+        assert!(connect_with_retry(
+            dead,
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+            none
+        )
+        .await
+        .is_err());
     }
 }

@@ -83,7 +83,10 @@ fn assert_input_stream_intact(sim: &Sim, label: &str) {
         sent.len(),
         injected.len()
     );
-    assert!(!injected.is_empty(), "{label}: no input was delivered at all");
+    assert!(
+        !injected.is_empty(),
+        "{label}: no input was delivered at all"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +225,10 @@ fn clean_link_presents_every_frame_in_order() -> Result<()> {
         "expected ~166 frames in {DURATION_CLEAN} ms, got {}",
         presented.len()
     );
-    assert_eq!(presented[0].frame_id, 1, "numbering starts at the first frame");
+    assert_eq!(
+        presented[0].frame_id, 1,
+        "numbering starts at the first frame"
+    );
     assert!(presented[0].keyframe, "a session opens on a keyframe");
     assert_contiguous(&presented, "clean");
     assert_all_hashes_ok(&presented, "clean");
@@ -417,7 +423,11 @@ fn total_outage_stalls_then_recovers() -> Result<()> {
 
     // Before: a healthy stream.
     let before = log.presented_between(0, OUTAGE_START_MS);
-    assert!(before.len() > 90, "got {} frames before the outage", before.len());
+    assert!(
+        before.len() > 90,
+        "got {} frames before the outage",
+        before.len()
+    );
     assert_all_hashes_ok(&before, "outage/before");
 
     // During: nothing. A datagram is lost if it is sent into the window *or*
@@ -425,7 +435,8 @@ fn total_outage_stalls_then_recovers() -> Result<()> {
     // until one full latency after it lifts.
     let dark_until = OUTAGE_END_MS + params.latency_ms;
     assert!(
-        log.presented_between(OUTAGE_START_MS, dark_until).is_empty(),
+        log.presented_between(OUTAGE_START_MS, dark_until)
+            .is_empty(),
         "frames were presented while the link was down: {:?}",
         log.presented_between(OUTAGE_START_MS, dark_until)
     );
@@ -493,7 +504,11 @@ fn total_outage_stalls_then_recovers() -> Result<()> {
     // No wedge: the reassembler is healthy and the stream is still moving.
     assert_still_live(&sim, "outage");
     assert!(log.control_rejections().is_empty());
-    assert_eq!(sim.host().route(), Route::Datagram, "no fallback in this row");
+    assert_eq!(
+        sim.host().route(),
+        Route::Datagram,
+        "no fallback in this row"
+    );
     Ok(())
 }
 
@@ -564,12 +579,19 @@ fn loss_spike_forces_keyframe_recovery() -> Result<()> {
         keyframe.at_ms,
         SPIKE_END_MS + recovery_bound
     );
-    assert!(keyframe.at_ms > honor, "the keyframe must follow the request");
+    assert!(
+        keyframe.at_ms > honor,
+        "the keyframe must follow the request"
+    );
     assert!(keyframe.hash_ok);
 
     // And the stream continues past it.
     let resumed = log.presented_between(keyframe.at_ms, sim.now_ms());
-    assert!(resumed.len() > 100, "only {} frames after recovery", resumed.len());
+    assert!(
+        resumed.len() > 100,
+        "only {} frames after recovery",
+        resumed.len()
+    );
     assert_still_live(&sim, "loss spike");
     Ok(())
 }
@@ -603,9 +625,16 @@ fn bitrate_falls_under_loss_and_recovers_when_clean() -> Result<()> {
     let (down, up) = sequence.split_at(trough + 1);
     assert!(down.len() >= 5 && down.windows(2).all(|w| w[1] < w[0]));
     assert!(up.len() >= 4 && up.windows(2).all(|w| w[1] > w[0]));
-    assert!(down[0] < adapt.start_kbps, "the first move must be downward");
+    assert!(
+        down[0] < adapt.start_kbps,
+        "the first move must be downward"
+    );
     for step in up.windows(2) {
-        assert_eq!(step[1] - step[0], adapt.step_kbps, "increase must be additive");
+        assert_eq!(
+            step[1] - step[0],
+            adapt.step_kbps,
+            "increase must be additive"
+        );
     }
 
     // Every decrease belongs to the lossy phase, every increase to the clean one.
@@ -621,7 +650,10 @@ fn bitrate_falls_under_loss_and_recovers_when_clean() -> Result<()> {
             "bitrate rose to {kbps} at {at_ms} ms, while the link was still lossy"
         );
     }
-    assert_eq!(sim.host().bitrate_kbps(), *sequence.last().expect("changes"));
+    assert_eq!(
+        sim.host().bitrate_kbps(),
+        *sequence.last().expect("changes")
+    );
 
     // The feedback that drove it: real measurements, above the adaptor's 2%
     // congestion threshold while lossy and exactly zero once clean.
@@ -639,7 +671,10 @@ fn bitrate_falls_under_loss_and_recovers_when_clean() -> Result<()> {
     );
     // A settled clean link reports no loss at all.
     for (at_ms, loss) in reports.iter().filter(|(t, _)| *t > ADAPT_PHASE_MS + 1_000) {
-        assert_eq!(*loss, 0.0, "loss {loss} reported at {at_ms} on a clean link");
+        assert_eq!(
+            *loss, 0.0,
+            "loss {loss} reported at {at_ms} on a clean link"
+        );
     }
 
     assert_all_hashes_ok(&log.presented(), "adaptation");
@@ -721,18 +756,28 @@ fn blocked_datagrams_fall_back_to_the_reliable_path() -> Result<()> {
     let engaged = log
         .fallback_engaged_at()
         .expect("the host must engage the fallback");
-    assert_eq!(requested, cfg.fallback_probe_ms, "detected on the probe window");
+    assert_eq!(
+        requested, cfg.fallback_probe_ms,
+        "detected on the probe window"
+    );
     assert!(engaged >= requested + params.latency_ms && engaged <= requested + 100);
     assert_eq!(sim.host().route(), Route::Fallback);
     assert_eq!(sim.client().route(), Route::Fallback);
 
     // Video flows again, over the reliable path, intact and in order.
     let presented = log.presented();
-    assert!(presented.len() > 150, "only {} frames presented", presented.len());
+    assert!(
+        presented.len() > 150,
+        "only {} frames presented",
+        presented.len()
+    );
     assert!(presented.iter().all(|p| p.route == Route::Fallback));
     assert_all_hashes_ok(&presented, "fallback");
     assert_strictly_increasing(&presented, "fallback");
-    assert!(presented[0].keyframe, "a path change must re-anchor the decoder");
+    assert!(
+        presented[0].keyframe,
+        "a path change must re-anchor the decoder"
+    );
     assert_still_live(&sim, "fallback");
     assert!(log.control_rejections().is_empty());
 
@@ -753,9 +798,8 @@ fn blocked_datagrams_fall_back_to_the_reliable_path() -> Result<()> {
     // A video record waits for everything the backlog cap allows plus the record
     // on the wire, and for the control and input records that overtake it — a
     // few tens of bytes each, generously four ticks.
-    let video_bound = ticks_for((cfg.mux_max_video_backlog + 1) * record_bytes)
-        + 4 * cfg.tick_ms
-        + net_ms;
+    let video_bound =
+        ticks_for((cfg.mux_max_video_backlog + 1) * record_bytes) + 4 * cfg.tick_ms + net_ms;
     assert_eq!((control_bound, input_bound, video_bound), (90, 95, 260));
 
     let deliveries = log.mux_deliveries();

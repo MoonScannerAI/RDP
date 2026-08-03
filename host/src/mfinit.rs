@@ -49,7 +49,9 @@ impl MfThread {
             }
         }
         DEPTH.with(|d| d.set(depth + 1));
-        Ok(Self { _not_send: PhantomData })
+        Ok(Self {
+            _not_send: PhantomData,
+        })
     }
 }
 

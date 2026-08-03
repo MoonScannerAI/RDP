@@ -706,6 +706,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "sha2",
+ "socket2",
  "spake2",
  "subtle",
  "thiserror 2.0.19",

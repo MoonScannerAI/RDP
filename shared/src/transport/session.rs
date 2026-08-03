@@ -43,8 +43,8 @@
 //! reassembler underneath it still takes an injected `now_ms`, measured from
 //! session start, which is what keeps its own tests deterministic.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -56,7 +56,7 @@ use crate::error::{Error, Result};
 use crate::protocol::{ControlMsg, InputMsg};
 use crate::stats::{ConnStats, TransportRoute};
 use crate::transport::quic::{self, SessionStreams};
-use crate::transport::reassembly::{Reassembler, ReassemblyConfig};
+use crate::transport::reassembly::{Reassembler, ReassemblyConfig, ReassemblyStats};
 use crate::video::EncodedFrame;
 
 /// Something the driver noticed that is not itself a protocol message.
@@ -111,7 +111,9 @@ impl SessionConfig {
     /// Reject configurations that would deadlock or spin.
     pub fn validate(&self) -> Result<()> {
         if self.control_capacity == 0 || self.input_capacity == 0 || self.video_capacity == 0 {
-            return Err(Error::Invalid("session queue capacities must be non-zero".into()));
+            return Err(Error::Invalid(
+                "session queue capacities must be non-zero".into(),
+            ));
         }
         Ok(())
     }
@@ -170,6 +172,11 @@ struct Shared {
     started: Instant,
     closed: AtomicBool,
     stats: Mutex<ConnStats>,
+    /// The inbound video reassembler's cumulative counters, republished after
+    /// every datagram so the stats sampler can turn them into a true
+    /// application-level delivery-loss figure — one that includes quinn's
+    /// silent datagram discards, which never touch its packet-loss counter.
+    reassembly: Mutex<ReassemblyStats>,
     /// Token and send time of the outstanding heartbeat, if any.
     pending_ping: Mutex<Option<(u64, Instant)>>,
     counters: Counters,
@@ -191,7 +198,9 @@ impl Shared {
 
     fn mark_closed(&self, reason: &str) {
         if !self.closed.swap(true, Ordering::SeqCst) {
-            self.emit(SessionEvent::Closed { reason: reason.to_string() });
+            self.emit(SessionEvent::Closed {
+                reason: reason.to_string(),
+            });
         }
     }
 }
@@ -237,6 +246,7 @@ impl QuicSession {
             started: Instant::now(),
             closed: AtomicBool::new(false),
             stats: Mutex::new(ConnStats::default()),
+            reassembly: Mutex::new(ReassemblyStats::default()),
             pending_ping: Mutex::new(None),
             counters: Counters::default(),
             control_out: control_out_tx,
@@ -260,8 +270,17 @@ impl QuicSession {
             control_recv,
             control_in_tx,
         )));
-        tasks.push(tokio::spawn(write_loop(shared.clone(), input_send, input_out_rx, "input")));
-        tasks.push(tokio::spawn(input_read_loop(shared.clone(), input_recv, input_in_tx)));
+        tasks.push(tokio::spawn(write_loop(
+            shared.clone(),
+            input_send,
+            input_out_rx,
+            "input",
+        )));
+        tasks.push(tokio::spawn(input_read_loop(
+            shared.clone(),
+            input_recv,
+            input_in_tx,
+        )));
         tasks.push(tokio::spawn(video_send_loop(shared.clone(), video_out_rx)));
         tasks.push(tokio::spawn(video_recv_loop(
             shared.clone(),
@@ -269,14 +288,23 @@ impl QuicSession {
             config.reassembly,
         )));
         if config.heartbeat_ms > 0 {
-            tasks.push(tokio::spawn(heartbeat_loop(shared.clone(), config.heartbeat_ms)));
+            tasks.push(tokio::spawn(heartbeat_loop(
+                shared.clone(),
+                config.heartbeat_ms,
+            )));
         }
         if config.stats_interval_ms > 0 {
-            tasks.push(tokio::spawn(stats_loop(shared.clone(), config.stats_interval_ms)));
+            tasks.push(tokio::spawn(stats_loop(
+                shared.clone(),
+                config.stats_interval_ms,
+            )));
         }
         tasks.push(tokio::spawn(closed_watch(shared.clone())));
 
-        let session = Self { shared, tasks: Mutex::new(tasks) };
+        let session = Self {
+            shared,
+            tasks: Mutex::new(tasks),
+        };
         let receivers = SessionReceivers {
             control: control_in_rx,
             input: input_in_rx,
@@ -288,12 +316,18 @@ impl QuicSession {
 
     /// Number of video frames dropped locally because the send queue was full.
     pub fn frames_dropped_local(&self) -> u64 {
-        self.shared.counters.video_frames_dropped_local.load(Ordering::Relaxed)
+        self.shared
+            .counters
+            .video_frames_dropped_local
+            .load(Ordering::Relaxed)
     }
 
     /// Number of keyframe requests this side has sent.
     pub fn keyframes_requested(&self) -> u64 {
-        self.shared.counters.keyframes_requested.load(Ordering::Relaxed)
+        self.shared
+            .counters
+            .keyframes_requested
+            .load(Ordering::Relaxed)
     }
 
     /// The underlying connection, for callers that need `export_keying_material`
@@ -315,7 +349,9 @@ impl QuicSession {
     /// response before closing locally. Use it whenever there is an async
     /// context available — which is every normal shutdown path.
     pub async fn close_graceful(&self, reason: &str, grace: Duration) {
-        let _ = self.shared.control_out.try_send(ControlMsg::Bye { reason: reason.to_string() });
+        let _ = self.shared.control_out.try_send(ControlMsg::Bye {
+            reason: reason.to_string(),
+        });
 
         let deadline = Instant::now() + grace;
         // Phase 1: let the writer task drain the queue onto the stream.
@@ -373,7 +409,10 @@ impl Session for QuicSession {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // Deliberate: a queued video frame is stale latency.
-                self.shared.counters.video_frames_dropped_local.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .counters
+                    .video_frames_dropped_local
+                    .fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => Err(Error::Transport(format!("video queue: {e}"))),
@@ -385,7 +424,9 @@ impl Session for QuicSession {
         // race against the connection close discarding buffered stream data —
         // the peer still learns the reason from the CONNECTION_CLOSE frame.
         // Prefer [`QuicSession::close_graceful`] when an async context exists.
-        let _ = self.shared.control_out.try_send(ControlMsg::Bye { reason: reason.to_string() });
+        let _ = self.shared.control_out.try_send(ControlMsg::Bye {
+            reason: reason.to_string(),
+        });
         self.shared.mark_closed(reason);
         self.shared.conn.close(0u32.into(), reason.as_bytes());
     }
@@ -407,7 +448,9 @@ async fn write_loop<T: serde::Serialize + Send + 'static>(
 ) {
     while let Some(msg) = rx.recv().await {
         if let Err(e) = quic::write_framed(&mut stream, &msg).await {
-            shared.emit(SessionEvent::Warning { detail: format!("{label} write: {e}") });
+            shared.emit(SessionEvent::Warning {
+                detail: format!("{label} write: {e}"),
+            });
             shared.mark_closed(&format!("{label} stream write failed"));
             return;
         }
@@ -432,7 +475,11 @@ async fn control_read_loop(
         match msg {
             ControlMsg::Ping { token } => {
                 // Answer immediately; never surface to the application.
-                if shared.control_out.try_send(ControlMsg::Pong { token }).is_err() {
+                if shared
+                    .control_out
+                    .try_send(ControlMsg::Pong { token })
+                    .is_err()
+                {
                     shared.emit(SessionEvent::Warning {
                         detail: "could not answer Ping: control queue full".into(),
                     });
@@ -462,7 +509,9 @@ async fn control_read_loop(
                 }
             }
             ControlMsg::Bye { reason } => {
-                shared.emit(SessionEvent::PeerClosed { reason: reason.clone() });
+                shared.emit(SessionEvent::PeerClosed {
+                    reason: reason.clone(),
+                });
                 shared.mark_closed(&format!("peer said bye: {reason}"));
                 return;
             }
@@ -489,11 +538,7 @@ async fn control_read_loop(
     }
 }
 
-async fn input_read_loop(
-    shared: Arc<Shared>,
-    mut stream: RecvStream,
-    tx: mpsc::Sender<InputMsg>,
-) {
+async fn input_read_loop(shared: Arc<Shared>, mut stream: RecvStream, tx: mpsc::Sender<InputMsg>) {
     loop {
         let msg: InputMsg = match quic::read_control(&mut stream).await {
             Ok(m) => m,
@@ -505,7 +550,9 @@ async fn input_read_loop(
         // Validate before handing an event to something that will inject it.
         if let InputMsg::Event(ev) = &msg {
             if let Err(e) = crate::input::validate_event(ev) {
-                shared.emit(SessionEvent::Warning { detail: format!("bad input event: {e}") });
+                shared.emit(SessionEvent::Warning {
+                    detail: format!("bad input event: {e}"),
+                });
                 continue;
             }
         }
@@ -521,7 +568,9 @@ async fn video_send_loop(shared: Arc<Shared>, mut rx: mpsc::Receiver<EncodedFram
         let mtu = match quic::max_datagram(&shared.conn) {
             Ok(m) => m,
             Err(e) => {
-                shared.emit(SessionEvent::Warning { detail: format!("no datagrams: {e}") });
+                shared.emit(SessionEvent::Warning {
+                    detail: format!("no datagrams: {e}"),
+                });
                 shared.mark_closed("peer does not support datagrams");
                 return;
             }
@@ -529,13 +578,17 @@ async fn video_send_loop(shared: Arc<Shared>, mut rx: mpsc::Receiver<EncodedFram
         let frags = match crate::video::fragment_frame(&frame, mtu) {
             Ok(f) => f,
             Err(e) => {
-                shared.emit(SessionEvent::Warning { detail: format!("fragment: {e}") });
+                shared.emit(SessionEvent::Warning {
+                    detail: format!("fragment: {e}"),
+                });
                 continue;
             }
         };
         for frag in frags {
             if let Err(e) = shared.conn.send_datagram(bytes::Bytes::from(frag)) {
-                shared.emit(SessionEvent::Warning { detail: format!("send datagram: {e}") });
+                shared.emit(SessionEvent::Warning {
+                    detail: format!("send datagram: {e}"),
+                });
                 break;
             }
         }
@@ -561,7 +614,9 @@ async fn video_recv_loop(
         if let Err(e) = reassembler.push(&datagram, now_ms) {
             // A malformed datagram is logged and ignored. It must never kill
             // the session: anyone on the path can inject one.
-            shared.emit(SessionEvent::Warning { detail: format!("bad video datagram: {e}") });
+            shared.emit(SessionEvent::Warning {
+                detail: format!("bad video datagram: {e}"),
+            });
         }
 
         while let Some(frame) = reassembler.pop_frame() {
@@ -573,10 +628,18 @@ async fn video_recv_loop(
         }
 
         if reassembler.take_keyframe_request(now_ms) {
-            shared.counters.keyframes_requested.fetch_add(1, Ordering::Relaxed);
+            shared
+                .counters
+                .keyframes_requested
+                .fetch_add(1, Ordering::Relaxed);
             let _ = shared.control_out.try_send(ControlMsg::RequestKeyframe);
             shared.emit(SessionEvent::KeyframeNeeded);
         }
+
+        // Publish the reassembler's counters for the stats sampler. Cheap: a
+        // `Copy` of a handful of `u64`s under an uncontended lock, once per
+        // datagram.
+        *shared.reassembly.lock() = reassembler.stats();
     }
 }
 
@@ -592,7 +655,11 @@ async fn heartbeat_loop(shared: Arc<Shared>, interval_ms: u64) {
         // A still-outstanding ping means the peer missed the last one. Replace
         // it rather than accumulating state.
         *shared.pending_ping.lock() = Some((token, Instant::now()));
-        if shared.control_out.try_send(ControlMsg::Ping { token }).is_err() {
+        if shared
+            .control_out
+            .try_send(ControlMsg::Ping { token })
+            .is_err()
+        {
             shared.emit(SessionEvent::Warning {
                 detail: "heartbeat skipped: control queue full".into(),
             });
@@ -605,6 +672,7 @@ async fn stats_loop(shared: Arc<Shared>, interval_ms: u64) {
     let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prev = StatsSample::from_quinn(&shared.conn.stats());
+    let mut prev_reasm = *shared.reassembly.lock();
     let mut prev_at = Instant::now();
 
     loop {
@@ -613,6 +681,7 @@ async fn stats_loop(shared: Arc<Shared>, interval_ms: u64) {
             return;
         }
         let cur = StatsSample::from_quinn(&shared.conn.stats());
+        let cur_reasm = *shared.reassembly.lock();
         let dt_ms = prev_at.elapsed().as_millis() as u64;
         prev_at = Instant::now();
 
@@ -621,18 +690,29 @@ async fn stats_loop(shared: Arc<Shared>, interval_ms: u64) {
             let sampled = delta_stats(&prev, &cur, dt_ms, stats.jitter_ms);
             // The heartbeat measures RTT more directly than quinn's estimate
             // once a Pong has landed, so keep whichever we have.
-            let rtt_ms = if stats.rtt_ms > 0.0 { stats.rtt_ms } else { sampled.rtt_ms };
+            let rtt_ms = if stats.rtt_ms > 0.0 {
+                stats.rtt_ms
+            } else {
+                sampled.rtt_ms
+            };
             stats.rtt_ms = rtt_ms;
             stats.jitter_ms = sampled.jitter_ms;
-            stats.loss = sampled.loss;
+            // True delivery loss. `sampled.loss` is quinn's packet-loss counter,
+            // which never sees a silently discarded datagram; `video_loss` is
+            // derived from the receiver's own fragment/frame accounting and does.
+            // Take the larger so neither source can hide loss from the adaptor.
+            stats.loss = video_loss(&prev_reasm, &cur_reasm).max(sampled.loss);
             stats.bandwidth_kbps = sampled.bandwidth_kbps;
             stats.keyframes_requested =
                 shared.counters.keyframes_requested.load(Ordering::Relaxed) as u32;
-            stats.frames_dropped =
-                shared.counters.video_frames_dropped_local.load(Ordering::Relaxed) as u32;
+            stats.frames_dropped = shared
+                .counters
+                .video_frames_dropped_local
+                .load(Ordering::Relaxed) as u32;
             *stats
         };
         prev = cur;
+        prev_reasm = cur_reasm;
         shared.emit(SessionEvent::Stats(snapshot));
     }
 }
@@ -686,6 +766,48 @@ pub fn ewma_jitter(prev_jitter_ms: f32, prev_rtt_ms: f32, rtt_ms: f32) -> f32 {
     prev_jitter_ms + JITTER_ALPHA * (delta - prev_jitter_ms)
 }
 
+/// Windowed application-level video **delivery loss**, in `0.0..=1.0`.
+///
+/// This is the number quinn cannot give us. QUIC datagrams are unreliable and
+/// unacknowledged: when the send path or the kernel socket buffer cannot place
+/// one, it is dropped without ever becoming a tracked "packet", so
+/// `Connection::stats().path.lost_packets` stays at zero while video is
+/// vanishing. The receiver, however, *can* see the hole — a frame that never
+/// gets all its fragments cannot be reassembled and is abandoned. Comparing two
+/// [`ReassemblyStats`] snapshots turns that into a fraction.
+///
+/// A frame is counted as *lost* when it was abandoned for want of fragments
+/// (`frames_dropped_incomplete`) or left behind by newer frames before it could
+/// finish (`frames_dropped_stale`) — both mean data that was sent did not
+/// arrive in time to decode. Frames merely skipped by the latest-wins policy or
+/// dropped as reordered stragglers are **not** loss: those arrived complete and
+/// were discarded on purpose, so including them would slander a healthy link.
+///
+/// ```text
+/// loss = (Δincomplete + Δstale) / (Δcompleted + Δincomplete + Δstale)
+/// ```
+///
+/// The denominator is every frame the receiver could account for in the window,
+/// so with no video traffic the result is a clean `0.0`. It reads only
+/// [`ReassemblyStats`], so the TCP fallback — which will run the same
+/// reassembler — can feed it identically.
+pub fn video_loss(prev: &ReassemblyStats, cur: &ReassemblyStats) -> f32 {
+    let completed = cur.frames_completed.saturating_sub(prev.frames_completed);
+    let incomplete = cur
+        .frames_dropped_incomplete
+        .saturating_sub(prev.frames_dropped_incomplete);
+    let stale = cur
+        .frames_dropped_stale
+        .saturating_sub(prev.frames_dropped_stale);
+
+    let lost = incomplete.saturating_add(stale);
+    let total = completed.saturating_add(lost);
+    if total == 0 {
+        return 0.0;
+    }
+    (lost as f32 / total as f32).clamp(0.0, 1.0)
+}
+
 /// Turn two cumulative samples into a windowed [`ConnStats`].
 ///
 /// Only the fields the transport can actually observe are filled; the capture,
@@ -702,7 +824,11 @@ pub fn delta_stats(
 
     let sent = cur.sent_packets.saturating_sub(prev.sent_packets);
     let lost = cur.lost_packets.saturating_sub(prev.lost_packets);
-    let loss = if sent == 0 { 0.0 } else { (lost as f32 / sent as f32).clamp(0.0, 1.0) };
+    let loss = if sent == 0 {
+        0.0
+    } else {
+        (lost as f32 / sent as f32).clamp(0.0, 1.0)
+    };
 
     let bytes = cur
         .rx_bytes
@@ -727,21 +853,28 @@ pub fn delta_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::HostIdentity;
     use crate::crypto::tls::ServerPinning;
+    use crate::crypto::HostIdentity;
     use crate::transport::quic::QuicParams;
     use crate::video::EncodedFrame;
 
     #[test]
     fn config_validation() {
         assert!(SessionConfig::default().validate().is_ok());
-        let bad = SessionConfig { video_capacity: 0, ..SessionConfig::default() };
+        let bad = SessionConfig {
+            video_capacity: 0,
+            ..SessionConfig::default()
+        };
         assert!(bad.validate().is_err());
     }
 
     #[test]
     fn jitter_starts_at_zero_and_converges() {
-        assert_eq!(ewma_jitter(0.0, 0.0, 50.0), 0.0, "no previous RTT means no jitter yet");
+        assert_eq!(
+            ewma_jitter(0.0, 0.0, 50.0),
+            0.0,
+            "no previous RTT means no jitter yet"
+        );
         let j1 = ewma_jitter(0.0, 20.0, 30.0);
         assert!(j1 > 0.0 && j1 < 10.0);
         // A steady RTT decays the estimate back toward zero.
@@ -785,16 +918,118 @@ mod tests {
 
         // Counters going backwards (should not happen, but must not panic or
         // produce NaN) are absorbed by the saturating arithmetic.
-        let high = StatsSample { sent_packets: 10, lost_packets: 5, ..Default::default() };
+        let high = StatsSample {
+            sent_packets: 10,
+            lost_packets: 5,
+            ..Default::default()
+        };
         let low = StatsSample::default();
         let s = delta_stats(&high, &low, 100, 0.0);
         assert!(crate::stats::validate_stats(&s));
     }
 
     #[test]
+    fn video_loss_zero_when_no_frames_and_when_all_complete() {
+        let z = ReassemblyStats::default();
+        // No traffic at all: a clean zero, never a divide-by-zero.
+        assert_eq!(video_loss(&z, &z), 0.0);
+
+        // 100 frames completed, nothing dropped: no loss.
+        let cur = ReassemblyStats {
+            frames_completed: 100,
+            ..z
+        };
+        assert_eq!(video_loss(&z, &cur), 0.0);
+    }
+
+    #[test]
+    fn video_loss_counts_incomplete_and_stale_only() {
+        let prev = ReassemblyStats::default();
+        // Window: 90 delivered, 8 abandoned incomplete, 2 aged out stale ->
+        // 10 lost of 100 accounted = 0.10.
+        let cur = ReassemblyStats {
+            frames_completed: 90,
+            frames_dropped_incomplete: 8,
+            frames_dropped_stale: 2,
+            // These must NOT count as loss: they arrived complete and were
+            // dropped deliberately.
+            frames_skipped_latest_wins: 50,
+            frames_dropped_reorder: 5,
+            ..prev
+        };
+        assert!(
+            (video_loss(&prev, &cur) - 0.10).abs() < 1e-6,
+            "{}",
+            video_loss(&prev, &cur)
+        );
+    }
+
+    #[test]
+    fn video_loss_is_windowed_via_deltas() {
+        // Cumulative counters: only the change since the previous sample counts.
+        let prev = ReassemblyStats {
+            frames_completed: 500,
+            frames_dropped_incomplete: 20,
+            ..ReassemblyStats::default()
+        };
+        // This window: +10 completed, +10 incomplete -> 0.5, regardless of the
+        // large history already accrued.
+        let cur = ReassemblyStats {
+            frames_completed: 510,
+            frames_dropped_incomplete: 30,
+            ..prev
+        };
+        assert!((video_loss(&prev, &cur) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn video_loss_half_datagrams_lost_reads_as_heavy_loss() {
+        // The bug this whole change is about: ~half the datagrams silently
+        // vanish, so almost every multi-fragment frame fails to assemble. quinn
+        // reports 0.00 loss; the reassembler-derived figure does not.
+        let prev = ReassemblyStats::default();
+        let cur = ReassemblyStats {
+            frames_completed: 118,
+            frames_dropped_incomplete: 114,
+            ..prev
+        };
+        let loss = video_loss(&prev, &cur);
+        assert!(loss > 0.4, "expected heavy loss, got {loss}");
+        assert!((0.0..=1.0).contains(&loss));
+        let s = ConnStats {
+            loss,
+            ..ConnStats::default()
+        };
+        assert!(crate::stats::validate_stats(&s));
+    }
+
+    #[test]
+    fn video_loss_absorbs_counter_resets() {
+        // Counters going backwards (a reset that must never happen, but must not
+        // panic or produce NaN/negative) saturate to a clean zero.
+        let high = ReassemblyStats {
+            frames_completed: 100,
+            frames_dropped_incomplete: 50,
+            ..ReassemblyStats::default()
+        };
+        let low = ReassemblyStats::default();
+        let loss = video_loss(&high, &low);
+        assert_eq!(loss, 0.0);
+        assert!(loss.is_finite());
+    }
+
+    #[test]
     fn loss_is_clamped_to_unit_range() {
-        let prev = StatsSample { sent_packets: 100, lost_packets: 0, ..Default::default() };
-        let cur = StatsSample { sent_packets: 110, lost_packets: 500, ..Default::default() };
+        let prev = StatsSample {
+            sent_packets: 100,
+            lost_packets: 0,
+            ..Default::default()
+        };
+        let cur = StatsSample {
+            sent_packets: 110,
+            lost_packets: 500,
+            ..Default::default()
+        };
         let s = delta_stats(&prev, &cur, 1000, 0.0);
         assert!((0.0..=1.0).contains(&s.loss));
         assert!(crate::stats::validate_stats(&s));
@@ -806,18 +1041,27 @@ mod tests {
     async fn loopback_session_moves_all_three_channels() {
         let id = HostIdentity::generate("session-host").unwrap();
         let params = QuicParams::default();
-        let server = quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params)
-            .unwrap();
+        let server =
+            quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let host_task = tokio::spawn(async move {
-            let conn = server.accept().await.expect("incoming").await.expect("handshake");
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
             let streams = quic::accept_streams(&conn).await.expect("accept streams");
             let (session, mut rx) = QuicSession::start(
                 conn,
                 streams,
                 TransportRoute::DirectUdp,
-                SessionConfig { heartbeat_ms: 100, stats_interval_ms: 100, ..Default::default() },
+                SessionConfig {
+                    heartbeat_ms: 100,
+                    stats_interval_ms: 100,
+                    ..Default::default()
+                },
             )
             .expect("host session");
 
@@ -855,13 +1099,19 @@ mod tests {
             &params,
         )
         .unwrap();
-        let conn = quic::connect(&client_ep, server_addr).await.expect("connect");
+        let conn = quic::connect(&client_ep, server_addr)
+            .await
+            .expect("connect");
         let streams = quic::open_streams(&conn).await.expect("open streams");
         let (session, mut rx) = QuicSession::start(
             conn,
             streams,
             TransportRoute::DirectUdp,
-            SessionConfig { heartbeat_ms: 100, stats_interval_ms: 100, ..Default::default() },
+            SessionConfig {
+                heartbeat_ms: 100,
+                stats_interval_ms: 100,
+                ..Default::default()
+            },
         )
         .expect("client session");
 
@@ -873,7 +1123,9 @@ mod tests {
                 quality_mode: crate::protocol::QualityMode::Balanced,
             })
             .expect("send control");
-        session.send_input(InputMsg::ReleaseAll).expect("send input");
+        session
+            .send_input(InputMsg::ReleaseAll)
+            .expect("send input");
 
         let frame = tokio::time::timeout(Duration::from_secs(10), rx.video.recv())
             .await
@@ -883,17 +1135,27 @@ mod tests {
         assert!(frame.keyframe);
         assert_eq!(frame.timestamp_ms, 1234);
         assert_eq!(frame.data.len(), 8000);
-        assert!(frame.data.iter().enumerate().all(|(i, b)| *b == (i as u32 % 251) as u8));
+        assert!(frame
+            .data
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == (i as u32 % 251) as u8));
 
         // The heartbeat should have produced a real RTT measurement by now.
         tokio::time::sleep(Duration::from_millis(600)).await;
         let stats = session.stats();
-        assert!(stats.rtt_ms >= 0.0 && stats.rtt_ms < 5_000.0, "rtt {}", stats.rtt_ms);
+        assert!(
+            stats.rtt_ms >= 0.0 && stats.rtt_ms < 5_000.0,
+            "rtt {}",
+            stats.rtt_ms
+        );
         assert!(crate::stats::validate_stats(&stats));
         assert!(!session.is_closed());
 
-        let host_stats =
-            tokio::time::timeout(Duration::from_secs(15), host_task).await.unwrap().unwrap();
+        let host_stats = tokio::time::timeout(Duration::from_secs(15), host_task)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(crate::stats::validate_stats(&host_stats));
 
         session.close("test done");
@@ -906,12 +1168,17 @@ mod tests {
     async fn peer_bye_closes_the_session() {
         let id = HostIdentity::generate("bye-host").unwrap();
         let params = QuicParams::default();
-        let server = quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params)
-            .unwrap();
+        let server =
+            quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let host_task = tokio::spawn(async move {
-            let conn = server.accept().await.expect("incoming").await.expect("handshake");
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
             let streams = quic::accept_streams(&conn).await.expect("accept streams");
             let (session, _rx) = QuicSession::start(
                 conn,
@@ -921,7 +1188,9 @@ mod tests {
             )
             .expect("host session");
             tokio::time::sleep(Duration::from_millis(200)).await;
-            session.close_graceful("host is going away", Duration::from_secs(5)).await;
+            session
+                .close_graceful("host is going away", Duration::from_secs(5))
+                .await;
         });
 
         let client_ep = quic::client_endpoint(
@@ -930,11 +1199,17 @@ mod tests {
             &params,
         )
         .unwrap();
-        let conn = quic::connect(&client_ep, server_addr).await.expect("connect");
+        let conn = quic::connect(&client_ep, server_addr)
+            .await
+            .expect("connect");
         let streams = quic::open_streams(&conn).await.expect("open streams");
-        let (session, mut rx) =
-            QuicSession::start(conn, streams, TransportRoute::DirectUdp, SessionConfig::default())
-                .expect("client session");
+        let (session, mut rx) = QuicSession::start(
+            conn,
+            streams,
+            TransportRoute::DirectUdp,
+            SessionConfig::default(),
+        )
+        .expect("client session");
 
         // `close_graceful` must actually deliver the structured `Bye`, not just
         // slam the connection shut — that is the whole point of it existing.

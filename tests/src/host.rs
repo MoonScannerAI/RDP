@@ -20,10 +20,14 @@ use directdesk_shared::protocol::{
     decode_strict, encode_framed, ControlMsg, InputMsg, QualityMode, MAX_CONTROL_MSG,
 };
 use directdesk_shared::stats::{validate_stats, TransportRoute};
-use directdesk_shared::traits::{Encoder, InputInjector, MockInjector, NullEncoder, PixelFormat, RawFrame};
+use directdesk_shared::traits::{
+    Encoder, InputInjector, MockInjector, NullEncoder, PixelFormat, RawFrame,
+};
 use directdesk_shared::video::fragment_frame;
 
-use crate::config::{SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C, STREAM_INPUT};
+use crate::config::{
+    SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C, STREAM_INPUT,
+};
 use crate::event::{Route, SimEvent};
 use crate::frames::synth_payload;
 use crate::framing::{encode_frame_record, strip_length_prefix, FramedReader, MuxClass};
@@ -223,7 +227,8 @@ impl SimHost {
         match msg {
             ControlMsg::RequestKeyframe => {
                 self.encoder.request_keyframe();
-                ctx.log.push(SimEvent::KeyframeHonored { at_ms: ctx.now_ms });
+                ctx.log
+                    .push(SimEvent::KeyframeHonored { at_ms: ctx.now_ms });
             }
             ControlMsg::Ping { token } => {
                 self.send_control(ctx, &ControlMsg::Pong { token })?;
@@ -249,9 +254,7 @@ impl SimHost {
                     });
                 }
             }
-            ControlMsg::RouteReport(TransportRoute::DirectTcp)
-                if self.route == Route::Datagram =>
-            {
+            ControlMsg::RouteReport(TransportRoute::DirectTcp) if self.route == Route::Datagram => {
                 self.engage_fallback(ctx)?;
             }
             _ => {}
@@ -269,7 +272,8 @@ impl SimHost {
         self.send_control(ctx, &ControlMsg::RouteReport(TransportRoute::DirectTcp))?;
         self.route = Route::Fallback;
         self.encoder.request_keyframe();
-        ctx.log.push(SimEvent::FallbackEngaged { at_ms: ctx.now_ms });
+        ctx.log
+            .push(SimEvent::FallbackEngaged { at_ms: ctx.now_ms });
         Ok(())
     }
 

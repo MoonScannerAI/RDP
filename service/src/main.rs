@@ -271,8 +271,10 @@ fn uninstall() -> anyhow::Result<()> {
 
 fn start() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service =
-        manager.open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)?;
+    let service = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    )?;
 
     match service.start(&[] as &[&OsStr]) {
         Ok(()) => {}
@@ -289,8 +291,10 @@ fn start() -> anyhow::Result<()> {
 
 fn stop() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service =
-        manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
+    let service = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    )?;
 
     match service.stop() {
         Ok(_) => {}
@@ -365,7 +369,10 @@ mod tests {
     fn service_info_matches_the_installer_contract() {
         let info = service_info().unwrap();
         assert_eq!(info.name, std::ffi::OsString::from("DirectDeskService"));
-        assert_eq!(info.display_name, std::ffi::OsString::from("DirectDesk Service"));
+        assert_eq!(
+            info.display_name,
+            std::ffi::OsString::from("DirectDesk Service")
+        );
         assert_eq!(info.start_type, ServiceStartType::AutoStart);
         assert_eq!(info.service_type, ServiceType::OWN_PROCESS);
         assert_eq!(info.error_control, ServiceErrorControl::Normal);

@@ -213,12 +213,16 @@ fn launch_host(host_exe: &std::path::Path) -> Result<Child, LaunchError> {
 fn stop_child(child: &Child) {
     post_close_to_windows(child.pid);
     // SAFETY: our own process handle.
-    let waited = unsafe { WaitForSingleObject(child.process.raw(), GRACEFUL_STOP.as_millis() as u32) };
+    let waited =
+        unsafe { WaitForSingleObject(child.process.raw(), GRACEFUL_STOP.as_millis() as u32) };
     if waited == WAIT_OBJECT_0 {
         tracing::info!(pid = child.pid, "host agent closed gracefully");
         return;
     }
-    tracing::warn!(pid = child.pid, "host agent did not close in time; terminating");
+    tracing::warn!(
+        pid = child.pid,
+        "host agent did not close in time; terminating"
+    );
     // SAFETY: our own process handle.
     unsafe {
         let _ = TerminateProcess(child.process.raw(), 1);
@@ -237,7 +241,10 @@ fn post_close_to_windows(pid: u32) {
     // SAFETY: the callback only touches the `CloseTarget` we pass in, which
     // outlives the (synchronous) enumeration.
     unsafe {
-        let _ = EnumWindows(Some(enum_windows_proc), LPARAM(&mut target as *mut _ as isize));
+        let _ = EnumWindows(
+            Some(enum_windows_proc),
+            LPARAM(&mut target as *mut _ as isize),
+        );
     }
     tracing::debug!(pid, windows = target.posted, "posted WM_CLOSE");
 }
@@ -351,7 +358,10 @@ impl Supervisor {
         let thread = std::thread::Builder::new()
             .name("dd-supervisor".into())
             .spawn(move || supervise(worker))?;
-        Ok(Self { shared, thread: Some(thread) })
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
     }
 
     /// Handle for the IPC dispatcher.
@@ -554,7 +564,10 @@ mod tests {
         assert!(!shared.host_running());
 
         shared.request_restart().unwrap();
-        assert!(shared.wanted(), "an explicit request must arm the supervisor");
+        assert!(
+            shared.wanted(),
+            "an explicit request must arm the supervisor"
+        );
         assert_eq!(shared.wake(), Wake::Restart);
 
         shared.restart.reset();
@@ -582,7 +595,11 @@ mod tests {
         let t0 = Instant::now();
         sup.shutdown();
         sup.shutdown(); // idempotent
-        assert!(t0.elapsed() < Duration::from_secs(3), "shutdown took {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "shutdown took {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
@@ -598,7 +615,11 @@ mod tests {
         shared.request_restart().unwrap();
         let t0 = Instant::now();
         sup.shutdown();
-        assert!(t0.elapsed() < Duration::from_secs(3), "shutdown took {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "shutdown took {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
@@ -612,7 +633,8 @@ mod tests {
 
     #[test]
     fn launch_host_rejects_a_missing_executable_before_touching_the_session() {
-        let err = launch_host(std::path::Path::new(r"C:\nonexistent\DirectDeskHost.exe")).unwrap_err();
+        let err =
+            launch_host(std::path::Path::new(r"C:\nonexistent\DirectDeskHost.exe")).unwrap_err();
         assert!(matches!(err, LaunchError::MissingExe(_)), "got {err:?}");
     }
 

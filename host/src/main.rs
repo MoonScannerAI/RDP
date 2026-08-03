@@ -113,8 +113,8 @@ fn open_identity(cfg: &HostConfig) -> anyhow::Result<(Arc<dyn SecretStore>, Arc<
             ),
         }
     }
-    let store = DpapiFileStore::client()
-        .map_err(|e| anyhow::anyhow!("no usable secret store: {e}"))?;
+    let store =
+        DpapiFileStore::client().map_err(|e| anyhow::anyhow!("no usable secret store: {e}"))?;
     tracing::warn!(
         dir = %store.dir().display(),
         "using the per-user identity store; this host will not work as a service"
@@ -143,8 +143,14 @@ fn selftest(seconds: u64) -> i32 {
     };
 
     let desc = session.describe();
-    println!("adapter       : {} (LUID {:#x})", desc.adapter, desc.adapter_luid);
-    println!("output        : {} at {:?}", desc.output, desc.monitor_origin);
+    println!(
+        "adapter       : {} (LUID {:#x})",
+        desc.adapter, desc.adapter_luid
+    );
+    println!(
+        "output        : {} at {:?}",
+        desc.output, desc.monitor_origin
+    );
     println!("resolution    : {}x{}", desc.width, desc.height);
     println!("encoder       : {}", desc.encoder);
     println!("hardware enc  : {}", desc.hardware_encoder);

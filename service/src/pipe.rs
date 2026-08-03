@@ -69,7 +69,10 @@ const MAX_FRAME: usize = 4 + MAX_IPC_MSG;
 pub fn encode_frame<T: serde::Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
     let body = postcard::to_stdvec(msg)?;
     if body.len() > MAX_IPC_MSG {
-        anyhow::bail!("outgoing message {} bytes exceeds cap {MAX_IPC_MSG}", body.len());
+        anyhow::bail!(
+            "outgoing message {} bytes exceeds cap {MAX_IPC_MSG}",
+            body.len()
+        );
     }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -89,7 +92,10 @@ pub fn decode_request(frame: &[u8]) -> anyhow::Result<SvcRequest> {
     let declared = parse_frame_len(prefix, MAX_IPC_MSG)?;
     let body = &frame[4..];
     if body.len() != declared {
-        anyhow::bail!("frame length mismatch: prefix says {declared}, body is {}", body.len());
+        anyhow::bail!(
+            "frame length mismatch: prefix says {declared}, body is {}",
+            body.len()
+        );
     }
     Ok(decode_strict::<SvcRequest>(body)?)
 }
@@ -221,8 +227,15 @@ pub fn start(pipe_name: &str, backend: Backend, instances: u32) -> anyhow::Resul
         );
     }
 
-    tracing::info!("pipe server listening on {pipe_name} ({} instances)", threads.len());
-    Ok(PipeServer { stop, threads, name: pipe_name.to_string() })
+    tracing::info!(
+        "pipe server listening on {pipe_name} ({} instances)",
+        threads.len()
+    );
+    Ok(PipeServer {
+        stop,
+        threads,
+        name: pipe_name.to_string(),
+    })
 }
 
 fn create_instance(
@@ -235,7 +248,8 @@ fn create_instance(
     if first {
         open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
-    let pipe_mode = PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    let pipe_mode =
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
 
     // SAFETY: name_w is NUL-terminated; sa outlives the call.
     let handle = unsafe {
@@ -282,7 +296,10 @@ fn instance_loop(pipe: OwnedHandle, backend: Backend, stop: Arc<StopSignal>, nam
 /// Wait for a client. `Ok(true)` = connected, `Ok(false)` = shutting down.
 fn accept(pipe: &OwnedHandle, stop: &StopSignal) -> anyhow::Result<bool> {
     let ev = Event::manual_reset()?;
-    let mut ov = OVERLAPPED { hEvent: ev.raw(), ..Default::default() };
+    let mut ov = OVERLAPPED {
+        hEvent: ev.raw(),
+        ..Default::default()
+    };
 
     // SAFETY: ov and its event outlive the operation (we always wait or cancel).
     let r = unsafe { ConnectNamedPipe(pipe.raw(), Some(&mut ov)) };
@@ -315,12 +332,16 @@ fn serve_one(pipe: &OwnedHandle, backend: &Backend, stop: &StopSignal) -> anyhow
             Ok(req) => dispatch(req, backend),
             Err(e) => {
                 tracing::warn!("rejecting malformed request: {e}");
-                SvcResponse::Failed { reason: "malformed request".to_string() }
+                SvcResponse::Failed {
+                    reason: "malformed request".to_string(),
+                }
             }
         },
         Err(ReadError::Oversize) => {
             tracing::warn!("rejecting oversize request (cap {MAX_IPC_MSG} bytes)");
-            SvcResponse::Failed { reason: format!("request exceeds {MAX_IPC_MSG} bytes") }
+            SvcResponse::Failed {
+                reason: format!("request exceeds {MAX_IPC_MSG} bytes"),
+            }
         }
         Err(ReadError::Shutdown) => return Ok(()),
         Err(ReadError::Io(e)) => return Err(e),
@@ -346,7 +367,10 @@ impl From<anyhow::Error> for ReadError {
 
 fn read_message(pipe: &OwnedHandle, stop: &StopSignal, buf: &mut [u8]) -> Result<usize, ReadError> {
     let ev = Event::manual_reset().map_err(ReadError::Io)?;
-    let mut ov = OVERLAPPED { hEvent: ev.raw(), ..Default::default() };
+    let mut ov = OVERLAPPED {
+        hEvent: ev.raw(),
+        ..Default::default()
+    };
     let mut read = 0u32;
 
     // SAFETY: buf, ov and the event outlive the operation.
@@ -358,7 +382,10 @@ fn read_message(pipe: &OwnedHandle, stop: &StopSignal, buf: &mut [u8]) -> Result
             match wait_io(pipe, stop, &ov, ev.raw()) {
                 Ok(Some(n)) => Ok(n),
                 Ok(None) => Err(ReadError::Shutdown),
-                Err(e) if e.downcast_ref::<WinErr>().is_some_and(|w| w.is(ERROR_MORE_DATA)) => {
+                Err(e)
+                    if e.downcast_ref::<WinErr>()
+                        .is_some_and(|w| w.is(ERROR_MORE_DATA)) =>
+                {
                     Err(ReadError::Oversize)
                 }
                 Err(e) => Err(ReadError::Io(e)),
@@ -370,7 +397,10 @@ fn read_message(pipe: &OwnedHandle, stop: &StopSignal, buf: &mut [u8]) -> Result
 
 fn write_message(pipe: &OwnedHandle, stop: &StopSignal, data: &[u8]) -> anyhow::Result<()> {
     let ev = Event::manual_reset()?;
-    let mut ov = OVERLAPPED { hEvent: ev.raw(), ..Default::default() };
+    let mut ov = OVERLAPPED {
+        hEvent: ev.raw(),
+        ..Default::default()
+    };
     let mut written = 0u32;
 
     // SAFETY: data, ov and the event outlive the operation.
@@ -503,7 +533,10 @@ mod tests {
     #[test]
     fn frame_roundtrip() {
         let frame = encode_frame(&SvcRequest::Ping).unwrap();
-        assert_eq!(u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize, frame.len() - 4);
+        assert_eq!(
+            u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize,
+            frame.len() - 4
+        );
         assert_eq!(decode_request(&frame).unwrap(), SvcRequest::Ping);
     }
 
@@ -569,7 +602,9 @@ mod tests {
 
     #[test]
     fn encode_frame_rejects_oversize_payload() {
-        let big = SvcResponse::Failed { reason: "x".repeat(MAX_IPC_MSG + 100) };
+        let big = SvcResponse::Failed {
+            reason: "x".repeat(MAX_IPC_MSG + 100),
+        };
         assert!(encode_frame(&big).is_err());
     }
 
@@ -581,7 +616,10 @@ mod tests {
             .expect("the pipe DACL must be a valid SDDL string");
         assert!(!sd.0.is_invalid());
         let sa = sd.attributes();
-        assert_eq!(sa.nLength as usize, std::mem::size_of::<SECURITY_ATTRIBUTES>());
+        assert_eq!(
+            sa.nLength as usize,
+            std::mem::size_of::<SECURITY_ATTRIBUTES>()
+        );
         assert!(!sa.lpSecurityDescriptor.is_null());
     }
 
@@ -593,9 +631,16 @@ mod tests {
         assert!(PIPE_SDDL.contains("(A;;GA;;;BA)"));
         assert!(PIPE_SDDL.contains("(A;;GRGW;;;IU)"));
         for forbidden in [";;;WD)", ";;;AN)", ";;;NU)", "(D;", "S:"] {
-            assert!(!PIPE_SDDL.contains(forbidden), "unexpected ACE component {forbidden}");
+            assert!(
+                !PIPE_SDDL.contains(forbidden),
+                "unexpected ACE component {forbidden}"
+            );
         }
-        assert_eq!(PIPE_SDDL.matches("(A;").count(), 3, "exactly three allow ACEs");
+        assert_eq!(
+            PIPE_SDDL.matches("(A;").count(),
+            3,
+            "exactly three allow ACEs"
+        );
     }
 
     #[test]
@@ -729,7 +774,10 @@ mod tests {
         let h = harness();
         let server = start(&name, h.backend.clone(), 1).unwrap();
         let second = start(&name, h.backend.clone(), 1);
-        assert!(second.is_err(), "a second server must not be able to claim the pipe name");
+        assert!(
+            second.is_err(),
+            "a second server must not be able to claim the pipe name"
+        );
         drop(server);
     }
 
@@ -741,7 +789,11 @@ mod tests {
         let t0 = std::time::Instant::now();
         server.shutdown();
         server.shutdown(); // second call is a no-op
-        assert!(t0.elapsed() < Duration::from_secs(3), "shutdown took {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "shutdown took {:?}",
+            t0.elapsed()
+        );
 
         // The name is free again once the instances are closed.
         let again = start(&name, h.backend, 1).expect("name should be reusable after shutdown");

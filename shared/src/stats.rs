@@ -81,9 +81,15 @@ mod tests {
     #[test]
     fn stats_validation() {
         assert!(validate_stats(&ConnStats::default()));
-        let bad = ConnStats { loss: 1.5, ..Default::default() };
+        let bad = ConnStats {
+            loss: 1.5,
+            ..Default::default()
+        };
         assert!(!validate_stats(&bad));
-        let bad = ConnStats { rtt_ms: f32::NAN, ..Default::default() };
+        let bad = ConnStats {
+            rtt_ms: f32::NAN,
+            ..Default::default()
+        };
         assert!(!validate_stats(&bad));
     }
 }

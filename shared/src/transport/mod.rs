@@ -55,7 +55,10 @@ pub fn channel_tag(channel: Channel) -> Result<u8> {
     let bytes = postcard::to_stdvec(&channel)?;
     match bytes.as_slice() {
         [b] => Ok(*b),
-        other => Err(Error::Protocol(format!("channel tag is {} bytes", other.len()))),
+        other => Err(Error::Protocol(format!(
+            "channel tag is {} bytes",
+            other.len()
+        ))),
     }
 }
 

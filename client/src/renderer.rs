@@ -72,7 +72,11 @@ impl FrameSlot {
             // decoded frame is discarded.
             self.dropped_at_present.fetch_add(1, Ordering::Relaxed);
         }
-        *guard = Some(Slotted { frame, generation, arrived: now });
+        *guard = Some(Slotted {
+            frame,
+            generation,
+            arrived: now,
+        });
     }
 
     /// Consume the pending frame if it is newer than `last_generation`.
@@ -125,7 +129,12 @@ pub struct RateMeter {
 
 impl RateMeter {
     pub fn new(now: Instant) -> Self {
-        Self { window: Duration::from_millis(500), last_at: now, last_count: 0, rate: 0.0 }
+        Self {
+            window: Duration::from_millis(500),
+            last_at: now,
+            last_count: 0,
+            rate: 0.0,
+        }
     }
 
     /// Feed the cumulative counter; recomputes at most once per window.
@@ -191,8 +200,11 @@ impl Presenter {
                             tex.set(image, egui::TextureOptions::LINEAR);
                         }
                         slot_tex => {
-                            *slot_tex =
-                                Some(ctx.load_texture("directdesk_video", image, egui::TextureOptions::LINEAR));
+                            *slot_tex = Some(ctx.load_texture(
+                                "directdesk_video",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            ));
                         }
                     }
                     self.last_generation = generation;
@@ -275,7 +287,11 @@ impl Presenter {
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
-        Some(VideoView { rect, remote_w: src_w, remote_h: src_h })
+        Some(VideoView {
+            rect,
+            remote_w: src_w,
+            remote_h: src_h,
+        })
     }
 
     pub fn has_frame(&self) -> bool {
@@ -293,7 +309,8 @@ impl Presenter {
     /// Age of the frame currently on screen, in ms. This is the client-side
     /// half of the latency budget (decode-complete → still displayed).
     pub fn present_age_ms(&self) -> Option<f32> {
-        self.last_arrived.map(|t| t.elapsed().as_secs_f32() * 1000.0)
+        self.last_arrived
+            .map(|t| t.elapsed().as_secs_f32() * 1000.0)
     }
 
     pub fn frame_size(&self) -> Option<(u32, u32)> {

@@ -54,7 +54,7 @@ use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
 use crate::crypto::auth::TrustedPeer;
-use crate::crypto::{Exporter, Role, SpkiHash, check_exporter, ct_eq};
+use crate::crypto::{check_exporter, ct_eq, Exporter, Role, SpkiHash};
 use crate::error::{Error, Result};
 use crate::protocol::AuthMsg;
 use crate::secret::Secret;
@@ -109,8 +109,10 @@ impl PairingCode {
 
     /// Parse user input. Spaces and dashes are ignored so "1234-5678" works.
     pub fn parse(input: &str) -> Result<Self> {
-        let digits: String =
-            input.chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_').collect();
+        let digits: String = input
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+            .collect();
         if digits.len() != PAIRING_CODE_DIGITS {
             return Err(Error::Pairing(format!(
                 "pairing code must be {PAIRING_CODE_DIGITS} digits"
@@ -242,7 +244,11 @@ struct Session {
 
 impl Session {
     fn new(started_ms: u64, ttl_ms: u64, stage: PairingStage) -> Self {
-        Self { started_ms, ttl_ms, stage }
+        Self {
+            started_ms,
+            ttl_ms,
+            stage,
+        }
     }
 
     fn expires_at_ms(&self) -> u64 {
@@ -292,7 +298,9 @@ pub struct PairingClient {
 
 impl std::fmt::Debug for PairingClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PairingClient").field("stage", &self.session.stage).finish()
+        f.debug_struct("PairingClient")
+            .field("stage", &self.session.stage)
+            .finish()
     }
 }
 
@@ -301,11 +309,7 @@ impl PairingClient {
     ///
     /// `exporter` must be the RFC 5705 exporter of the TLS session this
     /// pairing runs inside — see [`crate::crypto::EXPORTER_LABEL`].
-    pub fn start(
-        code: &PairingCode,
-        exporter: &Exporter,
-        now_ms: u64,
-    ) -> Result<(Self, AuthMsg)> {
+    pub fn start(code: &PairingCode, exporter: &Exporter, now_ms: u64) -> Result<(Self, AuthMsg)> {
         Self::start_with_rng(code, exporter, now_ms, PAIRING_TTL_MS, &mut OsRng)
     }
 
@@ -339,18 +343,26 @@ impl PairingClient {
     pub fn on_pair_response(&mut self, msg: &AuthMsg, now_ms: u64) -> Result<AuthMsg> {
         self.session.enter(PairingStage::AwaitResponse, now_ms)?;
         let AuthMsg::PairResponse { spake_msg } = msg else {
-            return self.session.fail(Error::Pairing("expected PairResponse".into()));
+            return self
+                .session
+                .fail(Error::Pairing("expected PairResponse".into()));
         };
         if let Err(e) = check_spake_msg(spake_msg) {
             return self.session.fail(e);
         }
 
         let Some(spake) = self.spake.take() else {
-            return self.session.fail(Error::Pairing("spake state already consumed".into()));
+            return self
+                .session
+                .fail(Error::Pairing("spake state already consumed".into()));
         };
         let key = match spake.finish(spake_msg) {
             Ok(k) => k,
-            Err(e) => return self.session.fail(Error::Pairing(format!("spake2 failed: {e:?}"))),
+            Err(e) => {
+                return self
+                    .session
+                    .fail(Error::Pairing(format!("spake2 failed: {e:?}")))
+            }
         };
 
         // Transcript is always client-message-then-host-message on both sides.
@@ -375,10 +387,14 @@ impl PairingClient {
     pub fn on_pair_confirm(&mut self, msg: &AuthMsg, now_ms: u64) -> Result<()> {
         self.session.enter(PairingStage::AwaitConfirm, now_ms)?;
         let AuthMsg::PairConfirm { mac } = msg else {
-            return self.session.fail(Error::Pairing("expected PairConfirm".into()));
+            return self
+                .session
+                .fail(Error::Pairing("expected PairConfirm".into()));
         };
         let Some(ck) = self.confirm_key.as_ref() else {
-            return self.session.fail(Error::Pairing("no confirmation key".into()));
+            return self
+                .session
+                .fail(Error::Pairing("no confirmation key".into()));
         };
         if let Err(e) = verify_confirm_mac(ck, &self.transcript, &self.exporter, Role::Host, mac) {
             return self.session.fail(e);
@@ -405,8 +421,15 @@ impl PairingClient {
                 .session
                 .fail(Error::Pairing("PairComplete before confirmation".into()));
         }
-        let AuthMsg::PairComplete { host_ed25519_pub, host_spki_sha256, host_name } = msg else {
-            return self.session.fail(Error::Pairing("expected PairComplete".into()));
+        let AuthMsg::PairComplete {
+            host_ed25519_pub,
+            host_spki_sha256,
+            host_name,
+        } = msg
+        else {
+            return self
+                .session
+                .fail(Error::Pairing("expected PairComplete".into()));
         };
         if !ct_eq(host_spki_sha256, observed_spki) {
             return self.session.fail(Error::Pairing(
@@ -414,7 +437,9 @@ impl PairingClient {
             ));
         }
         if let Err(e) = crate::crypto::identity::validate_name(host_name) {
-            return self.session.fail(Error::Pairing(format!("bad host name: {e}")));
+            return self
+                .session
+                .fail(Error::Pairing(format!("bad host name: {e}")));
         }
         // Reject a structurally invalid Ed25519 key now rather than at the
         // first authentication attempt.
@@ -520,7 +545,9 @@ impl PairingHost {
             return self.session.fail(e);
         }
         let AuthMsg::PairStart { spake_msg } = msg else {
-            return self.session.fail(Error::Pairing("expected PairStart".into()));
+            return self
+                .session
+                .fail(Error::Pairing("expected PairStart".into()));
         };
         if let Err(e) = check_spake_msg(spake_msg) {
             return self.session.fail(e);
@@ -534,7 +561,11 @@ impl PairingHost {
         );
         let key = match spake.finish(spake_msg) {
             Ok(k) => k,
-            Err(e) => return self.session.fail(Error::Pairing(format!("spake2 failed: {e:?}"))),
+            Err(e) => {
+                return self
+                    .session
+                    .fail(Error::Pairing(format!("spake2 failed: {e:?}")))
+            }
         };
 
         self.transcript.clear();
@@ -555,10 +586,14 @@ impl PairingHost {
     pub fn on_pair_confirm(&mut self, msg: &AuthMsg, now_ms: u64) -> Result<AuthMsg> {
         self.session.enter(PairingStage::AwaitConfirm, now_ms)?;
         let AuthMsg::PairConfirm { mac } = msg else {
-            return self.session.fail(Error::Pairing("expected PairConfirm".into()));
+            return self
+                .session
+                .fail(Error::Pairing("expected PairConfirm".into()));
         };
         let (Some(ck), Some(exporter)) = (self.confirm_key.as_ref(), self.exporter) else {
-            return self.session.fail(Error::Pairing("pairing state incomplete".into()));
+            return self
+                .session
+                .fail(Error::Pairing("pairing state incomplete".into()));
         };
         if let Err(e) = verify_confirm_mac(ck, &self.transcript, &exporter, Role::Client, mac) {
             return self.session.fail(e);
@@ -588,7 +623,9 @@ impl PairingHost {
         now_ms: u64,
     ) -> Result<TrustedPeer> {
         if self.session.stage != PairingStage::Complete {
-            return Err(Error::Pairing("client accepted before pairing completed".into()));
+            return Err(Error::Pairing(
+                "client accepted before pairing completed".into(),
+            ));
         }
         crate::crypto::identity::validate_name(name)?;
         crate::crypto::identity::parse_verifying_key(client_ed25519_pub)?;
@@ -614,8 +651,8 @@ impl PairingHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     fn exporter(byte: u8) -> Exporter {
         let mut e = [byte; 32];
@@ -665,8 +702,14 @@ mod tests {
 
     #[test]
     fn code_parsing() {
-        assert_eq!(PairingCode::parse("1234 5678").unwrap().expose(), "12345678");
-        assert_eq!(PairingCode::parse("1234-5678").unwrap().expose(), "12345678");
+        assert_eq!(
+            PairingCode::parse("1234 5678").unwrap().expose(),
+            "12345678"
+        );
+        assert_eq!(
+            PairingCode::parse("1234-5678").unwrap().expose(),
+            "12345678"
+        );
         assert!(PairingCode::parse("1234567").is_err());
         assert!(PairingCode::parse("123456789").is_err());
         assert!(PairingCode::parse("1234567a").is_err());
@@ -687,21 +730,17 @@ mod tests {
         let mut hrng = StdRng::seed_from_u64(2);
         let code = PairingCode::parse("13572468").unwrap();
 
-        let (mut client, start) = PairingClient::start_with_rng(
-            &code,
-            &exp,
-            1_000,
-            PAIRING_TTL_MS,
-            &mut crng,
-        )
-        .unwrap();
+        let (mut client, start) =
+            PairingClient::start_with_rng(&code, &exp, 1_000, PAIRING_TTL_MS, &mut crng).unwrap();
         let mut host = PairingHost::with_code(
             PairingCode::parse("13572468").unwrap(),
             1_000,
             PAIRING_TTL_MS,
         );
 
-        let response = host.on_pair_start_with_rng(&start, &exp, 1_010, &mut hrng).unwrap();
+        let response = host
+            .on_pair_start_with_rng(&start, &exp, 1_010, &mut hrng)
+            .unwrap();
         let client_confirm = client.on_pair_response(&response, 1_020).unwrap();
         let host_confirm = host.on_pair_confirm(&client_confirm, 1_030).unwrap();
         client.on_pair_confirm(&host_confirm, 1_040).unwrap();
@@ -722,7 +761,9 @@ mod tests {
             // Rebuild a response from the host's own state by re-running the
             // exchange: the rig already consumed PairStart, so drive confirm.
             let _ = &mut hrng;
-            AuthMsg::PairResponse { spake_msg: r.host.own_msg.clone() }
+            AuthMsg::PairResponse {
+                spake_msg: r.host.own_msg.clone(),
+            }
         };
         let client_confirm = r.client.on_pair_response(&response, 10).unwrap();
         let err = r.host.on_pair_confirm(&client_confirm, 20).unwrap_err();
@@ -735,7 +776,9 @@ mod tests {
         // A relay terminates two TLS sessions, so each honest side sees a
         // different exporter. Even with the correct code, confirmation fails.
         let mut r = rig("55556666", "55556666", exporter(0x01), exporter(0x02));
-        let response = AuthMsg::PairResponse { spake_msg: r.host.own_msg.clone() };
+        let response = AuthMsg::PairResponse {
+            spake_msg: r.host.own_msg.clone(),
+        };
         let client_confirm = r.client.on_pair_response(&response, 10).unwrap();
         let err = r.host.on_pair_confirm(&client_confirm, 20).unwrap_err();
         assert!(matches!(err, Error::Pairing(_)));
@@ -773,14 +816,15 @@ mod tests {
             &mut crng,
         )
         .unwrap();
-        let mut host = PairingHost::with_code(
-            PairingCode::parse("99998888").unwrap(),
-            0,
-            PAIRING_TTL_MS,
-        );
-        let response = host.on_pair_start_with_rng(&start, &exp, 10, &mut hrng).unwrap();
+        let mut host =
+            PairingHost::with_code(PairingCode::parse("99998888").unwrap(), 0, PAIRING_TTL_MS);
+        let response = host
+            .on_pair_start_with_rng(&start, &exp, 10, &mut hrng)
+            .unwrap();
         // Client dawdles past the deadline before answering.
-        let err = client.on_pair_response(&response, PAIRING_TTL_MS + 5).unwrap_err();
+        let err = client
+            .on_pair_response(&response, PAIRING_TTL_MS + 5)
+            .unwrap_err();
         assert!(matches!(err, Error::Pairing(_)));
         assert_eq!(client.stage(), PairingStage::Failed);
     }
@@ -800,8 +844,12 @@ mod tests {
         .unwrap();
         let mut host =
             PairingHost::with_code(PairingCode::parse("10101010").unwrap(), 0, PAIRING_TTL_MS);
-        assert!(host.on_pair_start_with_rng(&start, &exp, 1, &mut hrng).is_ok());
-        let err = host.on_pair_start_with_rng(&start, &exp, 2, &mut hrng).unwrap_err();
+        assert!(host
+            .on_pair_start_with_rng(&start, &exp, 1, &mut hrng)
+            .is_ok());
+        let err = host
+            .on_pair_start_with_rng(&start, &exp, 2, &mut hrng)
+            .unwrap_err();
         assert!(matches!(err, Error::Pairing(_)));
         assert_eq!(host.stage(), PairingStage::Failed);
     }
@@ -821,7 +869,9 @@ mod tests {
         .unwrap();
         let mut host =
             PairingHost::with_code(PairingCode::parse("20202020").unwrap(), 0, PAIRING_TTL_MS);
-        let response = host.on_pair_start_with_rng(&start, &exp, 1, &mut hrng).unwrap();
+        let response = host
+            .on_pair_start_with_rng(&start, &exp, 1, &mut hrng)
+            .unwrap();
         let cc = client.on_pair_response(&response, 2).unwrap();
         let hc = host.on_pair_confirm(&cc, 3).unwrap();
         client.on_pair_confirm(&hc, 4).unwrap();
@@ -846,7 +896,9 @@ mod tests {
         )
         .unwrap();
         // A PairConfirm before the response is out of order.
-        assert!(client.on_pair_confirm(&AuthMsg::PairConfirm { mac: [0u8; 32] }, 1).is_err());
+        assert!(client
+            .on_pair_confirm(&AuthMsg::PairConfirm { mac: [0u8; 32] }, 1)
+            .is_err());
         assert_eq!(client.stage(), PairingStage::Failed);
     }
 
@@ -856,8 +908,12 @@ mod tests {
         let mut hrng = StdRng::seed_from_u64(13);
         let mut host =
             PairingHost::with_code(PairingCode::parse("40404040").unwrap(), 0, PAIRING_TTL_MS);
-        let bad = AuthMsg::PairStart { spake_msg: vec![0u8; 7] };
-        assert!(host.on_pair_start_with_rng(&bad, &exp, 1, &mut hrng).is_err());
+        let bad = AuthMsg::PairStart {
+            spake_msg: vec![0u8; 7],
+        };
+        assert!(host
+            .on_pair_start_with_rng(&bad, &exp, 1, &mut hrng)
+            .is_err());
         assert_eq!(host.stage(), PairingStage::Failed);
     }
 
@@ -890,7 +946,9 @@ mod tests {
         .unwrap();
         let mut host =
             PairingHost::with_code(PairingCode::parse("60606060").unwrap(), 0, PAIRING_TTL_MS);
-        let response = host.on_pair_start_with_rng(&start, &exp, 1, &mut hrng).unwrap();
+        let response = host
+            .on_pair_start_with_rng(&start, &exp, 1, &mut hrng)
+            .unwrap();
         let cc = client.on_pair_response(&response, 2).unwrap();
         let hc = host.on_pair_confirm(&cc, 3).unwrap();
         client.on_pair_confirm(&hc, 4).unwrap();
@@ -917,12 +975,16 @@ mod tests {
         .unwrap();
         let mut host =
             PairingHost::with_code(PairingCode::parse("60606060").unwrap(), 0, PAIRING_TTL_MS);
-        let response = host.on_pair_start_with_rng(&start, &exp, 1, &mut hrng).unwrap();
+        let response = host
+            .on_pair_start_with_rng(&start, &exp, 1, &mut hrng)
+            .unwrap();
         let cc = client.on_pair_response(&response, 2).unwrap();
         let hc = host.on_pair_confirm(&cc, 3).unwrap();
         client.on_pair_confirm(&hc, 4).unwrap();
 
-        let peer = client.accept_pair_complete(&complete, id.spki_sha256(), 5_000).unwrap();
+        let peer = client
+            .accept_pair_complete(&complete, id.spki_sha256(), 5_000)
+            .unwrap();
         assert_eq!(peer.ed25519_pub, id.ed25519_pub());
         assert_eq!(peer.spki_sha256, *id.spki_sha256());
         assert_eq!(peer.name, "desk");
@@ -931,11 +993,8 @@ mod tests {
 
     #[test]
     fn accept_client_requires_completion() {
-        let host = PairingHost::with_code(
-            PairingCode::parse("70707070").unwrap(),
-            0,
-            PAIRING_TTL_MS,
-        );
+        let host =
+            PairingHost::with_code(PairingCode::parse("70707070").unwrap(), 0, PAIRING_TTL_MS);
         let id = crate::crypto::ClientIdentity::generate("laptop").unwrap();
         assert!(host.accept_client(&id.ed25519_pub(), "laptop", 1).is_err());
     }

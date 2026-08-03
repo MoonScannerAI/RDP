@@ -44,7 +44,8 @@ pub fn run() -> Result<(), windows_service::Error> {
 /// Entry point the SCM calls on its own thread.
 fn service_main(_arguments: Vec<OsString>) {
     // Logging must be up before anything else so failures are recorded.
-    let _guard = directdesk_shared::logging::init("service", directdesk_shared::logging::default_log_dir());
+    let _guard =
+        directdesk_shared::logging::init("service", directdesk_shared::logging::default_log_dir());
     if let Err(e) = run_service() {
         tracing::error!("service terminated with an error: {e:#}");
     }
@@ -66,7 +67,11 @@ fn run_service() -> anyhow::Result<()> {
     };
     let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
 
-    status_handle.set_service_status(status(ServiceState::StartPending, ServiceControlAccept::empty(), 1))?;
+    status_handle.set_service_status(status(
+        ServiceState::StartPending,
+        ServiceControlAccept::empty(),
+        1,
+    ))?;
 
     let started = start_components();
     let (mut pipe_server, mut supervisor) = match started {
@@ -99,13 +104,21 @@ fn run_service() -> anyhow::Result<()> {
     let _ = stop_rx.recv();
     tracing::info!("stop requested");
 
-    status_handle.set_service_status(status(ServiceState::StopPending, ServiceControlAccept::empty(), 1))?;
+    status_handle.set_service_status(status(
+        ServiceState::StopPending,
+        ServiceControlAccept::empty(),
+        1,
+    ))?;
 
     // Drain both subsystems before reporting Stopped.
     pipe_server.shutdown();
     supervisor.shutdown();
 
-    status_handle.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), 0))?;
+    status_handle.set_service_status(status(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        0,
+    ))?;
     tracing::info!("{SERVICE_NAME} stopped");
     Ok(())
 }
@@ -148,7 +161,11 @@ fn status(state: ServiceState, accepted: ServiceControlAccept, checkpoint: u32) 
         controls_accepted: accepted,
         exit_code: ServiceExitCode::Win32(0),
         checkpoint,
-        wait_hint: if checkpoint == 0 { Duration::default() } else { Duration::from_secs(15) },
+        wait_hint: if checkpoint == 0 {
+            Duration::default()
+        } else {
+            Duration::from_secs(15)
+        },
         process_id: None,
     }
 }

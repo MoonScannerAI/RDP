@@ -41,7 +41,9 @@ use directdesk_shared::traits::{Decoder, NullDecoder};
 use directdesk_shared::transport::reassembly::{is_newer, Reassembler, ReassemblyStats};
 use directdesk_shared::video::{EncodedFrame, FragHeader};
 
-use crate::config::{SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C, STREAM_INPUT};
+use crate::config::{
+    SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C, STREAM_INPUT,
+};
 use crate::event::{Route, SimEvent};
 use crate::frames::verify_payload;
 use crate::framing::{decode_frame_record, FramedReader, MuxClass, MuxReader};
@@ -303,7 +305,8 @@ impl SimClient {
         }
         if self.reassembler.take_keyframe_request(ctx.now_ms) {
             self.send_control(ctx, &ControlMsg::RequestKeyframe)?;
-            ctx.log.push(SimEvent::KeyframeRequested { at_ms: ctx.now_ms });
+            ctx.log
+                .push(SimEvent::KeyframeRequested { at_ms: ctx.now_ms });
         }
         Ok(())
     }
@@ -395,9 +398,7 @@ impl SimClient {
                     });
                 }
             }
-            ControlMsg::RouteReport(TransportRoute::DirectTcp)
-                if self.route == Route::Datagram =>
-            {
+            ControlMsg::RouteReport(TransportRoute::DirectTcp) if self.route == Route::Datagram => {
                 self.route = Route::Fallback;
                 // The path changed under the decoder; drop everything that
                 // referenced the old one rather than present half a frame.
@@ -538,7 +539,8 @@ impl SimClient {
         }
         self.fallback_requested = true;
         self.send_control(ctx, &ControlMsg::RouteReport(TransportRoute::DirectTcp))?;
-        ctx.log.push(SimEvent::FallbackRequested { at_ms: ctx.now_ms });
+        ctx.log
+            .push(SimEvent::FallbackRequested { at_ms: ctx.now_ms });
         Ok(())
     }
 }

@@ -152,7 +152,9 @@ impl ReassemblyConfig {
             return Err(Error::Invalid("max_forward_jump must be non-zero".into()));
         }
         if self.stale_frame_distance >= 0x8000_0000 {
-            return Err(Error::Invalid("stale_frame_distance must be under 2^31".into()));
+            return Err(Error::Invalid(
+                "stale_frame_distance must be under 2^31".into(),
+            ));
         }
         if self.max_forward_jump >= 0x8000_0000 {
             return Err(Error::Invalid("max_forward_jump must be under 2^31".into()));
@@ -413,7 +415,10 @@ impl Reassembler {
             self.stats.fragments_rejected += 1;
             self.stats.frames_dropped_incomplete += 1;
             self.need_keyframe = true;
-            return Err(Error::Oversized { got: total, limit: MAX_FRAME_BYTES });
+            return Err(Error::Oversized {
+                got: total,
+                limit: MAX_FRAME_BYTES,
+            });
         }
 
         {
@@ -753,7 +758,12 @@ mod tests {
 
     /// Fragments for one synthetic frame, via the real `fragment_frame`.
     fn frags(id: u32, keyframe: bool, ts: u32, len: usize, mtu: usize) -> Vec<Vec<u8>> {
-        let frame = EncodedFrame { frame_id: id, keyframe, timestamp_ms: ts, data: payload(len) };
+        let frame = EncodedFrame {
+            frame_id: id,
+            keyframe,
+            timestamp_ms: ts,
+            data: payload(len),
+        };
         fragment_frame(&frame, mtu).expect("fragment_frame")
     }
 
@@ -767,8 +777,14 @@ mod tests {
         payload_len: usize,
     ) -> Vec<u8> {
         let mut out = Vec::with_capacity(FRAG_HEADER_LEN + payload_len);
-        FragHeader { frame_id: id, frag_index, frag_count, keyframe, timestamp_ms: ts }
-            .encode(&mut out);
+        FragHeader {
+            frame_id: id,
+            frag_index,
+            frag_count,
+            keyframe,
+            timestamp_ms: ts,
+        }
+        .encode(&mut out);
         out.resize(FRAG_HEADER_LEN + payload_len, 0x5A);
         out
     }
@@ -890,7 +906,10 @@ mod tests {
         assert_eq!(r.stats().frames_completed, 2);
         // Contiguous ids: no gap, so no keyframe demand.
         assert!(!r.take_keyframe_request(0));
-        let mut r2 = Reassembler::new(ReassemblyConfig { latest_wins: false, ..cfg() });
+        let mut r2 = Reassembler::new(ReassemblyConfig {
+            latest_wins: false,
+            ..cfg()
+        });
         for d in a.iter().chain(b.iter()) {
             let _ = r2.push(d, 0).expect("push");
         }
@@ -900,7 +919,10 @@ mod tests {
 
     #[test]
     fn lost_fragment_times_out_and_requests_keyframe() {
-        let mut r = Reassembler::new(ReassemblyConfig { slot_timeout_ms: 500, ..cfg() });
+        let mut r = Reassembler::new(ReassemblyConfig {
+            slot_timeout_ms: 500,
+            ..cfg()
+        });
         let f = frags(1, false, 0, 3000, 1024);
         assert_eq!(f.len(), 3);
         assert!(!r.push(&f[0], 1000).expect("push"));
@@ -1015,7 +1037,10 @@ mod tests {
 
     #[test]
     fn arrival_order_when_latest_wins_disabled() {
-        let mut r = Reassembler::new(ReassemblyConfig { latest_wins: false, ..cfg() });
+        let mut r = Reassembler::new(ReassemblyConfig {
+            latest_wins: false,
+            ..cfg()
+        });
         for id in 1..=3u32 {
             let one = frags(id, false, id, 64, 1200);
             assert!(r.push(&one[0], 0).expect("push"));
@@ -1029,7 +1054,10 @@ mod tests {
 
     #[test]
     fn ready_queue_cap_drops_oldest() {
-        let mut r = Reassembler::new(ReassemblyConfig { latest_wins: false, ..cfg() });
+        let mut r = Reassembler::new(ReassemblyConfig {
+            latest_wins: false,
+            ..cfg()
+        });
         let total = MAX_READY_FRAMES as u32 + 3;
         for id in 1..=total {
             let one = frags(id, false, id, 64, 1200);
@@ -1128,7 +1156,10 @@ mod tests {
             keyframe_request_min_interval_ms: 500,
             ..cfg()
         });
-        assert!(!r.take_keyframe_request(0), "fresh reassembler wants nothing");
+        assert!(
+            !r.take_keyframe_request(0),
+            "fresh reassembler wants nothing"
+        );
         let f = frags(1, false, 0, 3000, 1024);
         assert!(!r.push(&f[0], 1000).expect("push"));
         r.tick(1600);
@@ -1142,7 +1173,10 @@ mod tests {
         // Completing a keyframe is NOT enough — it has to reach the decoder.
         let kf = frags(9, true, 9, 64, 1200);
         assert!(r.push(&kf[0], 2100).expect("push"));
-        assert!(r.take_keyframe_request(2700), "still unsatisfied until delivered");
+        assert!(
+            r.take_keyframe_request(2700),
+            "still unsatisfied until delivered"
+        );
         assert_eq!(r.stats().keyframe_requests, 3);
 
         // Delivering it settles the demand.
@@ -1174,7 +1208,10 @@ mod tests {
         // The legitimate stream keeps working, frame after frame.
         for (n, id) in (1001u32..1010).enumerate() {
             let f = frags(id, false, id, 64, 1200);
-            assert!(r.push(&f[0], 20 + n as u64).expect("push"), "frame {id} must complete");
+            assert!(
+                r.push(&f[0], 20 + n as u64).expect("push"),
+                "frame {id} must complete"
+            );
             let got = r.pop_frame().expect("frame must be delivered");
             assert_eq!(got.frame_id, id);
         }
@@ -1190,7 +1227,14 @@ mod tests {
 
         for i in 0..40u32 {
             // Each hostile id is far from the previous one, so the run resets.
-            let evil = forge(0x1000_0000u32.wrapping_mul(i.wrapping_add(1)), 0, 2, false, 0, 16);
+            let evil = forge(
+                0x1000_0000u32.wrapping_mul(i.wrapping_add(1)),
+                0,
+                2,
+                false,
+                0,
+                16,
+            );
             let _ = r.push(&evil, 1);
             // A legitimate fragment in between also clears the run.
             let good = frags(500 + i + 1, false, 0, 64, 1200);
@@ -1204,7 +1248,10 @@ mod tests {
     /// run the receiver adopts the new numbering and demands a keyframe.
     #[test]
     fn consistent_renumbering_run_triggers_resync() {
-        let mut r = Reassembler::new(ReassemblyConfig { resync_after: 4, ..cfg() });
+        let mut r = Reassembler::new(ReassemblyConfig {
+            resync_after: 4,
+            ..cfg()
+        });
         let f = frags(100_000, true, 0, 64, 1200);
         assert!(r.push(&f[0], 0).expect("push"));
         assert!(r.pop_frame().is_some());
@@ -1212,11 +1259,17 @@ mod tests {
         // Sender restarts at 0. The first few are refused...
         for id in 0u32..3 {
             let f = frags(id, false, id, 64, 1200);
-            assert!(r.push(&f[0], 1).is_err(), "id {id} should still be out of window");
+            assert!(
+                r.push(&f[0], 1).is_err(),
+                "id {id} should still be out of window"
+            );
         }
         // ...then the run is long enough and the numbering is adopted.
         let f = frags(3, true, 3, 64, 1200);
-        assert!(r.push(&f[0], 1).expect("push"), "resync should accept and complete");
+        assert!(
+            r.push(&f[0], 1).expect("push"),
+            "resync should accept and complete"
+        );
         let got = r.pop_frame().expect("frame after resync");
         assert_eq!(got.frame_id, 3);
 
@@ -1240,7 +1293,10 @@ mod tests {
         let kf = frags(10, true, 10, 64, 1200);
         assert!(r.push(&kf[0], 0).expect("push"));
         assert!(r.pop_frame().is_some());
-        assert!(!r.take_keyframe_request(0), "anchor delivered, nothing wanted");
+        assert!(
+            !r.take_keyframe_request(0),
+            "anchor delivered, nothing wanted"
+        );
 
         // Now a keyframe and a newer delta both complete before the consumer
         // pops. Latest-wins hands over the delta and throws the keyframe away.
@@ -1287,7 +1343,10 @@ mod tests {
         // Now 151's missing fragment finally arrives and completes the frame.
         assert!(r.push(&older[1], 0).expect("push"));
         // It must NOT come out: it is older than what we already delivered.
-        assert!(r.pop_frame().is_none(), "stale straggler must be dropped, not delivered");
+        assert!(
+            r.pop_frame().is_none(),
+            "stale straggler must be dropped, not delivered"
+        );
         assert_eq!(r.stats().frames_dropped_reorder, 1);
     }
 
@@ -1327,13 +1386,19 @@ mod tests {
         });
         r2.reset(0);
         assert!(r2.take_keyframe_request(9_000_000));
-        assert!(r2.take_keyframe_request(10), "clock went backwards: re-arm, do not starve");
+        assert!(
+            r2.take_keyframe_request(10),
+            "clock went backwards: re-arm, do not starve"
+        );
     }
 
     /// `slot_timeout_ms == 0` means "no timeout", not "expire everything".
     #[test]
     fn zero_slot_timeout_disables_expiry() {
-        let mut r = Reassembler::new(ReassemblyConfig { slot_timeout_ms: 0, ..cfg() });
+        let mut r = Reassembler::new(ReassemblyConfig {
+            slot_timeout_ms: 0,
+            ..cfg()
+        });
         let f = frags(1, false, 0, 3000, 1024);
         for (i, d) in f.iter().enumerate() {
             let last = i + 1 == f.len();
@@ -1346,14 +1411,18 @@ mod tests {
     #[test]
     fn config_validation() {
         assert!(ReassemblyConfig::default().validate().is_ok());
-        assert!(
-            ReassemblyConfig { max_forward_jump: 0, ..Default::default() }.validate().is_err()
-        );
-        assert!(
-            ReassemblyConfig { stale_frame_distance: 0x8000_0000, ..Default::default() }
-                .validate()
-                .is_err()
-        );
+        assert!(ReassemblyConfig {
+            max_forward_jump: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(ReassemblyConfig {
+            stale_frame_distance: 0x8000_0000,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     /// The counter partition must hold even when a newly created slot is itself
@@ -1388,7 +1457,10 @@ mod tests {
         assert!(r.push(&done[0], 100).expect("push"));
         r.reset(200);
         assert!(r.pop_frame().is_none(), "ready queue cleared");
-        assert!(r.take_keyframe_request(200), "first request allowed at once");
+        assert!(
+            r.take_keyframe_request(200),
+            "first request allowed at once"
+        );
         assert_eq!(r.stats().frames_dropped_incomplete, 1);
         // The half-built frame cannot resume: its remaining fragments start a
         // fresh slot instead.
@@ -1400,7 +1472,10 @@ mod tests {
 
     #[test]
     fn stats_arithmetic_is_consistent() {
-        let mut r = Reassembler::new(ReassemblyConfig { slot_timeout_ms: 500, ..cfg() });
+        let mut r = Reassembler::new(ReassemblyConfig {
+            slot_timeout_ms: 500,
+            ..cfg()
+        });
         let mut pushes = 0u64;
         fn counted_push(r: &mut Reassembler, d: &[u8], t: u64, pushes: &mut u64) -> Result<bool> {
             *pushes += 1;
@@ -1425,7 +1500,10 @@ mod tests {
         r.tick(1000);
 
         let s = r.stats();
-        assert_eq!(s.fragments_received + s.fragments_duplicate + s.fragments_rejected, pushes);
+        assert_eq!(
+            s.fragments_received + s.fragments_duplicate + s.fragments_rejected,
+            pushes
+        );
         assert_eq!(s.fragments_received, 6);
         assert_eq!(s.fragments_duplicate, 1);
         assert_eq!(s.fragments_rejected, 1);

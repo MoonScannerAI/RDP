@@ -25,6 +25,7 @@ pub mod mf_encoder;
 pub mod mfinit;
 pub mod net;
 pub mod session;
+pub mod testsupport;
 pub mod ui;
 
 pub use directdesk_shared as shared;

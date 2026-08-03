@@ -109,7 +109,8 @@ impl MfH264Decoder {
             let buf = MFCreateMemoryBuffer(frame.data.len() as u32)
                 .map_err(dec_err("MFCreateMemoryBuffer"))?;
             let mut ptr: *mut u8 = std::ptr::null_mut();
-            buf.Lock(&mut ptr, None, None).map_err(dec_err("Lock(in)"))?;
+            buf.Lock(&mut ptr, None, None)
+                .map_err(dec_err("Lock(in)"))?;
             std::ptr::copy_nonoverlapping(frame.data.as_ptr(), ptr, frame.data.len());
             let _ = buf.Unlock();
             buf.SetCurrentLength(frame.data.len() as u32)
@@ -156,7 +157,10 @@ impl MfH264Decoder {
     }
 
     fn process_output(&mut self) -> Result<Option<Picture>> {
-        let mut bufs = [MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, ..Default::default() }];
+        let mut bufs = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            ..Default::default()
+        }];
 
         // SAFETY: we allocate the output sample when the MFT does not; the
         // ManuallyDrop fields are taken exactly once so refcounts stay balanced.
@@ -184,7 +188,9 @@ impl MfH264Decoder {
                 Err(e) => return Err(Error::Decoder(format!("ProcessOutput: {e}"))),
             }
 
-            let Some(sample) = sample else { return Ok(None) };
+            let Some(sample) = sample else {
+                return Ok(None);
+            };
             let ts_hns = sample.GetSampleTime().unwrap_or(0);
             let buffer = sample
                 .ConvertToContiguousBuffer()
@@ -228,9 +234,8 @@ impl MfH264Decoder {
                     Err(_) => break,
                 }
             }
-            let t = chosen.ok_or_else(|| {
-                Error::Decoder("H.264 decoder offers no NV12 output type".into())
-            })?;
+            let t = chosen
+                .ok_or_else(|| Error::Decoder("H.264 decoder offers no NV12 output type".into()))?;
             self.transform
                 .SetOutputType(0, &t, 0)
                 .map_err(dec_err("SetOutputType(NV12)"))?;

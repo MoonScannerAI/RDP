@@ -22,25 +22,34 @@
 //! ## Canonical application handshake (the wire contract)
 //!
 //! After the QUIC handshake and the two tagged reliable streams are open, on the
-//! **control** stream, framed with `u32-le length || postcard`:
+//! **control** stream, framed with `u32-le length || postcard`. The host issues
+//! **one** `ServerChallenge` immediately after the Hello exchange — *before* it
+//! knows which branch we want — and in **both** branches the client proves its
+//! Ed25519 key by signing that fresh per-connection `nonce_s`. Which branch runs
+//! is chosen by the client from "did the user supply a pairing code?"; the host
+//! branches on the message type it reads next.
 //!
 //! ```text
 //! Phase 0 — Hello (client writes first)
 //!   C -> H : Hello { version, features, agent = <client display name> }
 //!   H -> C : Hello { .. }                              (both validate_hello)
 //!
-//! Phase 1a — PAIRING  (client set FEATURE_PAIRING_REQUEST in Hello.features)
+//! Phase 1 — the host always challenges first
+//!   H -> C : AuthMsg::ServerChallenge { nonce_s }      (read in both branches)
+//!
+//! Phase 1a — PAIRING  (user supplied a code)
 //!   C -> H : AuthMsg::PairStart    { spake A }
 //!   H -> C : AuthMsg::PairResponse { spake B }
 //!   C -> H : AuthMsg::PairConfirm  { client mac }
 //!   H -> C : AuthMsg::PairConfirm  { host mac }        (client verifies)
-//!   C -> H : AuthMsg::ClientAuth   { client_pub, sig } (sig over exporter||PAIR_BIND_NONCE)
 //!   H -> C : AuthMsg::PairComplete { host identity }   (client pins host; anti-MITM)
-//!   H -> C : AuthMsg::AuthOk
+//!   C -> H : AuthMsg::ClientAuth      { client_pub, sig_c over nonce_s }
+//!   C -> H : AuthMsg::ClientChallenge { nonce_c }
+//!   H -> C : AuthMsg::ServerAuth      { sig_s }        (client verifies pinned host key)
+//!   H -> C : AuthMsg::AuthOk                           (client persists host only now)
 //!
-//! Phase 1b — AUTH  (Hello.features had no FEATURE_PAIRING_REQUEST)
-//!   H -> C : AuthMsg::ServerChallenge { nonce_s }
-//!   C -> H : AuthMsg::ClientAuth      { client_pub, sig_c }
+//! Phase 1b — AUTH  (no code: reconnect of a known host)
+//!   C -> H : AuthMsg::ClientAuth      { client_pub, sig_c over nonce_s }
 //!   C -> H : AuthMsg::ClientChallenge { nonce_c }
 //!   H -> C : AuthMsg::ServerAuth      { sig_s }        (client verifies pinned host key)
 //!   H -> C : AuthMsg::AuthOk
@@ -50,23 +59,22 @@
 //! ```
 //!
 //! Both ends then call [`QuicSession::start`] on the same streams and the driver
-//! takes over. The host side of this contract does not exist yet (the host is
-//! still media-only); the loopback end-to-end test drives the mirror using the
-//! same shared primitives and the constants exported here, so the two stay in
-//! lockstep and a future host implementation has a single reference to match.
+//! takes over. This is the exact sequence the real `directdesk_host` listener
+//! implements (`host::net::{authenticate,pair}`); the `interop.rs` test drives
+//! the real client against the real host to prove it.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
 use directdesk_shared::crypto::auth::{
-    self, ClientAuthenticator, TrustedPeer, TrustedPeers, TRUSTED_HOSTS_KEY,
+    ClientAuthenticator, TrustedPeer, TrustedPeers, TRUSTED_HOSTS_KEY,
 };
 use directdesk_shared::crypto::identity::ClientIdentity;
 use directdesk_shared::crypto::pairing::{PairingClient, PairingCode};
 use directdesk_shared::crypto::storage::SecretStore;
 use directdesk_shared::crypto::tls::{ObservedPin, ServerPinning};
-use directdesk_shared::crypto::Role;
+use directdesk_shared::crypto::Ed25519Pub;
 use directdesk_shared::error::{Error, Result};
 use directdesk_shared::input::validate_event;
 use directdesk_shared::protocol::{
@@ -81,16 +89,13 @@ use tokio::sync::watch;
 
 use crate::session::{ConnectionState, TransportEndpoints};
 
-/// `Hello.features` bit the client sets to ask the host for a **pairing**
-/// exchange rather than steady-state auth. Occupies a high bit so it never
-/// collides with the wire feature flags in [`protocol::features`].
+/// `Hello.features` bit the client sets to *hint* it intends to pair rather
+/// than reconnect. It is only a hint: the real `directdesk_host` branches on the
+/// message type it reads after its `ServerChallenge` (`PairStart` vs
+/// `ClientAuth`), and the client's own branch is driven by whether the user
+/// supplied a pairing code. Occupies a high bit so it never collides with the
+/// wire feature flags in [`protocol::features`].
 pub const FEATURE_PAIRING_REQUEST: u64 = 1 << 32;
-
-/// Fixed 32-byte domain nonce the client signs (together with the live TLS
-/// exporter) to bind its long-term Ed25519 key to a pairing session. Freshness
-/// comes from the per-session exporter, so a constant nonce is sound here and
-/// keeps pairing to a single round trip. Exactly 32 bytes.
-pub const PAIR_BIND_NONCE: [u8; 32] = *b"directdesk/pair/v1/keybind-nonce";
 
 /// Per-attempt QUIC connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -163,8 +168,11 @@ pub async fn run_client(
 
     // In-memory record of the host we trust. Set by a successful pairing, or
     // loaded when reconnecting in auth mode.
-    let mut known_host: Option<TrustedPeer> =
-        if params.pairing_code.is_some() { None } else { sole_trusted_host(store.as_ref()) };
+    let mut known_host: Option<TrustedPeer> = if params.pairing_code.is_some() {
+        None
+    } else {
+        sole_trusted_host(store.as_ref())
+    };
     let mut want_pairing = params.pairing_code.is_some();
     let mut backoff = BACKOFF_MIN;
 
@@ -187,9 +195,18 @@ pub async fn run_client(
         )
         .await;
 
-        let Established { _endpoint, conn, streams, route, paired_host } = match established {
+        let Established {
+            _endpoint,
+            conn,
+            streams,
+            route,
+            paired_host,
+        } = match established {
             Ok(e) => e,
-            Err(HandshakeError { message, recoverable }) => {
+            Err(HandshakeError {
+                message,
+                recoverable,
+            }) => {
                 let _ = state_tx.try_send(ConnectionState::Failed(message.clone()));
                 if !recoverable {
                     tracing::error!("unrecoverable connect failure: {message}");
@@ -249,7 +266,11 @@ pub async fn run_client(
                 route_tx.clone(),
                 control_tx.clone(),
             )),
-            tokio::spawn(forward_events(receivers.events, stats_tx.clone(), closed.clone())),
+            tokio::spawn(forward_events(
+                receivers.events,
+                stats_tx.clone(),
+                closed.clone(),
+            )),
         ];
 
         // Outbound + lifecycle loop. Owns input_rx / control_rx across
@@ -434,10 +455,16 @@ struct HandshakeError {
 
 impl HandshakeError {
     fn recoverable(message: impl Into<String>) -> Self {
-        Self { message: message.into(), recoverable: true }
+        Self {
+            message: message.into(),
+            recoverable: true,
+        }
     }
     fn fatal(message: impl Into<String>) -> Self {
-        Self { message: message.into(), recoverable: false }
+        Self {
+            message: message.into(),
+            recoverable: false,
+        }
     }
 }
 
@@ -498,7 +525,11 @@ async fn connect_and_auth(
     // Phase 0 — Hello (client writes first).
     let hello = Hello {
         version: protocol::PROTOCOL_VERSION,
-        features: if want_pairing { FEATURE_PAIRING_REQUEST } else { 0 },
+        features: if want_pairing {
+            FEATURE_PAIRING_REQUEST
+        } else {
+            0
+        },
         agent: params.display_name.clone(),
     };
     if let Err(e) = quic::write_framed(&mut streams.control.0, &hello).await {
@@ -512,44 +543,72 @@ async fn connect_and_auth(
         return Err(HandshakeError::fatal(format!("host hello rejected: {e}")));
     }
 
-    // Phase 1 — auth.
+    // Phase 1 — the host always issues its ServerChallenge immediately after the
+    // Hello exchange, before it knows which branch we want. Read it now; in both
+    // branches the client signs this exact per-connection nonce.
+    let challenge = recv_auth(&mut streams).await?;
+
     let paired_host = if want_pairing {
-        match do_pairing(&mut streams, params, client_id, &exporter, &observed_spki).await {
-            Ok(peer) => {
-                // Persist the freshly trusted host (anti-MITM anchor).
-                if let Err(e) = persist_trusted_host(store, &peer) {
-                    tracing::warn!("could not persist trusted host: {e}");
-                }
-                Some(peer)
-            }
-            Err(e) => return Err(e),
+        // SPAKE2 first-contact, then pin the host identity (anti-MITM gate),
+        // then prove our key over `nonce_s` through the just-pinned host key.
+        let peer = do_pairing(&mut streams, params, &exporter, &observed_spki).await?;
+        finish_auth(
+            &mut streams,
+            client_id,
+            &peer.ed25519_pub,
+            &exporter,
+            &challenge,
+        )
+        .await?;
+        // Persist the freshly trusted host only after AuthOk (anti-MITM anchor).
+        if let Err(e) = persist_trusted_host(store, &peer) {
+            tracing::warn!("could not persist trusted host: {e}");
         }
+        Some(peer)
     } else {
         let host = known_host.expect("auth mode requires a known host");
-        do_auth(&mut streams, client_id, host, &exporter).await?;
+        finish_auth(
+            &mut streams,
+            client_id,
+            &host.ed25519_pub,
+            &exporter,
+            &challenge,
+        )
+        .await?;
         None
     };
 
     // Phase 2 — StartStream (raw, before the driver attaches).
     if let Err(e) = quic::write_framed(&mut streams.control.0, &params.start_stream()).await {
-        return Err(HandshakeError::recoverable(format!("send StartStream: {e}")));
+        return Err(HandshakeError::recoverable(format!(
+            "send StartStream: {e}"
+        )));
     }
 
-    Ok(Established { _endpoint: endpoint, conn, streams, route, paired_host })
+    Ok(Established {
+        _endpoint: endpoint,
+        conn,
+        streams,
+        route,
+        paired_host,
+    })
 }
 
-/// SPAKE2 pairing bound to the channel binding, then a key-possession proof.
+/// SPAKE2 first-contact bound to the channel binding, ending at `PairComplete`.
+///
+/// Returns the host identity the client has just pinned (SPKI + Ed25519),
+/// cross-checked against the certificate the TLS layer actually saw — the
+/// anti-MITM gate. The caller then runs [`finish_auth`] to prove the client's
+/// own key over `nonce_s` through this pinned key, exactly as the steady-state
+/// branch does; the host verifies that proof against the just-paired key.
 async fn do_pairing(
     streams: &mut SessionStreams,
     params: &ConnectParams,
-    client_id: &ClientIdentity,
     exporter: &[u8; 32],
     observed_spki: &[u8; 32],
 ) -> std::result::Result<TrustedPeer, HandshakeError> {
-    let code = PairingCode::parse(
-        params.pairing_code.as_deref().unwrap_or_default(),
-    )
-    .map_err(|e| HandshakeError::fatal(format!("pairing code: {e}")))?;
+    let code = PairingCode::parse(params.pairing_code.as_deref().unwrap_or_default())
+        .map_err(|e| HandshakeError::fatal(format!("pairing code: {e}")))?;
 
     let now = now_ms();
     let (mut pc, start) = PairingClient::start(&code, exporter, now)
@@ -563,44 +622,36 @@ async fn do_pairing(
     send_auth(streams, &confirm).await?;
 
     let host_confirm = recv_auth(streams).await?;
-    pc.on_pair_confirm(&host_confirm, now_ms()).map_err(pairing_fatal)?;
-
-    // Prove possession of our long-term key, bound to this exact TLS session.
-    let sig = auth::sign_challenge(client_id.signing_key(), Role::Client, exporter, &PAIR_BIND_NONCE)
-        .map_err(|e| HandshakeError::fatal(format!("sign: {e}")))?;
-    let client_auth =
-        AuthMsg::ClientAuth { client_ed25519_pub: client_id.ed25519_pub(), sig };
-    send_auth(streams, &client_auth).await?;
-
-    let complete = recv_auth(streams).await?;
-    let peer = pc
-        .accept_pair_complete(&complete, observed_spki, now_ms())
+    pc.on_pair_confirm(&host_confirm, now_ms())
         .map_err(pairing_fatal)?;
 
-    // AuthOk closes out the handshake.
-    match recv_auth(streams).await? {
-        AuthMsg::AuthOk => Ok(peer),
-        AuthMsg::AuthFail { reason } => {
-            Err(HandshakeError::fatal(format!("host rejected pairing: {reason}")))
-        }
-        other => Err(HandshakeError::fatal(format!("expected AuthOk, got {other:?}"))),
-    }
+    // PairComplete carries the host identity. Pin it against the pin the TLS
+    // layer actually observed — a relay that terminated its own TLS session
+    // cannot make these agree, which is what makes trust-on-pair safe.
+    let complete = recv_auth(streams).await?;
+    pc.accept_pair_complete(&complete, observed_spki, now_ms())
+        .map_err(pairing_fatal)
 }
 
-/// Steady-state mutual authentication against the pinned host key.
-async fn do_auth(
+/// The mutual-auth tail shared by both branches.
+///
+/// Answers the host's already-read `ServerChallenge` by signing `nonce_s`
+/// through `host_pub` (the pinned/known host key), challenges the host back,
+/// verifies the host's signature over our nonce against that pinned key — the
+/// anti-MITM gate — and consumes `AuthOk`.
+async fn finish_auth(
     streams: &mut SessionStreams,
     client_id: &ClientIdentity,
-    host: &TrustedPeer,
+    host_pub: &Ed25519Pub,
     exporter: &[u8; 32],
+    challenge: &AuthMsg,
 ) -> std::result::Result<(), HandshakeError> {
-    let mut ca = ClientAuthenticator::start(exporter, &host.ed25519_pub)
+    let mut ca = ClientAuthenticator::start(exporter, host_pub)
         .map_err(|e| HandshakeError::fatal(format!("auth start: {e}")))?;
 
-    // H -> C : ServerChallenge
-    let challenge = recv_auth(streams).await?;
+    // C -> H : ClientAuth (sig over nonce_s) + ClientChallenge (our nonce_c).
     let (client_auth, client_challenge) = ca
-        .on_server_challenge(&challenge, client_id.signing_key())
+        .on_server_challenge(challenge, client_id.signing_key())
         .map_err(auth_fatal)?;
     send_auth(streams, &client_auth).await?;
     send_auth(streams, &client_challenge).await?;
@@ -638,21 +689,27 @@ async fn send_auth(
         .map_err(|e| HandshakeError::recoverable(format!("send auth: {e}")))
 }
 
-async fn recv_auth(
-    streams: &mut SessionStreams,
-) -> std::result::Result<AuthMsg, HandshakeError> {
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, quic::read_auth::<AuthMsg>(&mut streams.control.1))
-        .await
+async fn recv_auth(streams: &mut SessionStreams) -> std::result::Result<AuthMsg, HandshakeError> {
+    match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        quic::read_auth::<AuthMsg>(&mut streams.control.1),
+    )
+    .await
     {
         Ok(Ok(m)) => Ok(m),
         Ok(Err(e)) => Err(HandshakeError::recoverable(format!("recv auth: {e}"))),
-        Err(_) => Err(HandshakeError::recoverable("handshake timed out".to_string())),
+        Err(_) => Err(HandshakeError::recoverable(
+            "handshake timed out".to_string(),
+        )),
     }
 }
 
 async fn read_hello(stream: &mut quinn::RecvStream) -> Result<Hello> {
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, quic::read_framed::<Hello>(stream, MAX_AUTH_MSG))
-        .await
+    match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        quic::read_framed::<Hello>(stream, MAX_AUTH_MSG),
+    )
+    .await
     {
         Ok(r) => r,
         Err(_) => Err(Error::Transport("hello read timed out".into())),
@@ -718,8 +775,7 @@ async fn connect_race(
     pinning: &ServerPinning,
     qp: &QuicParams,
 ) -> Result<(Endpoint, Connection, TransportRoute)> {
-    let mut last_err =
-        Error::Transport("no candidate addresses".into());
+    let mut last_err = Error::Transport("no candidate addresses".into());
     for addr in candidates {
         let bind: SocketAddr = if addr.is_ipv6() {
             "[::]:0".parse().expect("literal")
@@ -735,8 +791,11 @@ async fn connect_race(
         };
         match tokio::time::timeout(CONNECT_TIMEOUT, quic::connect(&endpoint, *addr)).await {
             Ok(Ok(conn)) => {
-                let route =
-                    if addr.is_ipv6() { TransportRoute::DirectIpv6 } else { TransportRoute::DirectUdp };
+                let route = if addr.is_ipv6() {
+                    TransportRoute::DirectIpv6
+                } else {
+                    TransportRoute::DirectUdp
+                };
                 tracing::info!("connected to {addr} via {}", route.label());
                 return Ok((endpoint, conn, route));
             }
@@ -779,11 +838,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pair_bind_nonce_is_32_bytes() {
-        assert_eq!(PAIR_BIND_NONCE.len(), 32);
-    }
-
-    #[test]
     fn pairing_feature_bit_does_not_collide_with_wire_flags() {
         // The wire flags live in the low bits; our handshake-only signal must
         // not overlap any of them.
@@ -813,7 +867,12 @@ mod tests {
             preferred_fps: 60,
         };
         match p.start_stream() {
-            ControlMsg::StartStream { max_width, max_height, preferred_fps, quality_mode } => {
+            ControlMsg::StartStream {
+                max_width,
+                max_height,
+                preferred_fps,
+                quality_mode,
+            } => {
                 assert_eq!((max_width, max_height, preferred_fps), (1920, 1080, 60));
                 assert_eq!(quality_mode, QualityMode::Balanced);
             }

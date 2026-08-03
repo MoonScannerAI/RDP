@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::crypto::storage::SecretStore;
-use crate::crypto::{Ed25519Pub, SpkiHash, sha256, spki_sha256_from_cert_der};
+use crate::crypto::{sha256, spki_sha256_from_cert_der, Ed25519Pub, SpkiHash};
 use crate::error::{Error, Result};
 use crate::secret::Secret;
 
@@ -53,7 +53,10 @@ pub fn validate_name(name: &str) -> Result<()> {
         return Err(Error::Invalid("name is empty".into()));
     }
     if name.len() > MAX_NAME_LEN {
-        return Err(Error::Oversized { got: name.len(), limit: MAX_NAME_LEN });
+        return Err(Error::Oversized {
+            got: name.len(),
+            limit: MAX_NAME_LEN,
+        });
     }
     if name.chars().any(|c| c.is_control()) {
         return Err(Error::Invalid("name contains control characters".into()));
@@ -77,7 +80,10 @@ impl std::fmt::Debug for TlsIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsIdentity")
             .field("cert_len", &self.cert_der.len())
-            .field("spki_sha256", &crate::crypto::fingerprint_short(&self.spki_sha256))
+            .field(
+                "spki_sha256",
+                &crate::crypto::fingerprint_short(&self.spki_sha256),
+            )
             .field("key", &"[REDACTED]")
             .finish()
     }
@@ -115,10 +121,16 @@ impl TlsIdentity {
         let from_cert = spki_sha256_from_cert_der(&cert_der)?;
         if from_cert != spki_sha256 {
             key_der.zeroize();
-            return Err(Error::Crypto("spki pin mismatch between cert and key".into()));
+            return Err(Error::Crypto(
+                "spki pin mismatch between cert and key".into(),
+            ));
         }
 
-        Ok(Self { cert_der, key_pkcs8: Secret::new(key_der), spki_sha256 })
+        Ok(Self {
+            cert_der,
+            key_pkcs8: Secret::new(key_der),
+            spki_sha256,
+        })
     }
 
     /// Rebuild from persisted DER bytes, recomputing (not trusting) the pin.
@@ -127,7 +139,11 @@ impl TlsIdentity {
             return Err(Error::Crypto("tls identity: empty DER".into()));
         }
         let spki_sha256 = spki_sha256_from_cert_der(&cert_der)?;
-        Ok(Self { cert_der, key_pkcs8: Secret::new(key_pkcs8), spki_sha256 })
+        Ok(Self {
+            cert_der,
+            key_pkcs8: Secret::new(key_pkcs8),
+            spki_sha256,
+        })
     }
 
     /// The DER-encoded certificate served to peers.
@@ -202,7 +218,10 @@ impl std::fmt::Debug for HostIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostIdentity")
             .field("name", &self.name)
-            .field("ed25519_pub", &crate::crypto::fingerprint_short(&self.ed25519_pub()))
+            .field(
+                "ed25519_pub",
+                &crate::crypto::fingerprint_short(&self.ed25519_pub()),
+            )
             .field("tls", &self.tls)
             .finish()
     }
@@ -249,7 +268,11 @@ impl HostIdentity {
         let signing = SigningKey::from_bytes(&seed);
         seed.zeroize();
         let tls = TlsIdentity::from_der(stored.tls_cert_der, stored.tls_key_pkcs8)?;
-        Ok(Some(Self { name: stored.name, signing, tls }))
+        Ok(Some(Self {
+            name: stored.name,
+            signing,
+            tls,
+        }))
     }
 
     /// Persist this identity (overwriting any previous one).
@@ -325,7 +348,10 @@ impl std::fmt::Debug for ClientIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientIdentity")
             .field("name", &self.name)
-            .field("ed25519_pub", &crate::crypto::fingerprint_short(&self.ed25519_pub()))
+            .field(
+                "ed25519_pub",
+                &crate::crypto::fingerprint_short(&self.ed25519_pub()),
+            )
             .finish()
     }
 }
@@ -334,7 +360,10 @@ impl ClientIdentity {
     /// Generate a brand-new client identity. Does not persist it.
     pub fn generate(name: &str) -> Result<Self> {
         validate_name(name)?;
-        Ok(Self { name: name.to_string(), signing: SigningKey::generate(&mut OsRng) })
+        Ok(Self {
+            name: name.to_string(),
+            signing: SigningKey::generate(&mut OsRng),
+        })
     }
 
     /// Load the persisted identity, or generate and persist a new one.
@@ -363,7 +392,10 @@ impl ClientIdentity {
         let mut seed = stored.ed25519_seed;
         let signing = SigningKey::from_bytes(&seed);
         seed.zeroize();
-        Ok(Some(Self { name: stored.name, signing }))
+        Ok(Some(Self {
+            name: stored.name,
+            signing,
+        }))
     }
 
     /// Persist this identity (overwriting any previous one).
@@ -415,15 +447,17 @@ mod tests {
         let a = TlsIdentity::generate("host-a").unwrap();
         let b = TlsIdentity::generate("host-b").unwrap();
         assert_ne!(a.spki_sha256(), b.spki_sha256());
-        assert_eq!(spki_sha256_from_cert_der(a.cert_der()).unwrap(), *a.spki_sha256());
+        assert_eq!(
+            spki_sha256_from_cert_der(a.cert_der()).unwrap(),
+            *a.spki_sha256()
+        );
         assert_eq!(a.pin_short().len(), 19);
     }
 
     #[test]
     fn tls_identity_roundtrips_through_der() {
         let a = TlsIdentity::generate("host").unwrap();
-        let b =
-            TlsIdentity::from_der(a.cert_der().to_vec(), a.key_pkcs8.expose().clone()).unwrap();
+        let b = TlsIdentity::from_der(a.cert_der().to_vec(), a.key_pkcs8.expose().clone()).unwrap();
         assert_eq!(a.spki_sha256(), b.spki_sha256());
     }
 
@@ -444,7 +478,11 @@ mod tests {
         let b = HostIdentity::load_or_create(&store, "ignored-name").unwrap();
 
         assert_eq!(a.name(), "workstation");
-        assert_eq!(b.name(), "workstation", "existing identity keeps its original name");
+        assert_eq!(
+            b.name(),
+            "workstation",
+            "existing identity keeps its original name"
+        );
         assert_eq!(a.ed25519_pub(), b.ed25519_pub());
         assert_eq!(a.spki_sha256(), b.spki_sha256());
         assert_eq!(a.tls().cert_der(), b.tls().cert_der());
@@ -529,6 +567,9 @@ mod tests {
                 parse_verifying_key(&b).is_err()
             })
             .count();
-        assert!(rejected > 0, "point decompression must reject off-curve encodings");
+        assert!(
+            rejected > 0,
+            "point decompression must reject off-curve encodings"
+        );
     }
 }

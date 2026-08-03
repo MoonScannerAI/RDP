@@ -342,14 +342,21 @@ mod tests {
         s.listening = false;
         s.last_error = Some("x".repeat(400));
         let v = tray_view_of(&s, true);
-        assert!(v.tooltip.chars().count() <= 120, "{}", v.tooltip.chars().count());
+        assert!(
+            v.tooltip.chars().count() <= 120,
+            "{}",
+            v.tooltip.chars().count()
+        );
         assert!(v.tooltip.ends_with('…'));
     }
 
     #[test]
     fn shared_state_reports_no_listener_instead_of_pretending() {
         let shared = AppShared::new(true);
-        assert!(!shared.send(NetCommand::ArmPairing), "no listener means no send");
+        assert!(
+            !shared.send(NetCommand::ArmPairing),
+            "no listener means no send"
+        );
         assert!(!shared.quit_requested());
         assert!(shared.remote_access());
     }

@@ -32,6 +32,12 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-channel = { workspace = true }
+# Only used to size the UDP socket send/receive buffers before handing the
+# socket to quinn. quinn's own `Endpoint::server`/`client` bind a socket with
+# the OS default buffers (~64 KiB on Windows), which a fast video sender
+# overruns on loopback — the kernel then drops datagrams silently. Already in
+# the tree transitively via quinn-udp 0.5, so this pins no new version.
+socket2 = "0.6"
 
 [dependencies.windows]
 workspace = true

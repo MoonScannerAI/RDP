@@ -169,7 +169,11 @@ pub mod mock {
             autostart: Arc::new(MockAutostart(false)),
             service_version: "9.9.9-test".to_string(),
         };
-        Harness { firewall, supervisor, backend }
+        Harness {
+            firewall,
+            supervisor,
+            backend,
+        }
     }
 }
 
@@ -205,11 +209,17 @@ mod tests {
     fn ensure_and_remove_firewall_rules_flip_presence() {
         let h = harness();
         assert!(!h.firewall.rules_present());
-        assert_eq!(dispatch(SvcRequest::EnsureFirewallRules, &h.backend), SvcResponse::Ok);
+        assert_eq!(
+            dispatch(SvcRequest::EnsureFirewallRules, &h.backend),
+            SvcResponse::Ok
+        );
         assert!(h.firewall.rules_present());
         assert_eq!(*h.firewall.ensure_calls.lock(), 1);
 
-        assert_eq!(dispatch(SvcRequest::RemoveFirewallRules, &h.backend), SvcResponse::Ok);
+        assert_eq!(
+            dispatch(SvcRequest::RemoveFirewallRules, &h.backend),
+            SvcResponse::Ok
+        );
         assert!(!h.firewall.rules_present());
         assert_eq!(*h.firewall.remove_calls.lock(), 1);
     }
@@ -231,7 +241,10 @@ mod tests {
     #[test]
     fn restart_host_nudges_supervisor() {
         let h = harness();
-        assert_eq!(dispatch(SvcRequest::RestartHostRequested, &h.backend), SvcResponse::Ok);
+        assert_eq!(
+            dispatch(SvcRequest::RestartHostRequested, &h.backend),
+            SvcResponse::Ok
+        );
         assert_eq!(*h.supervisor.restarts.lock(), 1);
     }
 

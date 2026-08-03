@@ -324,7 +324,9 @@ impl NetParams {
         // error arrives at construction, where it is obvious.
         for o in &self.outages {
             if o.duration_ms == 0 {
-                return Err(Error::Invalid("netsim: outage duration must be non-zero".into()));
+                return Err(Error::Invalid(
+                    "netsim: outage duration must be non-zero".into(),
+                ));
             }
             if o.duration_ms > MAX_OUTAGE_MS {
                 return Err(Error::Invalid(format!(
@@ -972,8 +974,13 @@ mod tests {
         let mut sim = NetSim::new(params, 7).expect("valid");
 
         sim.tick(30);
-        sim.send_datagram(Endpoint::A, vec![9, 9]).expect("under mtu");
-        assert_eq!(sim.stats().datagrams_dropped_outage, 1, "arrival lands mid-outage");
+        sim.send_datagram(Endpoint::A, vec![9, 9])
+            .expect("under mtu");
+        assert_eq!(
+            sim.stats().datagrams_dropped_outage,
+            1,
+            "arrival lands mid-outage"
+        );
 
         sim.tick(1_000);
         assert!(sim.recv_datagram(Endpoint::B).is_none());
@@ -1001,7 +1008,10 @@ mod tests {
         // Nothing may arrive while the link is down.
         for t in [110u64, 150, 199] {
             sim.tick(t);
-            assert!(sim.recv_stream(Endpoint::B, 1).is_empty(), "delivered during outage at {t}");
+            assert!(
+                sim.recv_stream(Endpoint::B, 1).is_empty(),
+                "delivered during outage at {t}"
+            );
         }
         sim.tick(1_000);
         assert_eq!(sim.recv_stream(Endpoint::B, 1), b"abc".to_vec());
@@ -1036,7 +1046,11 @@ mod tests {
         let lossless = transcript(0.0);
         let lossy = transcript(50.0);
         assert_eq!(lossless.len(), 60, "nothing is lost at 0%");
-        assert!(lossy.len() > 10 && lossy.len() < 60, "got {} survivors", lossy.len());
+        assert!(
+            lossy.len() > 10 && lossy.len() < 60,
+            "got {} survivors",
+            lossy.len()
+        );
         for (marker, when) in &lossy {
             assert_eq!(
                 lossless.get(marker),

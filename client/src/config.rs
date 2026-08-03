@@ -16,6 +16,10 @@ pub struct ClientConfig {
     pub host_address: String,
     pub udp_port: u16,
     pub tcp_port: u16,
+    /// Friendly name this client presents to the host. Empty means "derive one
+    /// from the machine name"; never holds a secret.
+    #[serde(default)]
+    pub display_name: String,
     pub quality_mode: QualityMode,
     pub show_diagnostics: bool,
     pub start_fullscreen: bool,
@@ -27,6 +31,7 @@ impl Default for ClientConfig {
             host_address: String::new(),
             udp_port: DEFAULT_UDP_PORT,
             tcp_port: DEFAULT_TCP_PORT,
+            display_name: String::new(),
             quality_mode: QualityMode::Balanced,
             show_diagnostics: false,
             start_fullscreen: false,
@@ -131,7 +136,12 @@ mod tests {
 
     #[test]
     fn zero_ports_are_repaired() {
-        let c = ClientConfig { udp_port: 0, tcp_port: 0, ..Default::default() }.sanitized();
+        let c = ClientConfig {
+            udp_port: 0,
+            tcp_port: 0,
+            ..Default::default()
+        }
+        .sanitized();
         assert_eq!(c.udp_port, DEFAULT_UDP_PORT);
         assert_eq!(c.tcp_port, DEFAULT_TCP_PORT);
     }

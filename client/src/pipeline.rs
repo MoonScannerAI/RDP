@@ -54,7 +54,11 @@ pub struct Pipeline {
 
 impl Pipeline {
     fn new(status: Arc<SourceStatus>, stop: Arc<AtomicBool>) -> Self {
-        Self { stop, threads: Vec::new(), status }
+        Self {
+            stop,
+            threads: Vec::new(),
+            status,
+        }
     }
 
     pub fn shutdown(&mut self) {
@@ -109,7 +113,9 @@ pub fn spawn_decode_thread(
             loop {
                 match video_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(frame) => {
-                        let Some(decoder) = decoder.as_mut() else { continue };
+                        let Some(decoder) = decoder.as_mut() else {
+                            continue;
+                        };
                         match decoder.decode(&frame) {
                             Ok(frames) => {
                                 let produced = frames.len();
@@ -149,7 +155,11 @@ pub fn spawn_decode_thread(
 /// This exists to exercise the render + input + stats loop end to end with no
 /// host and no network. It is NOT a decoder test: it deliberately bypasses the
 /// decoder, and the diagnostics panel says so.
-pub fn spawn_demo_source(slot: Arc<FrameSlot>, fps: u32, repaint: impl Fn() + Send + 'static) -> Pipeline {
+pub fn spawn_demo_source(
+    slot: Arc<FrameSlot>,
+    fps: u32,
+    repaint: impl Fn() + Send + 'static,
+) -> Pipeline {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
 
@@ -241,7 +251,13 @@ fn synth_frame(width: u32, height: u32, tick: u32, timestamp_ms: u32) -> RawFram
         }
     }
 
-    RawFrame { width, height, format: PixelFormat::Rgba8, data, timestamp_ms }
+    RawFrame {
+        width,
+        height,
+        format: PixelFormat::Rgba8,
+        data,
+        timestamp_ms,
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +271,10 @@ mod tests {
         assert_eq!(f.width, 64);
         assert_eq!(f.height, 32);
         assert_eq!(f.data.len(), 64 * 32 * 4);
-        assert!(f.data.chunks_exact(4).all(|p| p[3] == 255), "must be opaque");
+        assert!(
+            f.data.chunks_exact(4).all(|p| p[3] == 255),
+            "must be opaque"
+        );
     }
 
     #[test]
@@ -275,7 +294,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         pipeline.shutdown();
-        assert!(slot.decoded_count() >= 5, "only {} frames", slot.decoded_count());
+        assert!(
+            slot.decoded_count() >= 5,
+            "only {} frames",
+            slot.decoded_count()
+        );
         assert_eq!(slot.remote_dims(), Some((1280, 720)));
     }
 }

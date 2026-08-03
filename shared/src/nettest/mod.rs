@@ -109,12 +109,22 @@ pub enum Observation {
     PublicV6Discovered { addr: Ipv6Addr },
     /// The reflexive address is itself in the CGNAT range 100.64.0.0/10, or the
     /// local address is private while the reflexive address is also private.
-    PossibleCgnat { reflexive: Ipv4Addr, confidence: Confidence },
+    PossibleCgnat {
+        reflexive: Ipv4Addr,
+        confidence: Confidence,
+    },
     /// Our local address is private and the reflexive address is public — an
     /// ordinary NAT, and we know both sides of the mapping.
-    BehindNat { local: Ipv4Addr, reflexive: Ipv4Addr },
+    BehindNat {
+        local: Ipv4Addr,
+        reflexive: Ipv4Addr,
+    },
     /// STUN produced consistent mapping behaviour across servers.
-    NatMappingObserved { mapping: NatMapping, servers_agreeing: u8, servers_probed: u8 },
+    NatMappingObserved {
+        mapping: NatMapping,
+        servers_agreeing: u8,
+        servers_probed: u8,
+    },
     /// No UDP probe of any kind got a reply — UDP is very likely blocked.
     UdpBlocked { probes_sent: u32, timeout_ms: u32 },
     /// UDP works: at least one probe round-tripped.
@@ -125,7 +135,11 @@ pub enum Observation {
     DirectTcpUnavailable { addr: SocketAddr, reason: String },
     /// The external mapping changed between two probes — the NAT rebinds
     /// aggressively, so keep-alives must be frequent and the route may flap.
-    MappingChanged { before: SocketAddr, after: SocketAddr, after_ms: u32 },
+    MappingChanged {
+        before: SocketAddr,
+        after: SocketAddr,
+        after_ms: u32,
+    },
     /// A UPnP/NAT-PMP capable gateway answered a discovery request. We do NOT
     /// automatically create mappings; this is informational for the user.
     PortMappingProtocolAvailable { protocol: PortMappingProtocol },
@@ -136,7 +150,10 @@ pub enum Observation {
     /// The local machine has more than one candidate egress interface.
     MultipleEgressInterfaces { count: u8 },
     /// A Windows Firewall rule for the DirectDesk listener appears to be absent.
-    FirewallRuleMissing { port: u16, transport: ProbeTransport },
+    FirewallRuleMissing {
+        port: u16,
+        transport: ProbeTransport,
+    },
 }
 
 impl Observation {
@@ -172,7 +189,11 @@ pub struct ProbeReport {
 impl ProbeReport {
     /// Create an empty report for a run starting at `started_at_ms`.
     pub fn new(started_at_ms: u64) -> Self {
-        Self { started_at_ms, duration_ms: 0, observations: Vec::new() }
+        Self {
+            started_at_ms,
+            duration_ms: 0,
+            observations: Vec::new(),
+        }
     }
 
     /// Record one observation.
@@ -195,12 +216,16 @@ impl ProbeReport {
 
     /// True when at least one UDP probe round-tripped.
     pub fn udp_works(&self) -> bool {
-        self.observations.iter().any(|o| matches!(o, Observation::UdpAvailable { .. }))
+        self.observations
+            .iter()
+            .any(|o| matches!(o, Observation::UdpAvailable { .. }))
     }
 
     /// True when a direct TCP connection was proven to work.
     pub fn direct_tcp_works(&self) -> bool {
-        self.observations.iter().any(|o| matches!(o, Observation::DirectTcpAvailable { .. }))
+        self.observations
+            .iter()
+            .any(|o| matches!(o, Observation::DirectTcpAvailable { .. }))
     }
 }
 
@@ -224,7 +249,10 @@ mod tests {
             servers_agreeing: 3,
             servers_probed: 3,
         });
-        r.push(Observation::UdpBlocked { probes_sent: 4, timeout_ms: 800 });
+        r.push(Observation::UdpBlocked {
+            probes_sent: 4,
+            timeout_ms: 800,
+        });
 
         assert!(r.udp_works());
         assert!(!r.direct_tcp_works());

@@ -61,10 +61,16 @@ pub fn nv12_to_rgba(
     // UV row holds `width` bytes (width/2 interleaved U,V pairs), rounded up.
     let uv_needed = (uv_rows - 1) * stride + width.div_ceil(2) * 2;
     if y_plane.len() < y_needed {
-        return Err(Error::Decoder(format!("Y plane {} < {y_needed}", y_plane.len())));
+        return Err(Error::Decoder(format!(
+            "Y plane {} < {y_needed}",
+            y_plane.len()
+        )));
     }
     if uv_plane.len() < uv_needed {
-        return Err(Error::Decoder(format!("UV plane {} < {uv_needed}", uv_plane.len())));
+        return Err(Error::Decoder(format!(
+            "UV plane {} < {uv_needed}",
+            uv_plane.len()
+        )));
     }
 
     let mut out = vec![0u8; width * height * 4];
@@ -194,8 +200,9 @@ mod mf {
             // correctly typed arguments; failures come back as HRESULTs.
             unsafe {
                 let transform: IMFTransform =
-                    CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER)
-                        .map_err(|e| Error::Decoder(format!("CoCreateInstance(H264 decoder): {e}")))?;
+                    CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER).map_err(
+                        |e| Error::Decoder(format!("CoCreateInstance(H264 decoder): {e}")),
+                    )?;
 
                 // Low latency: no lookahead, emit as soon as a picture is done.
                 match transform.GetAttributes() {
@@ -215,7 +222,8 @@ mod mf {
                 input
                     .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
                     .map_err(|e| Error::Decoder(format!("set H264 subtype: {e}")))?;
-                let _ = input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
+                let _ =
+                    input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
                 // No MF_MT_MPEG_SEQUENCE_HEADER: that is what tells the MFT the
                 // stream is annex-B with in-band SPS/PPS, which is what the host
                 // sends.
@@ -391,7 +399,9 @@ mod mf {
 
                 let sample =
                     MFCreateSample().map_err(|e| Error::Decoder(format!("MFCreateSample: {e}")))?;
-                sample.AddBuffer(&buffer).map_err(|e| Error::Decoder(format!("AddBuffer: {e}")))?;
+                sample
+                    .AddBuffer(&buffer)
+                    .map_err(|e| Error::Decoder(format!("AddBuffer: {e}")))?;
                 sample
                     .SetSampleTime(pts)
                     .map_err(|e| Error::Decoder(format!("SetSampleTime: {e}")))?;
@@ -482,8 +492,11 @@ mod mf {
         unsafe fn drain_outputs(&mut self, out: &mut Vec<RawFrame>) -> Result<()> {
             let transform = self.transform.clone();
             loop {
-                let supplied =
-                    if self.provides_samples { None } else { Some(unsafe { self.acquire_out_sample()? }) };
+                let supplied = if self.provides_samples {
+                    None
+                } else {
+                    Some(unsafe { self.acquire_out_sample()? })
+                };
 
                 let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
                     dwStreamID: 0,
@@ -574,9 +587,9 @@ mod mf {
                     Err(e) if e.code() == MF_E_NOTACCEPTING_HR => {
                         // Backed up: drain, then the input must be accepted.
                         self.drain_outputs(&mut out)?;
-                        transform
-                            .ProcessInput(0, &sample, 0)
-                            .map_err(|e| Error::Decoder(format!("ProcessInput after drain: {e}")))?;
+                        transform.ProcessInput(0, &sample, 0).map_err(|e| {
+                            Error::Decoder(format!("ProcessInput after drain: {e}"))
+                        })?;
                     }
                     Err(e) => return Err(Error::Decoder(format!("ProcessInput: {e}"))),
                 }
@@ -629,7 +642,13 @@ mod mf {
             _ => (coded_w, coded_h),
         };
 
-        Ok(OutputFormat { coded_w, coded_h, disp_w, disp_h, stride })
+        Ok(OutputFormat {
+            coded_w,
+            coded_h,
+            disp_w,
+            disp_h,
+            stride,
+        })
     }
 
     /// # Safety
@@ -640,7 +659,10 @@ mod mf {
         unsafe { ty.GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut blob, None) }.ok()?;
         // SAFETY: MFVideoArea is a plain repr(C) POD; the blob is its size.
         let area: MFVideoArea = unsafe { std::ptr::read_unaligned(blob.as_ptr().cast()) };
-        Some((u32::try_from(area.Area.cx).ok()?, u32::try_from(area.Area.cy).ok()?))
+        Some((
+            u32::try_from(area.Area.cx).ok()?,
+            u32::try_from(area.Area.cy).ok()?,
+        ))
     }
 
     /// Create a decoder and report what Media Foundation negotiated. Used by
@@ -657,9 +679,8 @@ mod mf {
                         "output type: NV12 coded {}x{}, display {}x{}, stride {}\n",
                         f.coded_w, f.coded_h, f.disp_w, f.disp_h, f.stride
                     )),
-                    None => report.push_str(
-                        "output type: not negotiable before the first SPS (expected)\n",
-                    ),
+                    None => report
+                        .push_str("output type: not negotiable before the first SPS (expected)\n"),
                 }
                 report.push_str(&format!("provides_samples: {}\n", decoder.provides_samples));
                 // SAFETY: enumerating types on a live MFT we own.
@@ -738,8 +759,9 @@ mod roundtrip {
             ensure_mf_initialized()?;
             unsafe {
                 let transform: IMFTransform =
-                    CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                        .map_err(|e| Error::Encoder(format!("CoCreateInstance(H264 encoder): {e}")))?;
+                    CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER).map_err(
+                        |e| Error::Encoder(format!("CoCreateInstance(H264 encoder): {e}")),
+                    )?;
 
                 // The MS encoder requires the OUTPUT type to be set first.
                 let out = MFCreateMediaType().map_err(|e| Error::Encoder(e.to_string()))?;
@@ -747,7 +769,8 @@ mod roundtrip {
                     .map_err(|e| Error::Encoder(e.to_string()))?;
                 out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
                     .map_err(|e| Error::Encoder(e.to_string()))?;
-                out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate).map_err(|e| Error::Encoder(e.to_string()))?;
+                out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)
+                    .map_err(|e| Error::Encoder(e.to_string()))?;
                 out.SetUINT64(&MF_MT_FRAME_SIZE, packed_u64(width, height))
                     .map_err(|e| Error::Encoder(e.to_string()))?;
                 out.SetUINT64(&MF_MT_FRAME_RATE, packed_u64(fps, 1))
@@ -805,7 +828,9 @@ mod roundtrip {
                 let buffer = MFCreateMemoryBuffer(nv12.len() as u32)
                     .map_err(|e| Error::Encoder(e.to_string()))?;
                 let mut ptr: *mut u8 = std::ptr::null_mut();
-                buffer.Lock(&mut ptr, None, None).map_err(|e| Error::Encoder(e.to_string()))?;
+                buffer
+                    .Lock(&mut ptr, None, None)
+                    .map_err(|e| Error::Encoder(e.to_string()))?;
                 std::ptr::copy_nonoverlapping(nv12.as_ptr(), ptr, nv12.len());
                 let _ = buffer.Unlock();
                 buffer
@@ -813,11 +838,15 @@ mod roundtrip {
                     .map_err(|e| Error::Encoder(e.to_string()))?;
 
                 let sample = MFCreateSample().map_err(|e| Error::Encoder(e.to_string()))?;
-                sample.AddBuffer(&buffer).map_err(|e| Error::Encoder(e.to_string()))?;
+                sample
+                    .AddBuffer(&buffer)
+                    .map_err(|e| Error::Encoder(e.to_string()))?;
                 sample
                     .SetSampleTime(index as i64 * duration)
                     .map_err(|e| Error::Encoder(e.to_string()))?;
-                sample.SetSampleDuration(duration).map_err(|e| Error::Encoder(e.to_string()))?;
+                sample
+                    .SetSampleDuration(duration)
+                    .map_err(|e| Error::Encoder(e.to_string()))?;
 
                 self.transform
                     .ProcessInput(0, &sample, 0)
@@ -835,7 +864,9 @@ mod roundtrip {
                     let buffer = MFCreateMemoryBuffer(self.out_bytes)
                         .map_err(|e| Error::Encoder(e.to_string()))?;
                     let sample = MFCreateSample().map_err(|e| Error::Encoder(e.to_string()))?;
-                    sample.AddBuffer(&buffer).map_err(|e| Error::Encoder(e.to_string()))?;
+                    sample
+                        .AddBuffer(&buffer)
+                        .map_err(|e| Error::Encoder(e.to_string()))?;
                     Some(sample)
                 };
                 let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
@@ -949,7 +980,14 @@ mod roundtrip {
         plane
     }
 
-    fn mean_rgb(rgba: &[u8], width: usize, x0: usize, x1: usize, y0: usize, y1: usize) -> (f64, f64, f64) {
+    fn mean_rgb(
+        rgba: &[u8],
+        width: usize,
+        x0: usize,
+        x1: usize,
+        y0: usize,
+        y1: usize,
+    ) -> (f64, f64, f64) {
         let (mut r, mut g, mut b, mut n) = (0f64, 0f64, 0f64, 0f64);
         for y in y0..y1 {
             for x in x0..x1 {
@@ -994,7 +1032,9 @@ mod roundtrip {
             }
         }
 
-        let frame = decoded.first().expect("decoder produced no frames from a real H.264 stream");
+        let frame = decoded
+            .first()
+            .expect("decoder produced no frames from a real H.264 stream");
 
         // Prove the aperture crop actually did something: H.264 codes in 16-row
         // macroblocks, so 360 rows must be carried as 368 coded rows.
@@ -1003,26 +1043,55 @@ mod roundtrip {
             "round-trip: coded {}x{}, display {}x{}, stride {}",
             fmt.coded_w, fmt.coded_h, fmt.disp_w, fmt.disp_h, fmt.stride
         );
-        assert_eq!(fmt.disp_h, H as u32, "display height must be the real picture height");
-        assert!(fmt.coded_h > fmt.disp_h, "coded {} should exceed display {}", fmt.coded_h, fmt.disp_h);
+        assert_eq!(
+            fmt.disp_h, H as u32,
+            "display height must be the real picture height"
+        );
+        assert!(
+            fmt.coded_h > fmt.disp_h,
+            "coded {} should exceed display {}",
+            fmt.coded_h,
+            fmt.disp_h
+        );
 
         // Geometry: display size, not coded size.
-        assert_eq!((frame.width, frame.height), (W as u32, H as u32), "cropped to display aperture");
+        assert_eq!(
+            (frame.width, frame.height),
+            (W as u32, H as u32),
+            "cropped to display aperture"
+        );
         assert_eq!(frame.format, PixelFormat::Rgba8);
         assert_eq!(frame.data.len(), W * H * 4);
-        assert!(frame.data.chunks_exact(4).all(|p| p[3] == 255), "alpha must be opaque");
+        assert!(
+            frame.data.chunks_exact(4).all(|p| p[3] == 255),
+            "alpha must be opaque"
+        );
 
         // Content: left half red, right half blue, sampled away from the edges
         // so codec ringing at the boundary cannot muddy the result.
         let (lr, lg, lb) = mean_rgb(&frame.data, W, 20, W / 2 - 20, 20, H - 20);
         let (rr, rg, rb) = mean_rgb(&frame.data, W, W / 2 + 20, W - 20, 20, H - 20);
-        assert!(lr > 180.0 && lg < 70.0 && lb < 70.0, "left half should be red, got ({lr:.0},{lg:.0},{lb:.0})");
-        assert!(rb > 180.0 && rr < 70.0 && rg < 70.0, "right half should be blue, got ({rr:.0},{rg:.0},{rb:.0})");
+        assert!(
+            lr > 180.0 && lg < 70.0 && lb < 70.0,
+            "left half should be red, got ({lr:.0},{lg:.0},{lb:.0})"
+        );
+        assert!(
+            rb > 180.0 && rr < 70.0 && rg < 70.0,
+            "right half should be blue, got ({rr:.0},{rg:.0},{rb:.0})"
+        );
 
         // The last-mile invariant: flush must demand a fresh keyframe.
         decoder.flush();
-        let dummy = EncodedFrame { frame_id: 999, keyframe: false, timestamp_ms: 0, data: vec![0, 0, 0, 1, 0x41] };
-        assert!(decoder.decode(&dummy).unwrap().is_empty(), "must wait for a keyframe after flush");
+        let dummy = EncodedFrame {
+            frame_id: 999,
+            keyframe: false,
+            timestamp_ms: 0,
+            data: vec![0, 0, 0, 1, 0x41],
+        };
+        assert!(
+            decoder.decode(&dummy).unwrap().is_empty(),
+            "must wait for a keyframe after flush"
+        );
     }
 }
 
@@ -1061,10 +1130,20 @@ mod tests {
     #[test]
     fn black_and_white_hit_the_limited_range_endpoints() {
         // Y=16 is studio black, Y=235 is studio white; chroma neutral at 128.
-        let (y, uv) = synth_nv12(4, 4, 8, |x, _| if x < 2 { (16, 128, 128) } else { (235, 128, 128) });
+        let (y, uv) = synth_nv12(4, 4, 8, |x, _| {
+            if x < 2 {
+                (16, 128, 128)
+            } else {
+                (235, 128, 128)
+            }
+        });
         let rgba = nv12_to_rgba(&y, &uv, 4, 4, 8).unwrap();
         assert_eq!(px(&rgba, 4, 0, 0), (0, 0, 0, 255), "studio black → 0");
-        assert_eq!(px(&rgba, 4, 3, 0), (255, 255, 255, 255), "studio white → 255");
+        assert_eq!(
+            px(&rgba, 4, 3, 0),
+            (255, 255, 255, 255),
+            "studio white → 255"
+        );
     }
 
     #[test]
@@ -1144,13 +1223,23 @@ mod tests {
         });
         let rgba = nv12_to_rgba(&y, &uv, 1920, 1080, stride).unwrap();
         assert_eq!(rgba.len(), 1920 * 1080 * 4);
-        assert_eq!(px(&rgba, 1920, 0, 1079), (255, 255, 255, 255), "last visible row");
+        assert_eq!(
+            px(&rgba, 1920, 0, 1079),
+            (255, 255, 255, 255),
+            "last visible row"
+        );
     }
 
     #[test]
     fn chroma_is_shared_across_each_2x2_block() {
         // One red 2x2 block, rest black — proves the 4:2:0 subsampling index.
-        let (y, uv) = synth_nv12(4, 4, 4, |x, y| if x < 2 && y < 2 { (63, 102, 240) } else { (16, 128, 128) });
+        let (y, uv) = synth_nv12(4, 4, 4, |x, y| {
+            if x < 2 && y < 2 {
+                (63, 102, 240)
+            } else {
+                (16, 128, 128)
+            }
+        });
         let rgba = nv12_to_rgba(&y, &uv, 4, 4, 4).unwrap();
         for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             let (r, _, _, _) = px(&rgba, 4, x, y);
@@ -1164,8 +1253,14 @@ mod tests {
         let (y, uv) = synth_nv12(4, 4, 4, |_, _| (16, 128, 128));
         assert!(nv12_to_rgba(&y, &uv, 0, 4, 4).is_err(), "zero width");
         assert!(nv12_to_rgba(&y, &uv, 8, 4, 4).is_err(), "stride < width");
-        assert!(nv12_to_rgba(&y, &uv, 4, 64, 4).is_err(), "Y plane too small");
-        assert!(nv12_to_rgba(&y, &[], 4, 4, 4).is_err(), "UV plane too small");
+        assert!(
+            nv12_to_rgba(&y, &uv, 4, 64, 4).is_err(),
+            "Y plane too small"
+        );
+        assert!(
+            nv12_to_rgba(&y, &[], 4, 4, 4).is_err(),
+            "UV plane too small"
+        );
     }
 
     #[test]
@@ -1173,6 +1268,9 @@ mod tests {
         let (y, uv) = synth_nv12(6, 4, 8, |_, _| (128, 128, 128));
         let rgba = nv12_to_rgba(&y, &uv, 6, 4, 8).unwrap();
         assert_eq!(rgba.len(), 6 * 4 * 4);
-        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255), "alpha must be opaque");
+        assert!(
+            rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "alpha must be opaque"
+        );
     }
 }

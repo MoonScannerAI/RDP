@@ -53,94 +53,124 @@ fn body(ui: &mut egui::Ui, input: DiagnosticsInput<'_>) {
         if age > STALE_AFTER_MS {
             ui.colored_label(
                 egui::Color32::from_rgb(230, 170, 60),
-                format!("Host stats are {:.0} s old — figures below are stale.", age / 1000.0),
+                format!(
+                    "Host stats are {:.0} s old — figures below are stale.",
+                    age / 1000.0
+                ),
             );
         }
     }
-    egui::Grid::new("diag_transport").num_columns(2).striped(true).show(ui, |ui| {
-        row(ui, "Route", route_text(input.route));
-        match input.stats {
-            Some(s) => {
-                row(ui, "RTT", format!("{:.1} ms", s.rtt_ms));
-                row(ui, "Jitter", format!("{:.1} ms", s.jitter_ms));
-                row(ui, "Loss", format!("{:.2} %", s.loss * 100.0));
-                row(ui, "Bandwidth", format!("{} kbps", s.bandwidth_kbps));
-                row(ui, "Video bitrate", format!("{} kbps", s.bitrate_kbps));
-            }
-            None => {
-                for name in ["RTT", "Jitter", "Loss", "Bandwidth", "Video bitrate"] {
-                    row(ui, name, DASH.to_string());
+    egui::Grid::new("diag_transport")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            row(ui, "Route", route_text(input.route));
+            match input.stats {
+                Some(s) => {
+                    row(ui, "RTT", format!("{:.1} ms", s.rtt_ms));
+                    row(ui, "Jitter", format!("{:.1} ms", s.jitter_ms));
+                    row(ui, "Loss", format!("{:.2} %", s.loss * 100.0));
+                    row(ui, "Bandwidth", format!("{} kbps", s.bandwidth_kbps));
+                    row(ui, "Video bitrate", format!("{} kbps", s.bitrate_kbps));
+                }
+                None => {
+                    for name in ["RTT", "Jitter", "Loss", "Bandwidth", "Video bitrate"] {
+                        row(ui, name, DASH.to_string());
+                    }
                 }
             }
-        }
-    });
+        });
 
     ui.add_space(8.0);
     ui.heading("Frame chain");
-    egui::Grid::new("diag_frames").num_columns(2).striped(true).show(ui, |ui| {
-        // Host-side rates only exist if the host told us.
-        match input.stats {
-            Some(s) => {
-                row(ui, "fps capture (host)", format!("{:.1}", s.fps_capture));
-                row(ui, "fps encode (host)", format!("{:.1}", s.fps_encode));
-                row(ui, "Host pipeline", format!("{:.1} ms", s.pipeline_ms));
-                row(ui, "Keyframes requested", s.keyframes_requested.to_string());
+    egui::Grid::new("diag_frames")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            // Host-side rates only exist if the host told us.
+            match input.stats {
+                Some(s) => {
+                    row(ui, "fps capture (host)", format!("{:.1}", s.fps_capture));
+                    row(ui, "fps encode (host)", format!("{:.1}", s.fps_encode));
+                    row(ui, "Host pipeline", format!("{:.1} ms", s.pipeline_ms));
+                    row(ui, "Keyframes requested", s.keyframes_requested.to_string());
+                }
+                None => {
+                    row(ui, "fps capture (host)", DASH.to_string());
+                    row(ui, "fps encode (host)", DASH.to_string());
+                    row(ui, "Host pipeline", DASH.to_string());
+                    row(ui, "Keyframes requested", DASH.to_string());
+                }
             }
-            None => {
-                row(ui, "fps capture (host)", DASH.to_string());
-                row(ui, "fps encode (host)", DASH.to_string());
-                row(ui, "Host pipeline", DASH.to_string());
-                row(ui, "Keyframes requested", DASH.to_string());
-            }
-        }
-        // These we measure ourselves, so they are always real.
-        row(ui, "fps decode (local)", format!("{:.1}", input.presenter.fps_decode()));
-        row(ui, "fps present (local)", format!("{:.1}", input.presenter.fps_present()));
-        row(
-            ui,
-            "Present age",
-            match input.presenter.present_age_ms() {
-                Some(ms) => format!("{ms:.1} ms"),
-                None => DASH.to_string(),
-            },
-        );
-        row(ui, "Frames decoded", input.frames_decoded.to_string());
-        row(ui, "Frames presented", input.frames_presented.to_string());
-        row(ui, "Dropped at present", input.frames_dropped_at_present.to_string());
-    });
+            // These we measure ourselves, so they are always real.
+            row(
+                ui,
+                "fps decode (local)",
+                format!("{:.1}", input.presenter.fps_decode()),
+            );
+            row(
+                ui,
+                "fps present (local)",
+                format!("{:.1}", input.presenter.fps_present()),
+            );
+            row(
+                ui,
+                "Present age",
+                match input.presenter.present_age_ms() {
+                    Some(ms) => format!("{ms:.1} ms"),
+                    None => DASH.to_string(),
+                },
+            );
+            row(ui, "Frames decoded", input.frames_decoded.to_string());
+            row(ui, "Frames presented", input.frames_presented.to_string());
+            row(
+                ui,
+                "Dropped at present",
+                input.frames_dropped_at_present.to_string(),
+            );
+        });
 
     ui.add_space(8.0);
     ui.heading("Decoder");
-    egui::Grid::new("diag_decoder").num_columns(2).striped(true).show(ui, |ui| {
-        row(ui, "Source", input.source_description.to_string());
-        row(
-            ui,
-            "Presented size",
-            match input.presenter.frame_size() {
-                Some((w, h)) => format!("{w} x {h}"),
-                None => DASH.to_string(),
-            },
-        );
-        row(
-            ui,
-            "Decoded size",
-            match input.remote_dims {
-                Some((w, h)) => format!("{w} x {h}"),
-                None => DASH.to_string(),
-            },
-        );
-    });
+    egui::Grid::new("diag_decoder")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            row(ui, "Source", input.source_description.to_string());
+            row(
+                ui,
+                "Presented size",
+                match input.presenter.frame_size() {
+                    Some((w, h)) => format!("{w} x {h}"),
+                    None => DASH.to_string(),
+                },
+            );
+            row(
+                ui,
+                "Decoded size",
+                match input.remote_dims {
+                    Some((w, h)) => format!("{w} x {h}"),
+                    None => DASH.to_string(),
+                },
+            );
+        });
     if let Some(err) = input.source_error {
-        ui.colored_label(egui::Color32::from_rgb(220, 90, 90), format!("Decoder error: {err}"));
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 90, 90),
+            format!("Decoder error: {err}"),
+        );
     }
 
     ui.add_space(8.0);
     ui.heading("Input");
-    egui::Grid::new("diag_input").num_columns(2).striped(true).show(ui, |ui| {
-        row(ui, "Keys forwarded", input.keys_forwarded.to_string());
-        row(ui, "Mouse moves sent", input.moves_sent.to_string());
-        row(ui, "Moves coalesced", input.moves_coalesced.to_string());
-    });
+    egui::Grid::new("diag_input")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            row(ui, "Keys forwarded", input.keys_forwarded.to_string());
+            row(ui, "Mouse moves sent", input.moves_sent.to_string());
+            row(ui, "Moves coalesced", input.moves_coalesced.to_string());
+        });
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: String) {
@@ -192,6 +222,9 @@ mod tests {
 
     #[test]
     fn relayed_is_visually_flagged() {
-        assert_ne!(route_color(Some(TransportRoute::Relayed)), route_color(Some(TransportRoute::DirectUdp)));
+        assert_ne!(
+            route_color(Some(TransportRoute::Relayed)),
+            route_color(Some(TransportRoute::DirectUdp))
+        );
     }
 }

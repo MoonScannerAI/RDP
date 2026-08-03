@@ -23,15 +23,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use directdesk_client::net::{run_client, ConnectParams, FEATURE_PAIRING_REQUEST, PAIR_BIND_NONCE};
+use directdesk_client::net::{run_client, ConnectParams, FEATURE_PAIRING_REQUEST};
 use directdesk_client::session::{ClientSession, ConnectionState};
 use directdesk_shared::crypto::auth::{
-    self, HostAuthenticator, TrustedPeer, TrustedPeers, TRUSTED_HOSTS_KEY,
+    HostAuthenticator, TrustedPeer, TrustedPeers, TRUSTED_HOSTS_KEY,
 };
-use directdesk_shared::crypto::identity::parse_verifying_key;
 use directdesk_shared::crypto::pairing::{PairingCode, PairingHost};
 use directdesk_shared::crypto::storage::{MemoryStore, SecretStore};
-use directdesk_shared::crypto::{HostIdentity, Role};
+use directdesk_shared::crypto::HostIdentity;
 use directdesk_shared::input::{InputEvent, KeyAction};
 use directdesk_shared::protocol::{
     self, AuthMsg, ControlMsg, Hello, InputMsg, MAX_AUTH_MSG, PROTOCOL_VERSION,
@@ -46,7 +45,10 @@ use tokio::sync::watch;
 const CODE: &str = "12345678";
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Shared observation of what the host received — the "injector hook".
@@ -108,9 +110,16 @@ fn spawn_host(
                 let trusted_client = trusted_client.clone();
                 let stop = stop.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        serve_conn(conn, serve_id, expect_code, trusted_client, obs, stop, produce_frames)
-                            .await
+                    if let Err(e) = serve_conn(
+                        conn,
+                        serve_id,
+                        expect_code,
+                        trusted_client,
+                        obs,
+                        stop,
+                        produce_frames,
+                    )
+                    .await
                     {
                         eprintln!("[host] connection ended: {e}");
                     }
@@ -119,7 +128,12 @@ fn spawn_host(
         })
     };
 
-    HostHandle { addr, stop, obs, task }
+    HostHandle {
+        addr,
+        stop,
+        obs,
+        task,
+    }
 }
 
 async fn serve_conn(
@@ -132,44 +146,69 @@ async fn serve_conn(
     produce_frames: bool,
 ) -> Result<(), String> {
     let exporter = quic::channel_binding(&conn).map_err(|e| e.to_string())?;
-    let mut streams = quic::accept_streams(&conn).await.map_err(|e| e.to_string())?;
+    let mut streams = quic::accept_streams(&conn)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Phase 0 — Hello.
     let hello: Hello = quic::read_framed(&mut streams.control.1, MAX_AUTH_MSG)
         .await
         .map_err(|e| e.to_string())?;
     protocol::validate_hello(&hello).map_err(|e| e.to_string())?;
-    let client_name = if hello.agent.is_empty() { "client".to_string() } else { hello.agent.clone() };
+    let client_name = if hello.agent.is_empty() {
+        "client".to_string()
+    } else {
+        hello.agent.clone()
+    };
     let wants_pairing = hello.features & FEATURE_PAIRING_REQUEST != 0;
     quic::write_framed(
         &mut streams.control.0,
-        &Hello { version: PROTOCOL_VERSION, features: 0, agent: "DirectDeskHost-e2e".into() },
+        &Hello {
+            version: PROTOCOL_VERSION,
+            features: 0,
+            agent: "DirectDeskHost-e2e".into(),
+        },
     )
     .await
     .map_err(|e| e.to_string())?;
 
-    // Phase 1 — auth.
+    // Phase 1 — the host always issues ServerChallenge first, then branches on
+    // the message type it reads next. Both branches sign this nonce.
+    let (mut ha, challenge) = HostAuthenticator::start(&exporter).map_err(|e| e.to_string())?;
+    write_auth(&mut streams, &challenge).await?;
+
     if wants_pairing {
         let code = expect_code.clone().ok_or("host not armed for pairing")?;
-        host_pairing(&mut streams, &serve_id, &exporter, &code, &client_name).await?;
+        host_pairing(
+            &mut streams,
+            &serve_id,
+            &exporter,
+            &code,
+            &client_name,
+            &mut ha,
+        )
+        .await?;
     } else {
         let client = trusted_client.clone().ok_or("host has no trusted client")?;
-        host_auth(&mut streams, &serve_id, &exporter, &client).await?;
+        host_auth(&mut streams, &serve_id, &client, &mut ha).await?;
     }
 
     // Phase 2 — StartStream (raw), then the driver attaches.
-    let start: ControlMsg =
-        quic::read_framed(&mut streams.control.1, protocol::MAX_CONTROL_MSG)
-            .await
-            .map_err(|e| e.to_string())?;
+    let start: ControlMsg = quic::read_framed(&mut streams.control.1, protocol::MAX_CONTROL_MSG)
+        .await
+        .map_err(|e| e.to_string())?;
     if !matches!(start, ControlMsg::StartStream { .. }) {
         return Err(format!("expected StartStream, got {start:?}"));
     }
     obs.got_start_stream.store(true, Ordering::SeqCst);
 
-    let (session, mut receivers) =
-        QuicSession::start(conn, streams, TransportRoute::DirectUdp, SessionConfig::default())
-            .map_err(|e| e.to_string())?;
+    let (session, mut receivers) = QuicSession::start(
+        conn,
+        streams,
+        TransportRoute::DirectUdp,
+        SessionConfig::default(),
+    )
+    .map_err(|e| e.to_string())?;
     let session = Arc::new(session);
 
     // Observe inbound input — this is the host's injector hook.
@@ -199,6 +238,7 @@ async fn host_pairing(
     exporter: &[u8; 32],
     code: &str,
     client_name: &str,
+    ha: &mut HostAuthenticator,
 ) -> Result<(), String> {
     let mut ph = PairingHost::with_code(
         PairingCode::parse(code).map_err(|e| e.to_string())?,
@@ -207,81 +247,110 @@ async fn host_pairing(
     );
 
     let start = read_auth(streams).await?;
-    let response = ph.on_pair_start(&start, exporter, now_ms()).map_err(|e| e.to_string())?;
+    let response = ph
+        .on_pair_start(&start, exporter, now_ms())
+        .map_err(|e| e.to_string())?;
     write_auth(streams, &response).await?;
 
     let client_confirm = read_auth(streams).await?;
-    let host_confirm = ph.on_pair_confirm(&client_confirm, now_ms()).map_err(|e| e.to_string())?;
+    let host_confirm = ph
+        .on_pair_confirm(&client_confirm, now_ms())
+        .map_err(|e| e.to_string())?;
     write_auth(streams, &host_confirm).await?;
+    write_auth(streams, &serve_id.pair_complete()).await?;
 
-    // Client proves possession of its long-term key, bound to this session.
+    // The client now proves possession of its long-term key over the fresh
+    // ServerChallenge nonce, verified against the just-paired key.
     let client_auth = read_auth(streams).await?;
-    let AuthMsg::ClientAuth { client_ed25519_pub, sig } = &client_auth else {
+    let AuthMsg::ClientAuth {
+        client_ed25519_pub, ..
+    } = &client_auth
+    else {
         return Err(format!("expected ClientAuth, got {client_auth:?}"));
     };
-    let vk = parse_verifying_key(client_ed25519_pub).map_err(|e| e.to_string())?;
-    auth::verify_challenge(&vk, Role::Client, exporter, &PAIR_BIND_NONCE, sig)
-        .map_err(|e| format!("client key proof failed: {e}"))?;
-    // Record the now-trusted client (host-side of pairing).
-    let _peer = ph
+    let candidate = ph
         .accept_client(client_ed25519_pub, client_name, now_ms())
         .map_err(|e| e.to_string())?;
+    let mut provisional = TrustedPeers::new();
+    provisional.upsert(candidate).map_err(|e| e.to_string())?;
+    ha.on_client_auth(&client_auth, &provisional)
+        .map_err(|e| e.to_string())?;
 
-    write_auth(streams, &serve_id.pair_complete()).await?;
-    write_auth(streams, &AuthMsg::AuthOk).await?;
-    Ok(())
+    finish_host_auth(streams, serve_id, ha).await
 }
 
 async fn host_auth(
     streams: &mut SessionStreams,
     serve_id: &HostIdentity,
-    exporter: &[u8; 32],
     client: &TrustedPeer,
+    ha: &mut HostAuthenticator,
 ) -> Result<(), String> {
     let mut trusted = TrustedPeers::new();
     trusted.upsert(client.clone()).map_err(|e| e.to_string())?;
 
-    let (mut ha, challenge) = HostAuthenticator::start(exporter).map_err(|e| e.to_string())?;
-    write_auth(streams, &challenge).await?;
-
     let client_auth = read_auth(streams).await?;
-    ha.on_client_auth(&client_auth, &trusted).map_err(|e| e.to_string())?;
+    ha.on_client_auth(&client_auth, &trusted)
+        .map_err(|e| e.to_string())?;
 
+    finish_host_auth(streams, serve_id, ha).await
+}
+
+/// The mutual-auth tail shared by both host branches: read the client's
+/// challenge, answer it, and send `AuthOk`.
+async fn finish_host_auth(
+    streams: &mut SessionStreams,
+    serve_id: &HostIdentity,
+    ha: &mut HostAuthenticator,
+) -> Result<(), String> {
     let client_challenge = read_auth(streams).await?;
-    let (server_auth, ok) =
-        ha.on_client_challenge(&client_challenge, serve_id.signing_key()).map_err(|e| e.to_string())?;
+    let (server_auth, ok) = ha
+        .on_client_challenge(&client_challenge, serve_id.signing_key())
+        .map_err(|e| e.to_string())?;
     write_auth(streams, &server_auth).await?;
     write_auth(streams, &ok).await?;
     Ok(())
 }
 
 async fn read_auth(streams: &mut SessionStreams) -> Result<AuthMsg, String> {
-    quic::read_auth::<AuthMsg>(&mut streams.control.1).await.map_err(|e| e.to_string())
+    quic::read_auth::<AuthMsg>(&mut streams.control.1)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn write_auth(streams: &mut SessionStreams, msg: &AuthMsg) -> Result<(), String> {
-    quic::write_framed(&mut streams.control.0, msg).await.map_err(|e| e.to_string())
+    quic::write_framed(&mut streams.control.0, msg)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Feed the session with frames: real H.264 from the host pipeline if the
 /// capture stack is up, else synthetic Annex-B. Runs on its own OS thread since
 /// [`Session`] methods are synchronous.
-fn spawn_frame_producer(session: Arc<QuicSession>, stop: Arc<AtomicBool>, obs: Arc<HostObservations>) {
+fn spawn_frame_producer(
+    session: Arc<QuicSession>,
+    stop: Arc<AtomicBool>,
+    obs: Arc<HostObservations>,
+) {
     std::thread::spawn(move || {
         #[cfg(windows)]
         directdesk_host::capture::set_process_dpi_aware();
 
-        let real = directdesk_host::session::HostSession::start(directdesk_host::session::SessionConfig {
-            target_fps: 60,
-            bitrate_kbps: 8_000,
-            idle_repeat_ms: 16,
-            ..Default::default()
-        });
+        let real =
+            directdesk_host::session::HostSession::start(directdesk_host::session::SessionConfig {
+                target_fps: 60,
+                bitrate_kbps: 8_000,
+                idle_repeat_ms: 16,
+                ..Default::default()
+            });
 
         match real {
             Ok(host) => {
                 obs.real_frames.store(true, Ordering::SeqCst);
-                eprintln!("[host] frame source: REAL Media Foundation H.264 ({}x{})", host.dimensions().0, host.dimensions().1);
+                eprintln!(
+                    "[host] frame source: REAL Media Foundation H.264 ({}x{})",
+                    host.dimensions().0,
+                    host.dimensions().1
+                );
                 let frames = host.frames();
                 while !stop.load(Ordering::SeqCst) {
                     match frames.recv_timeout(Duration::from_millis(200)) {
@@ -328,14 +397,23 @@ fn synth_annexb(frame_id: u32, keyframe: bool, ts: u32) -> EncodedFrame {
         data.extend_from_slice(&[0, 0, 0, 1, 0x41]); // non-IDR NAL header
         data.extend(std::iter::repeat_n(0xCD, 1500));
     }
-    EncodedFrame { frame_id, keyframe, timestamp_ms: ts, data }
+    EncodedFrame {
+        frame_id,
+        keyframe,
+        timestamp_ms: ts,
+        data,
+    }
 }
 
 /// Spawn the client transport driver and hand back the UI-side channels.
 fn spawn_client(
     params: ConnectParams,
     store: Arc<dyn SecretStore>,
-) -> (ClientSession, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+) -> (
+    ClientSession,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
     let (session, transport) = ClientSession::new();
     let (sd_tx, sd_rx) = watch::channel(false);
     let task = tokio::spawn(run_client(transport, params, store, sd_rx));
@@ -369,6 +447,7 @@ fn latest_state(session: &ClientSession, sink: &mut Vec<ConnectionState>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pair_stream_and_input_end_to_end() {
+    let _capture = directdesk_host::testsupport::CaptureLock::acquire();
     let host_id = Arc::new(HostIdentity::generate("e2e-host").unwrap());
     let host = spawn_host(host_id.clone(), Some(CODE.to_string()), None, true);
     let addr = host.addr;
@@ -383,7 +462,10 @@ async fn pair_stream_and_input_end_to_end() {
     let mut connected = false;
     while Instant::now() < connect_deadline {
         latest_state(&client, &mut states);
-        if states.iter().any(|s| matches!(s, ConnectionState::Connected)) {
+        if states
+            .iter()
+            .any(|s| matches!(s, ConnectionState::Connected))
+        {
             connected = true;
             break;
         }
@@ -392,12 +474,23 @@ async fn pair_stream_and_input_end_to_end() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(connected, "client never reached Connected; states={states:?}");
+    assert!(
+        connected,
+        "client never reached Connected; states={states:?}"
+    );
     eprintln!("[test] PAIRING + AUTH OK — client Connected");
 
     // Inject an input event and confirm the host observes it.
-    let key = InputMsg::Event(InputEvent::Key { scan_code: 0x1E, extended: false, action: KeyAction::Down });
-    client.input_tx.send(key.clone()).await.expect("queue input");
+    let key = InputMsg::Event(InputEvent::Key {
+        scan_code: 0x1E,
+        extended: false,
+        action: KeyAction::Down,
+    });
+    client
+        .input_tx
+        .send(key.clone())
+        .await
+        .expect("queue input");
 
     // Count frames arriving over the client's video channel for 3 s.
     let mut frames = 0u64;
@@ -419,7 +512,15 @@ async fn pair_stream_and_input_end_to_end() {
     let input_deadline = Instant::now() + Duration::from_secs(2);
     let mut input_seen = false;
     while Instant::now() < input_deadline {
-        if host.obs.inputs.lock().unwrap().iter().any(|m| matches!(m, InputMsg::Event(InputEvent::Key { scan_code: 0x1E, .. }))) {
+        if host.obs.inputs.lock().unwrap().iter().any(|m| {
+            matches!(
+                m,
+                InputMsg::Event(InputEvent::Key {
+                    scan_code: 0x1E,
+                    ..
+                })
+            )
+        }) {
             input_seen = true;
             break;
         }
@@ -427,18 +528,34 @@ async fn pair_stream_and_input_end_to_end() {
     }
 
     let real = host.obs.real_frames.load(Ordering::SeqCst);
-    let head: Vec<u8> = first_keyframe.as_ref().map(|d| d.iter().take(8).copied().collect()).unwrap_or_default();
+    let head: Vec<u8> = first_keyframe
+        .as_ref()
+        .map(|d| d.iter().take(8).copied().collect())
+        .unwrap_or_default();
     let annexb = first_keyframe
         .as_ref()
         .map(|d| d.starts_with(&[0, 0, 0, 1]) || d.starts_with(&[0, 0, 1]))
         .unwrap_or(false);
 
     eprintln!("=== e2e loopback results ===");
-    eprintln!("frame source     : {}", if real { "REAL MF H.264" } else { "synthetic Annex-B" });
+    eprintln!(
+        "frame source     : {}",
+        if real {
+            "REAL MF H.264"
+        } else {
+            "synthetic Annex-B"
+        }
+    );
     eprintln!("frames in 3s     : {frames}");
     eprintln!("bytes received   : {bytes}");
-    eprintln!("first keyframe   : {} (head {head:02x?})", if annexb { "Annex-B" } else { "NOT Annex-B" });
-    eprintln!("host got StartStream: {}", host.obs.got_start_stream.load(Ordering::SeqCst));
+    eprintln!(
+        "first keyframe   : {} (head {head:02x?})",
+        if annexb { "Annex-B" } else { "NOT Annex-B" }
+    );
+    eprintln!(
+        "host got StartStream: {}",
+        host.obs.got_start_stream.load(Ordering::SeqCst)
+    );
     eprintln!("input observed   : {input_seen}");
 
     let _ = shutdown.send(true);
@@ -458,6 +575,7 @@ async fn pair_stream_and_input_end_to_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrong_pairing_code_fails_cleanly() {
+    let _capture = directdesk_host::testsupport::CaptureLock::acquire();
     let host_id = Arc::new(HostIdentity::generate("e2e-host-2").unwrap());
     let host = spawn_host(host_id.clone(), Some(CODE.to_string()), None, false);
     let addr = host.addr;
@@ -472,10 +590,15 @@ async fn wrong_pairing_code_fails_cleanly() {
     while Instant::now() < deadline {
         latest_state(&client, &mut states);
         assert!(
-            !states.iter().any(|s| matches!(s, ConnectionState::Connected)),
+            !states
+                .iter()
+                .any(|s| matches!(s, ConnectionState::Connected)),
             "wrong code must never reach Connected"
         );
-        if states.iter().any(|s| matches!(s, ConnectionState::Failed(_))) {
+        if states
+            .iter()
+            .any(|s| matches!(s, ConnectionState::Failed(_)))
+        {
             failed = true;
             break;
         }
@@ -487,7 +610,10 @@ async fn wrong_pairing_code_fails_cleanly() {
     client_task.abort();
     host.shutdown().await;
 
-    assert!(failed, "wrong pairing code should have surfaced a Failed state; states={states:?}");
+    assert!(
+        failed,
+        "wrong pairing code should have surfaced a Failed state; states={states:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +622,7 @@ async fn wrong_pairing_code_fails_cleanly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mismatched_spki_pin_is_rejected() {
+    let _capture = directdesk_host::testsupport::CaptureLock::acquire();
     // The client trusts host A (its pin), but the server on the wire is host B.
     let host_a = HostIdentity::generate("host-A").unwrap();
     let host_b = Arc::new(HostIdentity::generate("host-B-impostor").unwrap());
@@ -548,10 +675,15 @@ async fn mismatched_spki_pin_is_rejected() {
     while Instant::now() < deadline {
         latest_state(&client, &mut states);
         assert!(
-            !states.iter().any(|s| matches!(s, ConnectionState::Connected)),
+            !states
+                .iter()
+                .any(|s| matches!(s, ConnectionState::Connected)),
             "a pin mismatch must never reach Connected"
         );
-        if states.iter().any(|s| matches!(s, ConnectionState::Failed(_))) {
+        if states
+            .iter()
+            .any(|s| matches!(s, ConnectionState::Failed(_)))
+        {
             rejected = true;
             break;
         }
@@ -563,5 +695,8 @@ async fn mismatched_spki_pin_is_rejected() {
     client_task.abort();
     host.shutdown().await;
 
-    assert!(rejected, "mismatched SPKI pin must be rejected (Failed); states={states:?}");
+    assert!(
+        rejected,
+        "mismatched SPKI pin must be rejected (Failed); states={states:?}"
+    );
 }

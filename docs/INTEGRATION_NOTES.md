@@ -31,6 +31,30 @@ once the transport files are no longer held by active agents. Not user-facing.
 6. Minor: Null{Encoder,Decoder}/MockInjector lack `Debug`; `BitrateAdaptor` doesn't
    expose its `AdaptConfig` back.
 
+## Resolved
+
+- **Handshake reconciliation — DONE & PROVEN.** Client reworked to the host's
+  canonical protocol (read ServerChallenge first, sign fresh nonce_s in both
+  branches, no constant). Real cross-binary interop test
+  (`client/tests/interop.rs`) passes: pairing (147 frames), reconnect, wrong-code,
+  MITM-reject. No crypto changes needed.
+- **"50% datagram loss" — was a MEASUREMENT ARTIFACT, not real loss.** Instrumented
+  client reassembly stats show ~95-100% loopback delivery, zero assembly loss. The
+  232-vs-118 gap = host's session-lifetime frames_sent counter vs the client's 4s
+  window. Real fix delivered anyway: a true app-level loss estimator
+  (`session::video_loss` → `ConnStats.loss`) + 4 MiB UDP buffers for real
+  Wi-Fi/LTE. Shared now 255 tests.
+- **Reassembler out-of-order delivery — DONE.** Monotonic-delivery guard +
+  `frames_dropped_reorder` counter; matrix hostile row asserts on it.
+
+## Follow-up now assigned (host M5 agent)
+
+- Host's *reported* delivery ratio is misleading (frames_sent lifetime counter vs
+  client window) and `overrun_signal` reads a low carried-bitrate that could drive
+  the adaptor down unnecessarily. Fold into the M5 host adaptive-bitrate wiring:
+  fix the counter windowing + overrun source, wire `BitrateAdaptor` off the real
+  `ConnStats.loss`, honor `QualityChange`.
+
 ## Decisions made (Fable)
 
 - **Segment TCP media (M4 refinement).** `tcp.rs` currently sends one

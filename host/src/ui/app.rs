@@ -44,7 +44,15 @@ pub fn run(
         "DirectDesk Host",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(HostApp::new(cc, cfg, shared, rt, identity, store, start_hidden)))
+            Ok(Box::new(HostApp::new(
+                cc,
+                cfg,
+                shared,
+                rt,
+                identity,
+                store,
+                start_hidden,
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("the host window failed: {e}"))
@@ -110,7 +118,8 @@ impl HostApp {
         // `--minimized`.
         shared.set_ctx(cc.egui_ctx.clone());
         if start_hidden {
-            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         let mut app = Self {
@@ -168,7 +177,11 @@ impl HostApp {
         if !restart {
             self.shared.set_remote_access(false);
         }
-        self.note(if restart { "restarting listener" } else { "stopping listener" });
+        self.note(if restart {
+            "restarting listener"
+        } else {
+            "stopping listener"
+        });
     }
 
     /// Rebinding has to wait for the old endpoint to release the port.
@@ -237,7 +250,10 @@ impl HostApp {
 fn describe(ev: &NetEvent) -> String {
     match ev {
         NetEvent::Listening { bound, addresses } => {
-            format!("listening on {bound} ({} address(es) advertised)", addresses.len())
+            format!(
+                "listening on {bound} ({} address(es) advertised)",
+                addresses.len()
+            )
         }
         NetEvent::ListenFailed { detail } => format!("listen FAILED: {detail}"),
         NetEvent::Stopped => "listener stopped".into(),
@@ -246,7 +262,11 @@ fn describe(ev: &NetEvent) -> String {
         }
         NetEvent::PairingCleared => "pairing window closed".into(),
         NetEvent::Paired { name, fingerprint } => format!("paired with {name} ({fingerprint})"),
-        NetEvent::ClientConnected { name, fingerprint, peer } => {
+        NetEvent::ClientConnected {
+            name,
+            fingerprint,
+            peer,
+        } => {
             format!("{name} connected from {peer} ({fingerprint})")
         }
         NetEvent::ClientDisconnected { reason } => format!("client disconnected: {reason}"),
@@ -281,30 +301,32 @@ impl eframe::App for HostApp {
         let pairing = self.shared.pairing.snapshot(now_ms);
 
         egui::Frame::central_panel(root.style()).show(root, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.header(ui, &status);
-                ui.add_space(8.0);
-                self.identity_panel(ui, &status);
-                ui.add_space(8.0);
-                self.pairing_panel(ui, pairing.as_ref());
-                ui.add_space(8.0);
-                self.client_panel(ui, &status);
-                ui.add_space(8.0);
-                self.pipeline_panel(ui, &status);
-                ui.add_space(8.0);
-                self.stats_panel(ui, &status);
-                ui.add_space(8.0);
-                self.settings_panel(ui);
-                ui.add_space(8.0);
-                self.log_panel(ui);
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Hide to tray").clicked() {
-                        self.shared.hide_window();
-                    }
-                    ui.label("Closing this window hides it. Quit from the tray icon.");
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.header(ui, &status);
+                    ui.add_space(8.0);
+                    self.identity_panel(ui, &status);
+                    ui.add_space(8.0);
+                    self.pairing_panel(ui, pairing.as_ref());
+                    ui.add_space(8.0);
+                    self.client_panel(ui, &status);
+                    ui.add_space(8.0);
+                    self.pipeline_panel(ui, &status);
+                    ui.add_space(8.0);
+                    self.stats_panel(ui, &status);
+                    ui.add_space(8.0);
+                    self.settings_panel(ui);
+                    ui.add_space(8.0);
+                    self.log_panel(ui);
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Hide to tray").clicked() {
+                            self.shared.hide_window();
+                        }
+                        ui.label("Closing this window hides it. Quit from the tray icon.");
+                    });
                 });
-            });
         });
     }
 }
@@ -328,7 +350,11 @@ impl HostApp {
             ui.add_space(12.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 6.0, colour);
-            ui.label(egui::RichText::new(&view.status_line).color(colour).strong());
+            ui.label(
+                egui::RichText::new(&view.status_line)
+                    .color(colour)
+                    .strong(),
+            );
         });
         if !self.shared.remote_access() {
             ui.colored_label(
@@ -339,288 +365,329 @@ impl HostApp {
     }
 
     fn identity_panel(&mut self, ui: &mut egui::Ui, status: &StatusSnapshot) {
-        egui::CollapsingHeader::new("This host").default_open(true).show(ui, |ui| {
-            egui::Grid::new("identity").num_columns(2).spacing([16.0, 4.0]).striped(true).show(
-                ui,
-                |ui| {
-                    ui.strong("Name");
-                    ui.label(&status.host_name);
-                    ui.end_row();
+        egui::CollapsingHeader::new("This host")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("identity")
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Name");
+                        ui.label(&status.host_name);
+                        ui.end_row();
 
-                    ui.strong("Identity key");
-                    ui.monospace(&status.host_fingerprint);
-                    ui.end_row();
+                        ui.strong("Identity key");
+                        ui.monospace(&status.host_fingerprint);
+                        ui.end_row();
 
-                    ui.strong("TLS pin");
-                    ui.monospace(&status.tls_pin);
-                    ui.end_row();
+                        ui.strong("TLS pin");
+                        ui.monospace(&status.tls_pin);
+                        ui.end_row();
 
-                    ui.strong("Paired clients");
-                    ui.label(status.trusted_clients.to_string());
-                    ui.end_row();
+                        ui.strong("Paired clients");
+                        ui.label(status.trusted_clients.to_string());
+                        ui.end_row();
 
-                    ui.strong("Bound socket");
-                    match status.bound {
-                        Some(b) => ui.monospace(b.to_string()),
-                        None => ui.label("not listening"),
-                    };
-                    ui.end_row();
-                },
-            );
+                        ui.strong("Bound socket");
+                        match status.bound {
+                            Some(b) => ui.monospace(b.to_string()),
+                            None => ui.label("not listening"),
+                        };
+                        ui.end_row();
+                    });
 
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Reachable at (best effort — the client needs one of these):")
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Reachable at (best effort — the client needs one of these):",
+                    )
                     .small(),
-            );
-            if status.addresses.is_empty() {
-                ui.label("  — no addresses discovered —");
-            }
-            for addr in &status.addresses {
-                ui.horizontal(|ui| {
-                    ui.monospace(format!("  {addr}"));
-                    if ui.small_button("copy").clicked() {
-                        ui.ctx().copy_text(addr.to_string());
-                    }
-                });
-            }
-            if let Some(err) = &status.last_error {
-                ui.colored_label(egui::Color32::from_rgb(226, 106, 62), format!("Error: {err}"));
-            }
-        });
+                );
+                if status.addresses.is_empty() {
+                    ui.label("  — no addresses discovered —");
+                }
+                for addr in &status.addresses {
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("  {addr}"));
+                        if ui.small_button("copy").clicked() {
+                            ui.ctx().copy_text(addr.to_string());
+                        }
+                    });
+                }
+                if let Some(err) = &status.last_error {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(226, 106, 62),
+                        format!("Error: {err}"),
+                    );
+                }
+            });
     }
 
     fn pairing_panel(&mut self, ui: &mut egui::Ui, pairing: Option<&crate::net::PairingDisplay>) {
-        egui::CollapsingHeader::new("Pairing").default_open(true).show(ui, |ui| match pairing {
-            Some(p) => {
-                ui.label("Type this code on the client:");
-                ui.label(
-                    egui::RichText::new(&p.grouped)
-                        .monospace()
-                        .size(38.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(64, 148, 236)),
-                );
-                let total = directdesk_shared::crypto::pairing::PAIRING_TTL_MS as f32;
-                let fraction = (p.remaining_ms as f32 / total).clamp(0.0, 1.0);
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .text(format!("{} s left", p.remaining_ms / 1000)),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel pairing").clicked() {
-                        self.shared.send(NetCommand::CancelPairing);
-                    }
-                    ui.label("The code works once and expires on its own.");
-                });
-            }
-            None => {
-                ui.horizontal(|ui| {
-                    let enabled = self.net.is_some() && self.shared.remote_access();
-                    if ui
-                        .add_enabled(enabled, egui::Button::new("Pair new device"))
-                        .on_disabled_hover_text("Turn remote access on first")
-                        .clicked()
-                        && !self.shared.send(NetCommand::ArmPairing)
-                    {
-                        self.note("could not arm pairing: the listener is not running");
-                    }
-                    ui.label("Opens a 120-second window with a single-use 8-digit code.");
-                });
-            }
-        });
+        egui::CollapsingHeader::new("Pairing")
+            .default_open(true)
+            .show(ui, |ui| match pairing {
+                Some(p) => {
+                    ui.label("Type this code on the client:");
+                    ui.label(
+                        egui::RichText::new(&p.grouped)
+                            .monospace()
+                            .size(38.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(64, 148, 236)),
+                    );
+                    let total = directdesk_shared::crypto::pairing::PAIRING_TTL_MS as f32;
+                    let fraction = (p.remaining_ms as f32 / total).clamp(0.0, 1.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .text(format!("{} s left", p.remaining_ms / 1000)),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel pairing").clicked() {
+                            self.shared.send(NetCommand::CancelPairing);
+                        }
+                        ui.label("The code works once and expires on its own.");
+                    });
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        let enabled = self.net.is_some() && self.shared.remote_access();
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("Pair new device"))
+                            .on_disabled_hover_text("Turn remote access on first")
+                            .clicked()
+                            && !self.shared.send(NetCommand::ArmPairing)
+                        {
+                            self.note("could not arm pairing: the listener is not running");
+                        }
+                        ui.label("Opens a 120-second window with a single-use 8-digit code.");
+                    });
+                }
+            });
     }
 
     fn client_panel(&mut self, ui: &mut egui::Ui, status: &StatusSnapshot) {
-        egui::CollapsingHeader::new("Client").default_open(true).show(ui, |ui| match &status.client
-        {
-            Some(c) => {
-                egui::Grid::new("client").num_columns(2).spacing([16.0, 4.0]).striped(true).show(
-                    ui,
-                    |ui| {
-                        ui.strong("Name");
-                        ui.label(&c.name);
-                        ui.end_row();
-                        ui.strong("Identity key");
-                        ui.monospace(&c.fingerprint);
-                        ui.end_row();
-                        ui.strong("Route");
-                        ui.label(c.route.label());
-                        ui.end_row();
-                        ui.strong("Address");
-                        ui.monospace(c.peer.to_string());
-                        ui.end_row();
-                        ui.strong("Connected for");
-                        ui.label(format_duration(c.connected_at.elapsed()));
-                        ui.end_row();
-                    },
-                );
-                if ui.button("Disconnect client").clicked()
-                    && !self.shared.send(NetCommand::DisconnectClient)
-                {
-                    self.note("disconnect failed: the listener is not running");
+        egui::CollapsingHeader::new("Client")
+            .default_open(true)
+            .show(ui, |ui| match &status.client {
+                Some(c) => {
+                    egui::Grid::new("client")
+                        .num_columns(2)
+                        .spacing([16.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Name");
+                            ui.label(&c.name);
+                            ui.end_row();
+                            ui.strong("Identity key");
+                            ui.monospace(&c.fingerprint);
+                            ui.end_row();
+                            ui.strong("Route");
+                            ui.label(c.route.label());
+                            ui.end_row();
+                            ui.strong("Address");
+                            ui.monospace(c.peer.to_string());
+                            ui.end_row();
+                            ui.strong("Connected for");
+                            ui.label(format_duration(c.connected_at.elapsed()));
+                            ui.end_row();
+                        });
+                    if ui.button("Disconnect client").clicked()
+                        && !self.shared.send(NetCommand::DisconnectClient)
+                    {
+                        self.note("disconnect failed: the listener is not running");
+                    }
                 }
-            }
-            None => {
-                ui.label("Nobody is connected.");
-            }
-        });
+                None => {
+                    ui.label("Nobody is connected.");
+                }
+            });
     }
 
     fn pipeline_panel(&mut self, ui: &mut egui::Ui, status: &StatusSnapshot) {
-        egui::CollapsingHeader::new("Capture pipeline").default_open(true).show(ui, |ui| {
-            match &status.encoder {
-                Some(e) => {
-                    ui.monospace(e);
+        egui::CollapsingHeader::new("Capture pipeline")
+            .default_open(true)
+            .show(ui, |ui| {
+                match &status.encoder {
+                    Some(e) => {
+                        ui.monospace(e);
+                    }
+                    None => {
+                        ui.label("The pipeline starts when the first client connects.");
+                    }
                 }
-                None => {
-                    ui.label("The pipeline starts when the first client connects.");
+                if let Some((w, h)) = status.resolution {
+                    ui.label(format!("Capturing {w}×{h}"));
                 }
-            }
-            if let Some((w, h)) = status.resolution {
-                ui.label(format!("Capturing {w}×{h}"));
-            }
-            if let Some(state) = &status.pipeline_state {
-                ui.label(format!("State: {state}"));
-            }
-            if status.secure_desktop {
-                ui.colored_label(
-                    egui::Color32::from_rgb(226, 106, 62),
-                    "Secure desktop is up (UAC or lock screen) — capture is paused and all \
+                if let Some(state) = &status.pipeline_state {
+                    ui.label(format!("State: {state}"));
+                }
+                if status.secure_desktop {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(226, 106, 62),
+                        "Secure desktop is up (UAC or lock screen) — capture is paused and all \
                      client input has been released.",
-                );
-            }
-        });
+                    );
+                }
+            });
     }
 
     fn stats_panel(&mut self, ui: &mut egui::Ui, status: &StatusSnapshot) {
-        egui::CollapsingHeader::new("Live statistics").default_open(true).show(ui, |ui| {
-            if status.client.is_none() {
-                ui.label("No session — nothing to measure.");
-                return;
-            }
-            let t = &status.transport;
-            let p = &status.pipeline;
-            egui::Grid::new("stats").num_columns(4).spacing([18.0, 4.0]).striped(true).show(
-                ui,
-                |ui| {
-                    ui.strong("RTT");
-                    ui.monospace(format!("{:.1} ms", t.rtt_ms));
-                    ui.strong("Jitter");
-                    ui.monospace(format!("{:.1} ms", t.jitter_ms));
-                    ui.end_row();
+        egui::CollapsingHeader::new("Live statistics")
+            .default_open(true)
+            .show(ui, |ui| {
+                if status.client.is_none() {
+                    ui.label("No session — nothing to measure.");
+                    return;
+                }
+                let t = &status.transport;
+                let p = &status.pipeline;
+                egui::Grid::new("stats")
+                    .num_columns(4)
+                    .spacing([18.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("RTT");
+                        ui.monospace(format!("{:.1} ms", t.rtt_ms));
+                        ui.strong("Jitter");
+                        ui.monospace(format!("{:.1} ms", t.jitter_ms));
+                        ui.end_row();
 
-                    ui.strong("Loss");
-                    ui.monospace(format!("{:.2} %", t.loss * 100.0));
-                    ui.strong("Link");
-                    ui.monospace(format!("{} kbps", t.bandwidth_kbps));
-                    ui.end_row();
+                        ui.strong("Loss");
+                        ui.monospace(format!("{:.2} %", t.loss * 100.0));
+                        ui.strong("Link");
+                        ui.monospace(format!("{} kbps", t.bandwidth_kbps));
+                        ui.end_row();
 
-                    ui.strong("Capture");
-                    ui.monospace(format!("{:.1} fps", p.fps_capture));
-                    ui.strong("Encode");
-                    ui.monospace(format!("{:.1} fps", p.fps_encode));
-                    ui.end_row();
+                        ui.strong("Capture");
+                        ui.monospace(format!("{:.1} fps", p.fps_capture));
+                        ui.strong("Encode");
+                        ui.monospace(format!("{:.1} fps", p.fps_encode));
+                        ui.end_row();
 
-                    ui.strong("Encoder out");
-                    ui.monospace(format!("{} kbps", p.bitrate_kbps));
-                    ui.strong("Target");
-                    ui.monospace(format!("{} kbps", status.target_kbps));
-                    ui.end_row();
+                        ui.strong("Encoder out");
+                        ui.monospace(format!("{} kbps", p.bitrate_kbps));
+                        ui.strong("Target");
+                        ui.monospace(format!("{} kbps", status.target_kbps));
+                        ui.end_row();
 
-                    ui.strong("Frames sent");
-                    ui.monospace(status.frames_sent.to_string());
-                    ui.strong("Bytes sent");
-                    ui.monospace(format_bytes(status.bytes_sent));
-                    ui.end_row();
+                        ui.strong("Quality");
+                        ui.monospace(status.quality_mode.map_or("—", quality_label));
+                        ui.strong("Throughput");
+                        ui.monospace(format!("{} kbps (1s)", status.delivery.throughput_kbps()));
+                        ui.end_row();
 
-                    ui.strong("Skipped (stale)");
-                    ui.monospace(status.frames_coalesced.to_string());
-                    ui.strong("Pipeline");
-                    ui.monospace(format!("{:.2} ms/frame", p.pipeline_ms));
-                    ui.end_row();
-                },
-            );
-            ui.label(
+                        ui.strong("Delivered");
+                        ui.monospace(format!(
+                            "{:.0} % (1s)",
+                            status.delivery.delivery_ratio() * 100.0
+                        ));
+                        ui.strong("Backpressure");
+                        ui.monospace(format!(
+                            "{:.1} % (1s)",
+                            status.delivery.backpressure_ratio() * 100.0
+                        ));
+                        ui.end_row();
+
+                        ui.strong("Frames sent");
+                        ui.monospace(format!("{} (total)", status.frames_sent));
+                        ui.strong("Bytes sent");
+                        ui.monospace(format!("{} (total)", format_bytes(status.bytes_sent)));
+                        ui.end_row();
+
+                        ui.strong("Skipped (stale)");
+                        ui.monospace(status.frames_coalesced.to_string());
+                        ui.strong("Pipeline");
+                        ui.monospace(format!("{:.2} ms/frame", p.pipeline_ms));
+                        ui.end_row();
+                    });
+                ui.label(
                 egui::RichText::new(
                     "\"Skipped\" counts frames the encoder produced while the link was behind. \
                      The newest frame is always the one sent.",
                 )
                 .small(),
             );
-        });
+            });
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Settings").default_open(false).show(ui, |ui| {
-            ui.checkbox(&mut self.edit.remote_access, "Remote access enabled");
-            ui.horizontal(|ui| {
-                ui.label("UDP port");
-                ui.add(egui::DragValue::new(&mut self.edit.udp_port).range(1_024..=65_535));
-                ui.label("(changing this rebinds the listener)");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Quality mode");
-                egui::ComboBox::from_id_salt("quality")
-                    .selected_text(quality_label(self.edit.quality))
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            QualityMode::TextDesktop,
-                            QualityMode::Balanced,
-                            QualityMode::Motion,
-                            QualityMode::LowBandwidth,
-                        ] {
-                            ui.selectable_value(&mut self.edit.quality, mode, quality_label(mode));
-                        }
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Starting bitrate");
-                ui.add(
-                    egui::DragValue::new(&mut self.edit.bitrate_kbps)
-                        .range(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS)
-                        .suffix(" kbps"),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.edit.cap_enabled, "Cap bitrate at");
-                ui.add_enabled(
-                    self.edit.cap_enabled,
-                    egui::DragValue::new(&mut self.edit.cap_kbps)
-                        .range(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS)
-                        .suffix(" kbps"),
-                );
-                ui.label("(the adaptive controller never exceeds this)");
-            });
-            ui.checkbox(&mut self.edit.start_minimized, "Start hidden in the tray");
+        egui::CollapsingHeader::new("Settings")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.edit.remote_access, "Remote access enabled");
+                ui.horizontal(|ui| {
+                    ui.label("UDP port");
+                    ui.add(egui::DragValue::new(&mut self.edit.udp_port).range(1_024..=65_535));
+                    ui.label("(changing this rebinds the listener)");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Quality mode");
+                    egui::ComboBox::from_id_salt("quality")
+                        .selected_text(quality_label(self.edit.quality))
+                        .show_ui(ui, |ui| {
+                            for mode in [
+                                QualityMode::TextDesktop,
+                                QualityMode::Balanced,
+                                QualityMode::Motion,
+                                QualityMode::LowBandwidth,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.edit.quality,
+                                    mode,
+                                    quality_label(mode),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Starting bitrate");
+                    ui.add(
+                        egui::DragValue::new(&mut self.edit.bitrate_kbps)
+                            .range(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS)
+                            .suffix(" kbps"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.edit.cap_enabled, "Cap bitrate at");
+                    ui.add_enabled(
+                        self.edit.cap_enabled,
+                        egui::DragValue::new(&mut self.edit.cap_kbps)
+                            .range(MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS)
+                            .suffix(" kbps"),
+                    );
+                    ui.label("(the adaptive controller never exceeds this)");
+                });
+                ui.checkbox(&mut self.edit.start_minimized, "Start hidden in the tray");
 
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save and apply").clicked() {
-                    self.apply_settings();
-                }
-                if ui.button("Revert").clicked() {
-                    self.edit = Edit::from(&self.cfg);
-                }
-                if let Some(path) = crate::config::config_path() {
-                    ui.label(egui::RichText::new(path.display().to_string()).small());
-                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save and apply").clicked() {
+                        self.apply_settings();
+                    }
+                    if ui.button("Revert").clicked() {
+                        self.edit = Edit::from(&self.cfg);
+                    }
+                    if let Some(path) = crate::config::config_path() {
+                        ui.label(egui::RichText::new(path.display().to_string()).small());
+                    }
+                });
             });
-        });
     }
 
     fn log_panel(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new(format!("Activity ({})", self.log.len()))
             .default_open(false)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).show(
-                    ui,
-                    |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
                         for (at, line) in &self.log {
                             ui.monospace(format!("[{:>7}] {line}", format_duration(*at)));
                         }
-                    },
-                );
+                    });
             });
     }
 }
@@ -708,7 +775,10 @@ mod tests {
         assert_eq!(e.cap(), Some(4_000));
         assert!(e.start_minimized);
 
-        let uncapped = HostConfig { bitrate_cap_kbps: None, ..HostConfig::default() };
+        let uncapped = HostConfig {
+            bitrate_cap_kbps: None,
+            ..HostConfig::default()
+        };
         assert_eq!(Edit::from(&uncapped).cap(), None);
     }
 
@@ -721,7 +791,9 @@ mod tests {
         assert!(text.contains("10.0.0.9"));
         assert!(text.contains("REJECTED"));
 
-        let text = describe(&NetEvent::ListenFailed { detail: "address in use".into() });
+        let text = describe(&NetEvent::ListenFailed {
+            detail: "address in use".into(),
+        });
         assert!(text.contains("FAILED"), "{text}");
     }
 }

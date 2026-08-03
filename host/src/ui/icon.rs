@@ -16,11 +16,11 @@ impl TrayState {
     /// greyscale too: off is dark, listening is mid, connected is bright.
     fn accent(self) -> [u8; 3] {
         match self {
-            TrayState::Disabled => [110, 116, 124],  // grey: not serving
-            TrayState::Starting => [140, 160, 186],  // pale: on its way up
-            TrayState::Listening => [64, 148, 236],  // blue: ready
-            TrayState::Connected => [58, 196, 118],  // green: someone is here
-            TrayState::Problem => [226, 106, 62],    // orange: enabled, broken
+            TrayState::Disabled => [110, 116, 124], // grey: not serving
+            TrayState::Starting => [140, 160, 186], // pale: on its way up
+            TrayState::Listening => [64, 148, 236], // blue: ready
+            TrayState::Connected => [58, 196, 118], // green: someone is here
+            TrayState::Problem => [226, 106, 62],   // orange: enabled, broken
         }
     }
 }
@@ -134,7 +134,10 @@ mod tests {
         let centre = &connected[idx(15, 13)..idx(15, 13) + 3];
         assert_eq!(centre, TrayState::Connected.accent());
         let listening = rgba(TrayState::Listening);
-        assert_ne!(&listening[idx(15, 13)..idx(15, 13) + 3], TrayState::Listening.accent());
+        assert_ne!(
+            &listening[idx(15, 13)..idx(15, 13) + 3],
+            TrayState::Listening.accent()
+        );
     }
 
     #[test]

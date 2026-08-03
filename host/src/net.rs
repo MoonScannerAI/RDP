@@ -114,6 +114,16 @@ pub const AUTH_FAIL_WINDOW_MS: u64 = 60_000;
 pub const KEYFRAME_MIN_INTERVAL_MS: u64 = 500;
 /// Period of the host's `Stats` / `RouteReport` broadcast.
 pub const STATUS_INTERVAL_MS: u64 = 1_000;
+/// Status windows a stream must run before the encoder-vs-carried `overrun`
+/// diagnostic is trusted to move the adaptor. The first windows measure the
+/// encoder over a full interval while the transport has barely begun carrying
+/// the stream, so their ratio is a window artifact — not congestion. Gating on
+/// it is what stops the spurious start-up downshift.
+pub const OVERRUN_WARMUP_INTERVALS: u32 = 3;
+/// Frames that must actually have gone out in a window for that window's
+/// `overrun` ratio to mean anything. A window where we barely sent (idle, or a
+/// stream that just stopped) cannot report meaningful carried bitrate.
+pub const OVERRUN_MIN_FRAMES: u64 = 5;
 /// QUIC application close code used for a rejected connection.
 pub const CLOSE_CODE_REJECTED: u32 = 1;
 /// QUIC application close code used for a deliberate host-side disconnect.
@@ -163,14 +173,19 @@ pub struct PairingSlot {
 
 impl Default for PairingSlot {
     fn default() -> Self {
-        Self { inner: Mutex::new(None), clock: Instant::now() }
+        Self {
+            inner: Mutex::new(None),
+            clock: Instant::now(),
+        }
     }
 }
 
 impl std::fmt::Debug for PairingSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let armed = self.inner.lock().is_some();
-        f.debug_struct("PairingSlot").field("armed", &armed).finish()
+        f.debug_struct("PairingSlot")
+            .field("armed", &armed)
+            .finish()
     }
 }
 
@@ -197,7 +212,11 @@ impl PairingSlot {
             digits: code.expose().to_string(),
             remaining_ms: ttl_ms,
         };
-        *self.inner.lock() = Some(Armed { code, armed_ms: now_ms, ttl_ms });
+        *self.inner.lock() = Some(Armed {
+            code,
+            armed_ms: now_ms,
+            ttl_ms,
+        });
         display
     }
 
@@ -284,10 +303,11 @@ impl AuthThrottle {
     /// Record a failure. Returns `true` when this failure triggered a lockout.
     pub fn record_failure(&mut self, ip: IpAddr, now_ms: u64) -> bool {
         self.gc(now_ms);
-        let rec = self
-            .peers
-            .entry(ip)
-            .or_insert(FailRecord { failures: 0, last_fail_ms: now_ms, locked_until_ms: 0 });
+        let rec = self.peers.entry(ip).or_insert(FailRecord {
+            failures: 0,
+            last_fail_ms: now_ms,
+            locked_until_ms: 0,
+        });
         // A long-quiet address starts over rather than accumulating forever.
         if now_ms.saturating_sub(rec.last_fail_ms) > AUTH_FAIL_WINDOW_MS {
             rec.failures = 0;
@@ -334,7 +354,10 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(min_interval_ms: u64) -> Self {
-        Self { min_interval_ms, last_ms: None }
+        Self {
+            min_interval_ms,
+            last_ms: None,
+        }
     }
 
     /// Whether the action may run now; records the time when it may.
@@ -390,6 +413,96 @@ pub fn overrun_signal(encoder_kbps: u32, carried_kbps: u32) -> f32 {
     ((produced - carried) / produced).clamp(0.0, 1.0)
 }
 
+/// Host-side delivery over a **single matched status window**.
+///
+/// Every field is a delta measured across the *same* interval — never a
+/// lifetime total. The old diagnostic compared a session-lifetime send count
+/// against a one-second client report, so a link that had been up for a minute
+/// looked ~50% "lossy" the instant the client's window began. Deltas over one
+/// shared window cannot drift like that.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WindowDelivery {
+    /// Frames actually put on the wire this window.
+    pub sent: u64,
+    /// Frames offered to the link this window: sent plus those the link had no
+    /// room for. Frames merely coalesced (a newer one superseded them) are not
+    /// offered and so are not counted here.
+    pub offered: u64,
+    /// Bytes put on the wire this window.
+    pub bytes: u64,
+    /// Length of the window, milliseconds.
+    pub dt_ms: u64,
+}
+
+impl WindowDelivery {
+    /// Fraction of offered frames that actually reached the wire, `0.0..=1.0`.
+    /// An idle window (`offered == 0`) delivered everything it was asked to, so
+    /// it reads `1.0` rather than dividing by zero into a false shortfall.
+    pub fn delivery_ratio(&self) -> f32 {
+        if self.offered == 0 {
+            1.0
+        } else {
+            (self.sent as f32 / self.offered as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Fraction of offered frames the link had no room for, `0.0..=1.0`. This is
+    /// congestion quinn's packet-loss counter cannot see (the frame was never
+    /// sent) and the receiver's reassembler cannot see either (nothing to
+    /// reassemble), so it is a genuine, matched-window congestion signal.
+    pub fn backpressure_ratio(&self) -> f32 {
+        if self.offered == 0 {
+            0.0
+        } else {
+            (self.offered.saturating_sub(self.sent) as f32 / self.offered as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Throughput actually carried this window, kbps. Bytes over the real
+    /// elapsed window, not a nominal tick length.
+    pub fn throughput_kbps(&self) -> u32 {
+        if self.dt_ms == 0 {
+            0
+        } else {
+            ((self.bytes as f64 * 8.0) / self.dt_ms as f64).min(u32::MAX as f64) as u32
+        }
+    }
+}
+
+/// The single congestion number the [`BitrateAdaptor`] observes for one window.
+///
+/// `loss` is the transport's real, matched-window application-level loss — the
+/// [`ConnStats::loss`] that already folds in the receiver's silent-datagram
+/// accounting *and* quinn's packet loss upstream. `backpressure` is host frames
+/// the link had no room for this window. `overrun` is the encoder-vs-carried
+/// *diagnostic*, and is only folded in once `warm`: before warm-up its two
+/// inputs are measured over mismatched, half-empty windows and their ratio is
+/// meaningless, so feeding it to the adaptor is exactly the spurious-downshift
+/// bug. The adaptor is therefore *driven by the real loss*, with the diagnostic
+/// gated out until it can be trusted.
+pub fn congestion_signal(loss: f32, backpressure: f32, overrun: f32, warm: bool) -> f32 {
+    let overrun = if warm { overrun } else { 0.0 };
+    loss.max(backpressure).max(overrun).clamp(0.0, 1.0)
+}
+
+/// Combine the host's standing cap with a client's `BitrateLimit`. A client can
+/// only narrow the cap, never widen it.
+pub fn effective_cap(host_cap: Option<u32>, client_limit: Option<u32>) -> Option<u32> {
+    match (host_cap, client_limit) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// Clamp a bitrate target to a hard cap, if one is set.
+pub fn clamp_to_cap(kbps: u32, cap: Option<u32>) -> u32 {
+    match cap {
+        Some(c) => kbps.min(c),
+        None => kbps,
+    }
+}
+
 /// Latest-wins: keep the newest frame the encoder has produced and report how
 /// many older ones were skipped.
 ///
@@ -397,10 +510,7 @@ pub fn overrun_signal(encoder_kbps: u32, carried_kbps: u32) -> f32 {
 /// empty and nothing is dropped. If we are behind — a slow link, a big IDR
 /// still being fragmented — every queued frame except the last is already
 /// stale, and sending it would only delay the one the user actually wants.
-pub fn coalesce_latest(
-    first: EncodedFrame,
-    rx: &CbReceiver<EncodedFrame>,
-) -> (EncodedFrame, u32) {
+pub fn coalesce_latest(first: EncodedFrame, rx: &CbReceiver<EncodedFrame>) -> (EncodedFrame, u32) {
     let mut newest = first;
     let mut dropped = 0u32;
     while let Ok(next) = rx.try_recv() {
@@ -489,6 +599,11 @@ pub struct StatusSnapshot {
     pub secure_desktop: bool,
     /// Bitrate the adaptive controller currently asks the encoder for.
     pub target_kbps: u32,
+    /// Quality mode in force for the live session. `None` when idle.
+    pub quality_mode: Option<QualityMode>,
+    /// Delivery/throughput over the most recent matched status window. Honest
+    /// per-window figures, distinct from the lifetime counters below.
+    pub delivery: WindowDelivery,
     /// Frames skipped by the latest-wins policy since the session started.
     pub frames_coalesced: u64,
     /// Frames skipped because the connection had no room for a whole one.
@@ -505,17 +620,42 @@ pub struct StatusSnapshot {
 /// Notable things the listener did. The UI keeps a short log of these.
 #[derive(Debug, Clone)]
 pub enum NetEvent {
-    Listening { bound: SocketAddr, addresses: Vec<SocketAddr> },
-    ListenFailed { detail: String },
+    Listening {
+        bound: SocketAddr,
+        addresses: Vec<SocketAddr>,
+    },
+    ListenFailed {
+        detail: String,
+    },
     Stopped,
-    PairingArmed { grouped: String, ttl_ms: u64 },
+    PairingArmed {
+        grouped: String,
+        ttl_ms: u64,
+    },
     PairingCleared,
-    Paired { name: String, fingerprint: String },
-    ClientConnected { name: String, fingerprint: String, peer: SocketAddr },
-    ClientDisconnected { reason: String },
-    AuthRejected { peer: IpAddr, detail: String },
-    LockedOut { peer: IpAddr, for_ms: u64 },
-    Warning { detail: String },
+    Paired {
+        name: String,
+        fingerprint: String,
+    },
+    ClientConnected {
+        name: String,
+        fingerprint: String,
+        peer: SocketAddr,
+    },
+    ClientDisconnected {
+        reason: String,
+    },
+    AuthRejected {
+        peer: IpAddr,
+        detail: String,
+    },
+    LockedOut {
+        peer: IpAddr,
+        for_ms: u64,
+    },
+    Warning {
+        detail: String,
+    },
 }
 
 /// What the UI (or the tray) can ask the listener to do.
@@ -655,7 +795,10 @@ impl Inner {
     async fn ensure_pipeline(&self) -> Result<Arc<HostSession>> {
         let mut guard = self.pipeline.lock().await;
         if let Some(existing) = guard.as_ref() {
-            if !matches!(existing.state(), SessionState::Failed(_) | SessionState::Stopped) {
+            if !matches!(
+                existing.state(),
+                SessionState::Failed(_) | SessionState::Stopped
+            ) {
                 return Ok(existing.clone());
             }
             tracing::warn!("media pipeline is dead; restarting it");
@@ -754,25 +897,31 @@ impl NetService {
             stopped_task.store(true, Ordering::SeqCst);
         });
 
-        NetHandle { cmd: cmd_tx, events: ev_rx, status, pairing, stopped }
+        NetHandle {
+            cmd: cmd_tx,
+            events: ev_rx,
+            status,
+            pairing,
+            stopped,
+        }
     }
 }
 
 async fn accept_loop(inner: Arc<Inner>, mut cmds: mpsc::UnboundedReceiver<NetCommand>) {
-    let endpoint = match quic::server_endpoint(inner.cfg.bind, inner.identity.tls(), &inner.cfg.quic)
-    {
-        Ok(e) => e,
-        Err(e) => {
-            let detail = e.to_string();
-            tracing::error!("listener bind failed: {detail}");
-            inner.status_mut(|s| {
-                s.listening = false;
-                s.last_error = Some(detail.clone());
-            });
-            inner.emit(NetEvent::ListenFailed { detail });
-            return;
-        }
-    };
+    let endpoint =
+        match quic::server_endpoint(inner.cfg.bind, inner.identity.tls(), &inner.cfg.quic) {
+            Ok(e) => e,
+            Err(e) => {
+                let detail = e.to_string();
+                tracing::error!("listener bind failed: {detail}");
+                inner.status_mut(|s| {
+                    s.listening = false;
+                    s.last_error = Some(detail.clone());
+                });
+                inner.emit(NetEvent::ListenFailed { detail });
+                return;
+            }
+        };
 
     let bound = endpoint.local_addr().unwrap_or(inner.cfg.bind);
     let addresses = advertised_addresses(bound.port());
@@ -782,7 +931,10 @@ async fn accept_loop(inner: Arc<Inner>, mut cmds: mpsc::UnboundedReceiver<NetCom
         s.addresses = addresses.clone();
         s.last_error = None;
     });
-    tracing::info!("listening on {bound} (advertising {} address(es))", addresses.len());
+    tracing::info!(
+        "listening on {bound} (advertising {} address(es))",
+        addresses.len()
+    );
     inner.emit(NetEvent::Listening { bound, addresses });
 
     loop {
@@ -916,24 +1068,39 @@ async fn handle_connection(inner: Arc<Inner>, incoming: quinn::Incoming) -> Resu
     let (streams, client) = match handshake {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            let locked = inner.throttle.lock().record_failure(peer.ip(), inner.now_ms());
+            let locked = inner
+                .throttle
+                .lock()
+                .record_failure(peer.ip(), inner.now_ms());
             tracing::warn!(peer = %peer, "authentication failed: {e}");
-            inner.emit(NetEvent::AuthRejected { peer: peer.ip(), detail: e.to_string() });
+            inner.emit(NetEvent::AuthRejected {
+                peer: peer.ip(),
+                detail: e.to_string(),
+            });
             if locked {
-                inner.emit(NetEvent::LockedOut { peer: peer.ip(), for_ms: AUTH_LOCKOUT_MS });
+                inner.emit(NetEvent::LockedOut {
+                    peer: peer.ip(),
+                    for_ms: AUTH_LOCKOUT_MS,
+                });
             }
             conn.close(CLOSE_CODE_REJECTED.into(), b"authentication failed");
             return Err(e);
         }
         Err(_) => {
-            let locked = inner.throttle.lock().record_failure(peer.ip(), inner.now_ms());
+            let locked = inner
+                .throttle
+                .lock()
+                .record_failure(peer.ip(), inner.now_ms());
             tracing::warn!(peer = %peer, "authentication timed out");
             inner.emit(NetEvent::AuthRejected {
                 peer: peer.ip(),
                 detail: "handshake timed out".into(),
             });
             if locked {
-                inner.emit(NetEvent::LockedOut { peer: peer.ip(), for_ms: AUTH_LOCKOUT_MS });
+                inner.emit(NetEvent::LockedOut {
+                    peer: peer.ip(),
+                    for_ms: AUTH_LOCKOUT_MS,
+                });
             }
             conn.close(CLOSE_CODE_REJECTED.into(), b"handshake timeout");
             return Err(Error::Auth("handshake timed out".into()));
@@ -982,7 +1149,9 @@ async fn reject_busy(conn: &Connection) {
         quic::write_framed(&mut streams.control.0, &host_hello()).await?;
         quic::write_framed(
             &mut streams.control.0,
-            &AuthMsg::AuthFail { reason: "host busy: another client is connected".into() },
+            &AuthMsg::AuthFail {
+                reason: "host busy: another client is connected".into(),
+            },
         )
         .await?;
         Ok::<(), Error>(())
@@ -1013,7 +1182,9 @@ async fn authenticate(
 
     let first: AuthMsg = quic::read_auth(&mut streams.control.1).await?;
     let outcome = match &first {
-        AuthMsg::ClientAuth { client_ed25519_pub, .. } => {
+        AuthMsg::ClientAuth {
+            client_ed25519_pub, ..
+        } => {
             let attempted = fingerprint_short(client_ed25519_pub);
             let trusted = inner.trusted.lock().clone();
             match authenticator.on_client_auth(&first, &trusted) {
@@ -1024,11 +1195,16 @@ async fn authenticate(
                 }
             }
         }
-        AuthMsg::PairStart { .. } => {
-            pair(inner, &mut streams, &mut authenticator, &exporter, &first, &hello)
-                .await
-                .map(|peer| (peer, true))
-        }
+        AuthMsg::PairStart { .. } => pair(
+            inner,
+            &mut streams,
+            &mut authenticator,
+            &exporter,
+            &first,
+            &hello,
+        )
+        .await
+        .map(|peer| (peer, true)),
         other => Err(Error::Auth(format!(
             "expected ClientAuth or PairStart, got {}",
             variant_name(other)
@@ -1040,7 +1216,9 @@ async fn authenticate(
         Err(e) => {
             let _ = quic::write_framed(
                 &mut streams.control.0,
-                &AuthMsg::AuthFail { reason: "authentication rejected".into() },
+                &AuthMsg::AuthFail {
+                    reason: "authentication rejected".into(),
+                },
             )
             .await;
             return Err(e);
@@ -1055,7 +1233,9 @@ async fn authenticate(
             Err(e) => {
                 let _ = quic::write_framed(
                     &mut streams.control.0,
-                    &AuthMsg::AuthFail { reason: "authentication rejected".into() },
+                    &AuthMsg::AuthFail {
+                        reason: "authentication rejected".into(),
+                    },
                 )
                 .await;
                 return Err(e);
@@ -1083,7 +1263,9 @@ async fn pair(
     hello: &Hello,
 ) -> Result<TrustedPeer> {
     let Some(armed) = inner.pairing.take(inner.now_ms()) else {
-        return Err(Error::Pairing("no pairing window is open on the host".into()));
+        return Err(Error::Pairing(
+            "no pairing window is open on the host".into(),
+        ));
     };
     // Whatever happens now, the code is burned: `take` removed it.
     inner.emit(NetEvent::PairingCleared);
@@ -1102,11 +1284,14 @@ async fn pair(
     // the machine that typed it — signed over the challenge nonce this
     // connection already issued, so it cannot be replayed from elsewhere.
     let client_auth: AuthMsg = quic::read_auth(&mut streams.control.1).await?;
-    let AuthMsg::ClientAuth { client_ed25519_pub, .. } = &client_auth else {
+    let AuthMsg::ClientAuth {
+        client_ed25519_pub, ..
+    } = &client_auth
+    else {
         return Err(Error::Auth("expected ClientAuth after PairComplete".into()));
     };
-    let name = crate::config::sanitize_name(&hello.agent)
-        .unwrap_or_else(|| "paired client".to_string());
+    let name =
+        crate::config::sanitize_name(&hello.agent).unwrap_or_else(|| "paired client".to_string());
     let candidate = host.accept_client(client_ed25519_pub, &name, wall_clock_ms())?;
 
     let mut provisional = TrustedPeers::new();
@@ -1236,7 +1421,11 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
             adaptor,
             counters.clone(),
         )),
-        tokio::spawn(event_loop(inner.clone(), receivers.events, pipeline.clone())),
+        tokio::spawn(event_loop(
+            inner.clone(),
+            receivers.events,
+            pipeline.clone(),
+        )),
     ];
 
     let reason = conn.closed().await.to_string();
@@ -1259,6 +1448,8 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
         s.frames_coalesced = counters.coalesced.load(Ordering::Relaxed);
         s.frames_backpressured = counters.backpressured.load(Ordering::Relaxed);
         s.transport = ConnStats::default();
+        s.delivery = WindowDelivery::default();
+        s.quality_mode = None;
     });
     reason
 }
@@ -1289,7 +1480,9 @@ fn video_pump(
 
         let (frame, dropped) = coalesce_latest(frame, &frames);
         if dropped > 0 {
-            counters.coalesced.fetch_add(dropped as u64, Ordering::Relaxed);
+            counters
+                .coalesced
+                .fetch_add(dropped as u64, Ordering::Relaxed);
             // Skipping a P-frame breaks the client's reference chain. Ask for
             // an IDR, but not more than twice a second or a congested link
             // turns into a keyframe storm.
@@ -1389,7 +1582,12 @@ async fn control_loop(
     while let Some(msg) = rx.recv().await {
         let now = inner.now_ms();
         match msg {
-            ControlMsg::StartStream { max_width, max_height, preferred_fps, quality_mode } => {
+            ControlMsg::StartStream {
+                max_width,
+                max_height,
+                preferred_fps,
+                quality_mode,
+            } => {
                 let (w, h) = pipeline.dimensions();
                 tracing::info!(
                     "stream requested: client canvas {max_width}x{max_height} @ {preferred_fps} \
@@ -1436,18 +1634,16 @@ async fn control_loop(
             ControlMsg::BitrateLimit { max_kbps } => {
                 tracing::info!("client asked for a bitrate limit of {max_kbps:?} kbps");
                 // The client's request narrows, never widens, the host's cap.
-                let host_cap = *inner.bitrate_cap.lock();
-                let effective = match (host_cap, max_kbps) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, b) => b,
-                };
+                let effective = effective_cap(*inner.bitrate_cap.lock(), max_kbps);
                 *inner.bitrate_cap.lock() = effective;
                 apply_bitrate(&inner, &pipeline, adaptor.lock().current());
             }
             ControlMsg::ClipboardText(text) => {
                 // Clipboard is a later milestone. Say so rather than pretending.
-                tracing::info!("ignoring {} bytes of clipboard text (not implemented)", text.len());
+                tracing::info!(
+                    "ignoring {} bytes of clipboard text (not implemented)",
+                    text.len()
+                );
             }
             ControlMsg::Stats(peer) => {
                 inner.status_mut(|s| {
@@ -1461,10 +1657,10 @@ async fn control_loop(
 }
 
 fn apply_bitrate(inner: &Arc<Inner>, pipeline: &Arc<HostSession>, kbps: u32) {
-    let capped = match *inner.bitrate_cap.lock() {
-        Some(cap) => kbps.min(cap),
-        None => kbps,
-    };
+    // A `BitrateLimit`/host cap is a hard ceiling on what the encoder is ever
+    // asked for, applied on top of whatever the adaptor picked within its mode
+    // range. The encoder never sees a value above the cap.
+    let capped = clamp_to_cap(kbps, *inner.bitrate_cap.lock());
     pipeline.set_bitrate(capped);
     inner.status_mut(|s| s.target_kbps = capped);
 }
@@ -1481,7 +1677,10 @@ async fn status_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_paused: Option<bool> = None;
     let mut prev_sent = 0u64;
+    let mut prev_bytes = 0u64;
     let mut prev_backpressured = 0u64;
+    let mut prev_now = inner.now_ms();
+    let mut intervals = 0u32;
 
     loop {
         ticker.tick().await;
@@ -1511,41 +1710,65 @@ async fn status_loop(
             pipeline_ms: media.pipeline_ms,
         };
 
-        // Frames the connection had no room for are congestion the packet-level
-        // loss counter cannot see: quinn accepted every datagram we offered and
-        // then dropped some of them itself. Feeding that back is what stops the
-        // encoder from cheerfully producing a bitrate the link never carries.
+        // Everything below is a delta over THIS window (a matched sliding
+        // window, never a lifetime total), measured against the real elapsed
+        // time so the throughput figure is honest even if a tick was skipped.
         let sent = counters.frames_sent.load(Ordering::Relaxed);
+        let bytes = counters.bytes_sent.load(Ordering::Relaxed);
         let backpressured = counters.backpressured.load(Ordering::Relaxed);
-        let offered = (sent - prev_sent) + (backpressured - prev_backpressured);
-        let pressure = if offered == 0 {
-            0.0
-        } else {
-            (backpressured - prev_backpressured) as f32 / offered as f32
+        let win_sent = sent.saturating_sub(prev_sent);
+        let win_backpressured = backpressured.saturating_sub(prev_backpressured);
+        let delivery = WindowDelivery {
+            sent: win_sent,
+            offered: win_sent + win_backpressured,
+            bytes: bytes.saturating_sub(prev_bytes),
+            dt_ms: now.saturating_sub(prev_now),
         };
         prev_sent = sent;
+        prev_bytes = bytes;
         prev_backpressured = backpressured;
+        prev_now = now;
+        intervals = intervals.saturating_add(1);
 
+        // Backpressure is congestion the packet-level loss counter cannot see:
+        // quinn accepted every datagram we offered and then dropped some itself.
+        // It is a matched-window ratio, so it does not skew like the old
+        // lifetime comparison did.
+        let pressure = delivery.backpressure_ratio();
+
+        // The encoder-vs-carried "overrun" is only a trustworthy congestion
+        // signal once the stream has run a few windows AND actually sent a
+        // meaningful number of frames this window. Before that (start-up, or a
+        // window where the stream just stopped) the encoder bitrate is measured
+        // over a full interval while the link carried almost nothing, and their
+        // ratio is a window artifact that would drive the adaptor down for no
+        // reason. Gate it; the adaptor is driven by the real ConnStats.loss.
+        let warm = intervals > OVERRUN_WARMUP_INTERVALS && win_sent >= OVERRUN_MIN_FRAMES;
         let overrun = overrun_signal(media.bitrate_kbps, transport.bandwidth_kbps);
-        let congestion = transport.loss.max(pressure).max(overrun);
+        let congestion = congestion_signal(transport.loss, pressure, overrun, warm);
         if let Some(next) = adaptor.lock().observe(now, congestion, transport.rtt_ms) {
             tracing::info!(
                 "adaptive bitrate → {next} kbps (loss {:.1}%, send pressure {:.1}%, \
-                 overrun {:.1}%: encoder {} kbps vs link {} kbps)",
+                 overrun {:.1}%{}: encoder {} kbps vs link {} kbps)",
                 transport.loss * 100.0,
                 pressure * 100.0,
                 overrun * 100.0,
+                if warm { "" } else { " [gated]" },
                 media.bitrate_kbps,
                 transport.bandwidth_kbps
             );
             apply_bitrate(&inner, &pipeline, next);
         }
+        let quality_mode = *inner.quality.lock();
 
         let _ = session.send_control(ControlMsg::Stats(merged));
         let _ = session.send_control(ControlMsg::RouteReport(HOST_ROUTE));
         if last_paused != Some(paused) {
             last_paused = Some(paused);
-            tracing::info!("secure desktop {}", if paused { "active" } else { "cleared" });
+            tracing::info!(
+                "secure desktop {}",
+                if paused { "active" } else { "cleared" }
+            );
             let _ = session.send_control(ControlMsg::SecureDesktopActive(paused));
             if !paused {
                 // The desktop we came back to may look nothing like the one we
@@ -1559,8 +1782,10 @@ async fn status_loop(
             s.pipeline = merged;
             s.pipeline_state = Some(format!("{state:?}"));
             s.secure_desktop = paused;
-            s.frames_sent = counters.frames_sent.load(Ordering::Relaxed);
-            s.bytes_sent = counters.bytes_sent.load(Ordering::Relaxed);
+            s.quality_mode = Some(quality_mode);
+            s.delivery = delivery;
+            s.frames_sent = sent;
+            s.bytes_sent = bytes;
             s.frames_coalesced = counters.coalesced.load(Ordering::Relaxed);
             s.frames_backpressured = backpressured;
             s.input_injected = pipeline.input_events_injected();
@@ -1644,7 +1869,10 @@ mod tests {
         slot.arm_with(PairingCode::parse("87654321").unwrap(), 0, 120_000);
         let first = slot.take(10).expect("first use");
         assert_eq!(first.code.expose(), "87654321");
-        assert!(slot.take(20).is_none(), "a second PairStart must find nothing");
+        assert!(
+            slot.take(20).is_none(),
+            "a second PairStart must find nothing"
+        );
         assert!(!slot.is_armed(20));
     }
 
@@ -1693,7 +1921,10 @@ mod tests {
         assert!(t.locked_for_ms(&ip(1), 0).is_none());
         assert!(!t.record_failure(ip(1), 0));
         assert!(!t.record_failure(ip(1), 100));
-        assert!(t.locked_for_ms(&ip(1), 100).is_none(), "two strikes is not a lockout");
+        assert!(
+            t.locked_for_ms(&ip(1), 100).is_none(),
+            "two strikes is not a lockout"
+        );
         assert!(t.record_failure(ip(1), 200));
         assert_eq!(t.locked_for_ms(&ip(1), 200), Some(AUTH_LOCKOUT_MS));
     }
@@ -1736,7 +1967,10 @@ mod tests {
         t.record_failure(ip(6), 1);
         t.record_success(&ip(6));
         assert_eq!(t.tracked(), 0);
-        assert!(!t.record_failure(ip(6), 2), "counting restarts after a success");
+        assert!(
+            !t.record_failure(ip(6), 2),
+            "counting restarts after a success"
+        );
     }
 
     #[test]
@@ -1774,7 +2008,12 @@ mod tests {
     // -- drop policy -------------------------------------------------------
 
     fn frame(id: u32, keyframe: bool) -> EncodedFrame {
-        EncodedFrame { frame_id: id, keyframe, timestamp_ms: id, data: vec![0xAB; 32] }
+        EncodedFrame {
+            frame_id: id,
+            keyframe,
+            timestamp_ms: id,
+            data: vec![0xAB; 32],
+        }
     }
 
     #[test]
@@ -1792,7 +2031,10 @@ mod tests {
             tx.send(frame(id, false)).unwrap();
         }
         let (kept, dropped) = coalesce_latest(frame(1, true), &rx);
-        assert_eq!(kept.frame_id, 6, "the newest frame is the one that survives");
+        assert_eq!(
+            kept.frame_id, 6,
+            "the newest frame is the one that survives"
+        );
         assert_eq!(dropped, 5, "one taken plus four queued were skipped");
         assert!(rx.is_empty());
     }
@@ -1800,7 +2042,11 @@ mod tests {
     #[test]
     fn overrun_is_silent_when_the_link_keeps_up() {
         assert_eq!(overrun_signal(8_000, 8_000), 0.0);
-        assert_eq!(overrun_signal(8_000, 9_000), 0.0, "headroom is not congestion");
+        assert_eq!(
+            overrun_signal(8_000, 9_000),
+            0.0,
+            "headroom is not congestion"
+        );
         assert_eq!(overrun_signal(8_000, 7_500), 0.0, "within the 15% slack");
     }
 
@@ -1816,7 +2062,11 @@ mod tests {
     #[test]
     fn overrun_needs_both_numbers_to_mean_anything() {
         assert_eq!(overrun_signal(0, 5_000), 0.0);
-        assert_eq!(overrun_signal(5_000, 0), 0.0, "an unmeasured link is not a congested one");
+        assert_eq!(
+            overrun_signal(5_000, 0),
+            0.0,
+            "an unmeasured link is not a congested one"
+        );
     }
 
     #[test]
@@ -1834,7 +2084,9 @@ mod tests {
         let start = a.current();
         assert_eq!(a.observe(0, 0.0, 1.0), None, "establish a baseline");
         let signal = overrun_signal(13_000, 7_313);
-        let next = a.observe(1_500, signal, 1.0).expect("an overrun must lower the bitrate");
+        let next = a
+            .observe(1_500, signal, 1.0)
+            .expect("an overrun must lower the bitrate");
         assert!(next < start, "{next} should be below {start}");
     }
 
@@ -1848,8 +2100,11 @@ mod tests {
                 timestamp_ms: 0,
                 data: vec![0u8; len],
             };
-            let actual: usize =
-                fragment_frame(&f, mtu).unwrap().iter().map(|d| d.len()).sum();
+            let actual: usize = fragment_frame(&f, mtu)
+                .unwrap()
+                .iter()
+                .map(|d| d.len())
+                .sum();
             assert_eq!(wire_size(&f, mtu), actual, "len {len}");
         }
     }
@@ -1865,7 +2120,10 @@ mod tests {
             data: vec![0u8; 50_000],
         };
         assert!(wire_size(&f, 1_200) > f.data.len());
-        assert!(wire_size(&f, 1_200) > wire_size(&f, 1_400), "smaller MTU means more headers");
+        assert!(
+            wire_size(&f, 1_200) > wire_size(&f, 1_400),
+            "smaller MTU means more headers"
+        );
     }
 
     #[test]
@@ -1873,7 +2131,10 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<EncodedFrame>();
         tx.send(frame(2, false)).unwrap();
         let (_, dropped) = coalesce_latest(frame(1, false), &rx);
-        assert!(dropped > 0, "any drop must be visible so a keyframe can be requested");
+        assert!(
+            dropped > 0,
+            "any drop must be visible so a keyframe can be requested"
+        );
     }
 
     // -- addresses ---------------------------------------------------------
@@ -1927,8 +2188,253 @@ mod tests {
         let names = [
             variant_name(&AuthMsg::AuthOk),
             variant_name(&AuthMsg::PairStart { spake_msg: vec![] }),
-            variant_name(&AuthMsg::ClientAuth { client_ed25519_pub: [0; 32], sig: vec![] }),
+            variant_name(&AuthMsg::ClientAuth {
+                client_ed25519_pub: [0; 32],
+                sig: vec![],
+            }),
         ];
         assert_eq!(names, ["AuthOk", "PairStart", "ClientAuth"]);
+    }
+
+    // -- M5: windowed delivery reporting -----------------------------------
+
+    #[test]
+    fn window_delivery_is_matched_window_math() {
+        let d = WindowDelivery {
+            sent: 45,
+            offered: 60,
+            bytes: 1_000_000,
+            dt_ms: 1_000,
+        };
+        assert!((d.delivery_ratio() - 0.75).abs() < 1e-6);
+        assert!((d.backpressure_ratio() - 0.25).abs() < 1e-6);
+        // 1,000,000 bytes in 1 s = 8,000 kbps.
+        assert_eq!(d.throughput_kbps(), 8_000);
+    }
+
+    #[test]
+    fn idle_window_reports_full_delivery_not_loss() {
+        // The old bug read a lifetime send count against a fresh client window
+        // and called a healthy link ~50% lossy. A matched window with nothing
+        // offered delivered everything it was asked to.
+        let idle = WindowDelivery {
+            sent: 0,
+            offered: 0,
+            bytes: 0,
+            dt_ms: 1_000,
+        };
+        assert_eq!(idle.delivery_ratio(), 1.0);
+        assert_eq!(idle.backpressure_ratio(), 0.0);
+        assert_eq!(idle.throughput_kbps(), 0);
+    }
+
+    #[test]
+    fn window_delivery_cannot_divide_by_a_zero_length_window() {
+        let z = WindowDelivery {
+            sent: 10,
+            offered: 10,
+            bytes: 500,
+            dt_ms: 0,
+        };
+        assert_eq!(z.throughput_kbps(), 0);
+    }
+
+    // -- M5: congestion signal + overrun gating ----------------------------
+
+    #[test]
+    fn congestion_ignores_overrun_until_warm() {
+        // Cold: a big overrun ratio is discarded; only real loss/backpressure
+        // count. This is what stops the spurious start-up downshift.
+        assert_eq!(congestion_signal(0.0, 0.0, 0.9, false), 0.0);
+        assert!((congestion_signal(0.05, 0.0, 0.9, false) - 0.05).abs() < 1e-6);
+        assert!((congestion_signal(0.0, 0.2, 0.9, false) - 0.2).abs() < 1e-6);
+        // Warm: the overrun is folded in.
+        assert!((congestion_signal(0.0, 0.0, 0.9, true) - 0.9).abs() < 1e-6);
+        // Real loss wins whenever it is larger, warm or not.
+        assert!((congestion_signal(0.5, 0.1, 0.2, true) - 0.5).abs() < 1e-6);
+    }
+
+    // -- M5: bitrate caps --------------------------------------------------
+
+    #[test]
+    fn caps_narrow_but_never_widen() {
+        assert_eq!(effective_cap(None, None), None);
+        assert_eq!(effective_cap(Some(5_000), None), Some(5_000));
+        assert_eq!(effective_cap(None, Some(3_000)), Some(3_000));
+        assert_eq!(
+            effective_cap(Some(5_000), Some(3_000)),
+            Some(3_000),
+            "client narrows"
+        );
+        assert_eq!(
+            effective_cap(Some(2_000), Some(9_000)),
+            Some(2_000),
+            "client cannot widen"
+        );
+        assert_eq!(clamp_to_cap(8_000, Some(3_000)), 3_000);
+        assert_eq!(clamp_to_cap(2_000, Some(3_000)), 2_000);
+        assert_eq!(clamp_to_cap(8_000, None), 8_000);
+    }
+
+    #[test]
+    fn bitrate_limit_clamps_the_adaptor_output() {
+        // The adaptor free-runs in Balanced (start 8000). A 3000 kbps client
+        // limit must be a hard ceiling on what the encoder is actually asked for.
+        let a = BitrateAdaptor::new(AdaptConfig::for_mode(QualityMode::Balanced));
+        let cap = effective_cap(None, Some(3_000));
+        assert_eq!(clamp_to_cap(a.current(), cap), 3_000);
+    }
+
+    // -- M5: adaptor drive (synthetic status windows) ----------------------
+
+    /// One synthetic `status_loop` window.
+    struct Window {
+        loss: f32,
+        sent: u64,
+        backpressured: u64,
+        encoder_kbps: u32,
+        carried_kbps: u32,
+    }
+
+    /// Reproduce the adaptor drive from `status_loop` without a live
+    /// connection: build the exact congestion number the loop would and observe
+    /// the adaptor. Returns (current target, Some(new) when it changed).
+    fn drive(a: &mut BitrateAdaptor, w: &Window, now_ms: u64, interval: u32) -> (u32, Option<u32>) {
+        let delivery = WindowDelivery {
+            sent: w.sent,
+            offered: w.sent + w.backpressured,
+            bytes: 0,
+            dt_ms: STATUS_INTERVAL_MS,
+        };
+        let warm = interval > OVERRUN_WARMUP_INTERVALS && w.sent >= OVERRUN_MIN_FRAMES;
+        let overrun = overrun_signal(w.encoder_kbps, w.carried_kbps);
+        let congestion = congestion_signal(w.loss, delivery.backpressure_ratio(), overrun, warm);
+        let changed = a.observe(now_ms, congestion, 50.0);
+        (a.current(), changed)
+    }
+
+    #[test]
+    fn adaptor_backs_off_on_real_loss_then_recovers() {
+        let mut a = BitrateAdaptor::new(AdaptConfig::for_mode(QualityMode::Balanced));
+        let start = a.current();
+        let clean = Window {
+            loss: 0.0,
+            sent: 60,
+            backpressured: 0,
+            encoder_kbps: 8_000,
+            carried_kbps: 8_000,
+        };
+        drive(&mut a, &clean, 0, 1);
+        // A window of real transport loss backs the target off.
+        let lossy = Window {
+            loss: 0.08,
+            sent: 60,
+            backpressured: 0,
+            encoder_kbps: 8_000,
+            carried_kbps: 8_000,
+        };
+        let (after, changed) = drive(&mut a, &lossy, 1_100, 2);
+        assert!(
+            changed.is_some() && after < start,
+            "loss must lower the target ({after} < {start})"
+        );
+        // Clean windows then raise it back up.
+        let mut t = 2_000;
+        let mut raised = None;
+        for i in 3..40 {
+            t += 1_000;
+            if let (_, Some(v)) = drive(&mut a, &clean, t, i) {
+                raised = Some(v);
+                break;
+            }
+        }
+        assert!(
+            raised.unwrap() > after,
+            "clean windows raise the target back up"
+        );
+    }
+
+    #[test]
+    fn startup_overrun_does_not_spuriously_downshift() {
+        let mut a = BitrateAdaptor::new(AdaptConfig::for_mode(QualityMode::Balanced));
+        let start = a.current();
+        // Encoder 12 Mbps but the link "carried" only 2 Mbps because the stream
+        // just began — a pure window artifact, with no real loss.
+        let w = Window {
+            loss: 0.0,
+            sent: 60,
+            backpressured: 0,
+            encoder_kbps: 12_000,
+            carried_kbps: 2_000,
+        };
+        let mut t = 0;
+        for i in 1..=OVERRUN_WARMUP_INTERVALS {
+            t += 500;
+            let (cur, changed) = drive(&mut a, &w, t, i);
+            assert_eq!(
+                cur, start,
+                "a gated overrun must not move the adaptor during warm-up"
+            );
+            assert!(changed.is_none());
+        }
+        // Once warm, the same sustained overrun IS treated as congestion.
+        t += 1_100;
+        let (cur, changed) = drive(&mut a, &w, t, OVERRUN_WARMUP_INTERVALS + 1);
+        assert!(
+            changed.is_some() && cur < start,
+            "a warm, sustained overrun backs off"
+        );
+    }
+
+    #[test]
+    fn quality_mode_switch_applies_ceiling_and_floor() {
+        // Ramp to the Motion ceiling, then switch to LowBandwidth: the current
+        // target clamps down into the new, lower range.
+        let mut a = BitrateAdaptor::new(AdaptConfig::for_mode(QualityMode::Motion));
+        let clean = Window {
+            loss: 0.0,
+            sent: 60,
+            backpressured: 0,
+            encoder_kbps: 1,
+            carried_kbps: 1,
+        };
+        let mut t = 0;
+        for i in 1..200 {
+            t += 2_100;
+            drive(&mut a, &clean, t, i);
+        }
+        assert_eq!(
+            a.current(),
+            AdaptConfig::for_mode(QualityMode::Motion).ceiling_kbps
+        );
+        a.set_mode(QualityMode::LowBandwidth, t);
+        assert_eq!(
+            a.current(),
+            AdaptConfig::for_mode(QualityMode::LowBandwidth).ceiling_kbps,
+            "clamped down to the new ceiling",
+        );
+
+        // A mode with a higher floor lifts a floored-out target up to it.
+        let mut b = BitrateAdaptor::new(AdaptConfig::for_mode(QualityMode::LowBandwidth));
+        let heavy = Window {
+            loss: 0.9,
+            sent: 10,
+            backpressured: 0,
+            encoder_kbps: 1,
+            carried_kbps: 1,
+        };
+        for i in 1..200u32 {
+            drive(&mut b, &heavy, i as u64 * 1_100, i);
+        }
+        assert_eq!(
+            b.current(),
+            AdaptConfig::for_mode(QualityMode::LowBandwidth).floor_kbps
+        );
+        b.set_mode(QualityMode::Motion, 999_999);
+        assert_eq!(
+            b.current(),
+            AdaptConfig::for_mode(QualityMode::Motion).floor_kbps,
+            "lifted up to the new floor",
+        );
     }
 }

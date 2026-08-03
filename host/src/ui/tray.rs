@@ -80,7 +80,11 @@ fn run(shared: Arc<AppShared>) -> anyhow::Result<()> {
         .build()?;
     tracing::info!("tray icon created ({:?})", view.state);
 
-    let items = Items { status, disconnect, pair };
+    let items = Items {
+        status,
+        disconnect,
+        pair,
+    };
     apply(&tray, &items, &view);
 
     while !shared.quit_requested() {
@@ -116,7 +120,9 @@ fn apply(tray: &tray_icon::TrayIcon, items: &Items, view: &TrayView) {
     }
     items.status.set_text(&view.status_line);
     items.disconnect.set_enabled(view.can_disconnect);
-    items.pair.set_enabled(view.state != super::TrayState::Disabled);
+    items
+        .pair
+        .set_enabled(view.state != super::TrayState::Disabled);
 }
 
 fn install_handlers(

@@ -31,9 +31,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL, DXGI_ERROR_NOT_FOUND,
@@ -607,7 +605,10 @@ fn create_bgra_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Te
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
         CPUAccessFlags: 0,
@@ -630,7 +631,10 @@ fn create_staging_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D1
         MipLevels: 1,
         ArraySize: 1,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_STAGING,
         BindFlags: 0,
         CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -652,8 +656,7 @@ fn find_primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
     // SAFETY: DXGI enumeration; every call's result is checked before use.
     unsafe {
         let primary: HMONITOR = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        let factory: IDXGIFactory1 =
-            CreateDXGIFactory1().map_err(cap_err("CreateDXGIFactory1"))?;
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(cap_err("CreateDXGIFactory1"))?;
 
         let mut fallback: Option<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC)> = None;
 
@@ -696,7 +699,9 @@ fn find_primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
                 let info = adapter_info(&adapter, &desc)?;
                 Ok((adapter, out1, info))
             }
-            None => Err(Error::Capture("no desktop-attached DXGI output found".into())),
+            None => Err(Error::Capture(
+                "no desktop-attached DXGI output found".into(),
+            )),
         }
     }
 }

@@ -152,7 +152,10 @@ impl MfH264Encoder {
             match Self::try_build(&activate, path, name.clone(), cfg.clone(), device) {
                 Ok(me) => return Ok(me),
                 Err(e) => {
-                    tracing::warn!("encoder candidate \"{name}\" ({}) unusable: {e}", path.label());
+                    tracing::warn!(
+                        "encoder candidate \"{name}\" ({}) unusable: {e}",
+                        path.label()
+                    );
                     // SAFETY: releases whatever the failed activation created.
                     unsafe {
                         let _ = activate.ShutdownObject();
@@ -161,8 +164,7 @@ impl MfH264Encoder {
                 }
             }
         }
-        Err(last_err
-            .unwrap_or_else(|| Error::Encoder("no usable H.264 encoder MFT".into())))
+        Err(last_err.unwrap_or_else(|| Error::Encoder("no usable H.264 encoder MFT".into())))
     }
 
     fn try_build(
@@ -246,7 +248,11 @@ impl MfH264Encoder {
     ///
     /// Returns `Ok(None)` when the encoder is not ready for input (frame
     /// dropped, back-pressure) or has not produced output yet.
-    pub fn submit(&mut self, input: FrameInput<'_>, timestamp_ms: u32) -> Result<Option<EncodedFrame>> {
+    pub fn submit(
+        &mut self,
+        input: FrameInput<'_>,
+        timestamp_ms: u32,
+    ) -> Result<Option<EncodedFrame>> {
         if self.force_key {
             self.set_codec_u32(&CODECAPI_AVEncVideoForceKeyFrame, 1, "ForceKeyFrame");
             self.force_key = false;
@@ -294,11 +300,9 @@ impl MfH264Encoder {
                 attrs
                     .SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)
                     .map_err(|e| Error::Encoder(format!("MF_TRANSFORM_ASYNC_UNLOCK: {e}")))?;
-                self.events = Some(
-                    self.transform
-                        .cast::<IMFMediaEventGenerator>()
-                        .map_err(|e| Error::Encoder(format!("async MFT without event generator: {e}")))?,
-                );
+                self.events = Some(self.transform.cast::<IMFMediaEventGenerator>().map_err(
+                    |e| Error::Encoder(format!("async MFT without event generator: {e}")),
+                )?);
             }
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
         }
@@ -353,10 +357,15 @@ impl MfH264Encoder {
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
             out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).ok();
             out.SetUINT32(&MF_MT_AVG_BITRATE, bps).ok();
-            out.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(self.cfg.width, self.cfg.height))
+            out.SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                pack_2x32(self.cfg.width, self.cfg.height),
+            )
+            .ok();
+            out.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.cfg.fps, 1))
                 .ok();
-            out.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.cfg.fps, 1)).ok();
-            out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1)).ok();
+            out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1))
+                .ok();
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 .ok();
             out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
@@ -376,10 +385,15 @@ impl MfH264Encoder {
             let inp = MFCreateMediaType().map_err(enc_err("MFCreateMediaType(in)"))?;
             inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
             inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ok();
-            inp.SetUINT64(&MF_MT_FRAME_SIZE, pack_2x32(self.cfg.width, self.cfg.height))
+            inp.SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                pack_2x32(self.cfg.width, self.cfg.height),
+            )
+            .ok();
+            inp.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.cfg.fps, 1))
                 .ok();
-            inp.SetUINT64(&MF_MT_FRAME_RATE, pack_2x32(self.cfg.fps, 1)).ok();
-            inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1)).ok();
+            inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2x32(1, 1))
+                .ok();
             inp.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 .ok();
             self.transform
@@ -393,9 +407,8 @@ impl MfH264Encoder {
             let provides = MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
                 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32;
             self.out_provides_samples = info.dwFlags & provides != 0;
-            self.out_buf_size = info
-                .cbSize
-                .max(self.cfg.width * self.cfg.height); // generous floor
+            self.out_buf_size = info.cbSize.max(self.cfg.width * self.cfg.height);
+            // generous floor
         }
         self.codec_api = self.transform.cast::<ICodecAPI>().ok();
         Ok(())
@@ -517,7 +530,9 @@ impl MfH264Encoder {
     }
 
     fn pump_events(&mut self) {
-        let Some(gen) = self.events.clone() else { return };
+        let Some(gen) = self.events.clone() else {
+            return;
+        };
         loop {
             // SAFETY: NO_WAIT never blocks; errors mean "queue empty".
             let ev = unsafe { gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) };
@@ -572,7 +587,9 @@ impl MfH264Encoder {
                 Err(e) => return Err(Error::Encoder(format!("ProcessOutput: {e}"))),
             }
 
-            let Some(sample) = sample else { return Ok(None) };
+            let Some(sample) = sample else {
+                return Ok(None);
+            };
             let keyframe = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) == 1;
             let ts_hns = sample.GetSampleTime().unwrap_or(0);
 
@@ -623,13 +640,19 @@ impl MfH264Encoder {
     fn fetch_sequence_header(&mut self) {
         // SAFETY: live transform; blob size is queried before the read.
         unsafe {
-            let Ok(t) = self.transform.GetOutputCurrentType(0) else { return };
-            let Ok(size) = t.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) else { return };
+            let Ok(t) = self.transform.GetOutputCurrentType(0) else {
+                return;
+            };
+            let Ok(size) = t.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER) else {
+                return;
+            };
             if size == 0 {
                 return;
             }
             let mut buf = vec![0u8; size as usize];
-            if t.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, None).is_ok() {
+            if t.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, None)
+                .is_ok()
+            {
                 tracing::debug!("captured {} byte H.264 sequence header", buf.len());
                 self.seq_header = buf;
             }
@@ -805,7 +828,11 @@ impl Encoder for MfH264Encoder {
         } else {
             self.cfg.adapter_name.clone()
         };
-        let io = if self.d3d_bound { "GPU texture in" } else { "CPU NV12 in" };
+        let io = if self.d3d_bound {
+            "GPU texture in"
+        } else {
+            "CPU NV12 in"
+        };
         format!(
             "MF H.264 \"{}\" — {} on {} ({})",
             self.friendly_name,
@@ -847,7 +874,10 @@ fn candidate_mfts(cfg: &EncoderConfig) -> Result<Vec<(IMFActivate, EncoderPath)>
                     list.sort_by_key(|a| !mft_vendor_matches(a, &want));
                 }
                 log_names("LUID-matched hardware", &list);
-                out.extend(list.into_iter().map(|a| (a, EncoderPath::HardwareSameAdapter)));
+                out.extend(
+                    list.into_iter()
+                        .map(|a| (a, EncoderPath::HardwareSameAdapter)),
+                );
             }
             Err(e) => tracing::warn!("LUID-scoped MFT enumeration failed: {e}"),
         }
@@ -909,7 +939,8 @@ fn enumerate(flags: MFT_ENUM_FLAG, luid: Option<u64>) -> Result<Vec<IMFActivate>
     unsafe {
         let mut attrs: Option<IMFAttributes> = None;
         MFCreateAttributes(&mut attrs, 1).map_err(enc_err("MFCreateAttributes"))?;
-        let attrs = attrs.ok_or_else(|| Error::Encoder("MFCreateAttributes returned null".into()))?;
+        let attrs =
+            attrs.ok_or_else(|| Error::Encoder("MFCreateAttributes returned null".into()))?;
         if let Some(luid) = luid {
             attrs
                 .SetUINT64(&MFT_ENUM_ADAPTER_LUID, luid)

@@ -38,13 +38,13 @@
 //! [`crate::crypto::tls`], before any of this runs. Both checks must pass.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::identity::parse_verifying_key;
 use crate::crypto::storage::SecretStore;
-use crate::crypto::{Ed25519Pub, Exporter, Role, SpkiHash, check_exporter, ct_eq};
+use crate::crypto::{check_exporter, ct_eq, Ed25519Pub, Exporter, Role, SpkiHash};
 use crate::error::{Error, Result};
 use crate::protocol::AuthMsg;
 
@@ -109,7 +109,9 @@ pub fn verify_challenge(
         .map_err(|_| Error::Auth(format!("signature must be 64 bytes, got {}", sig.len())))?;
     let signature = Signature::from_bytes(&bytes);
     let msg = challenge_message(peer_role, exporter, our_nonce);
-    peer_pub.verify(&msg, &signature).map_err(|_| Error::Auth("signature invalid".into()))
+    peer_pub
+        .verify(&msg, &signature)
+        .map_err(|_| Error::Auth("signature invalid".into()))
 }
 
 /// A fresh 32-byte nonce from the OS CSPRNG.
@@ -201,12 +203,17 @@ impl TrustedPeers {
             crate::crypto::identity::validate_name(&p.name)?;
             p.verifying_key()?;
         }
-        Ok(Self { peers: stored.peers })
+        Ok(Self {
+            peers: stored.peers,
+        })
     }
 
     /// Persist to a store.
     pub fn save(&self, store: &dyn SecretStore, key: &str) -> Result<()> {
-        let stored = StoredPeers { version: STORE_VERSION, peers: self.peers.clone() };
+        let stored = StoredPeers {
+            version: STORE_VERSION,
+            peers: self.peers.clone(),
+        };
         let bytes = postcard::to_stdvec(&stored)?;
         store.write(key, &bytes)
     }
@@ -220,7 +227,11 @@ impl TrustedPeers {
     pub fn upsert(&mut self, peer: TrustedPeer) -> Result<bool> {
         crate::crypto::identity::validate_name(&peer.name)?;
         peer.verifying_key()?;
-        if let Some(slot) = self.peers.iter_mut().find(|p| p.ed25519_pub == peer.ed25519_pub) {
+        if let Some(slot) = self
+            .peers
+            .iter_mut()
+            .find(|p| p.ed25519_pub == peer.ed25519_pub)
+        {
             *slot = peer;
             return Ok(true);
         }
@@ -243,7 +254,9 @@ impl TrustedPeers {
 
     /// Look up a peer by identity key, comparing in constant time.
     pub fn find(&self, ed25519_pub: &Ed25519Pub) -> Option<&TrustedPeer> {
-        self.peers.iter().find(|p| ct_eq(&p.ed25519_pub, ed25519_pub))
+        self.peers
+            .iter()
+            .find(|p| ct_eq(&p.ed25519_pub, ed25519_pub))
     }
 
     /// Look up a peer by its TLS pin.
@@ -251,7 +264,9 @@ impl TrustedPeers {
         if spki_sha256 == &[0u8; 32] {
             return None;
         }
-        self.peers.iter().find(|p| ct_eq(&p.spki_sha256, spki_sha256))
+        self.peers
+            .iter()
+            .find(|p| ct_eq(&p.spki_sha256, spki_sha256))
     }
 
     /// All records, in insertion order.
@@ -325,16 +340,16 @@ impl HostAuthenticator {
     /// the same [`Error::Auth`] shape on purpose: the caller sends a single
     /// generic `AuthFail` so a prober cannot tell "not paired" from
     /// "wrong key".
-    pub fn on_client_auth(
-        &mut self,
-        msg: &AuthMsg,
-        trusted: &TrustedPeers,
-    ) -> Result<TrustedPeer> {
+    pub fn on_client_auth(&mut self, msg: &AuthMsg, trusted: &TrustedPeers) -> Result<TrustedPeer> {
         if self.stage != HostStage::AwaitClientAuth {
             self.stage = HostStage::Failed;
             return Err(Error::Auth("unexpected ClientAuth".into()));
         }
-        let AuthMsg::ClientAuth { client_ed25519_pub, sig } = msg else {
+        let AuthMsg::ClientAuth {
+            client_ed25519_pub,
+            sig,
+        } = msg
+        else {
             self.stage = HostStage::Failed;
             return Err(Error::Auth("expected ClientAuth".into()));
         };
@@ -343,8 +358,7 @@ impl HostAuthenticator {
             return Err(Error::Auth("client is not paired with this host".into()));
         };
         let vk = peer.verifying_key()?;
-        if let Err(e) =
-            verify_challenge(&vk, Role::Client, &self.exporter, &self.server_nonce, sig)
+        if let Err(e) = verify_challenge(&vk, Role::Client, &self.exporter, &self.server_nonce, sig)
         {
             self.stage = HostStage::Failed;
             return Err(e);
@@ -410,7 +424,10 @@ impl std::fmt::Debug for ClientAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientAuthenticator")
             .field("stage", &self.stage)
-            .field("host_pub", &crate::crypto::fingerprint_short(&self.host_pub.to_bytes()))
+            .field(
+                "host_pub",
+                &crate::crypto::fingerprint_short(&self.host_pub.to_bytes()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -459,7 +476,9 @@ impl ClientAuthenticator {
                 client_ed25519_pub: client_key.verifying_key().to_bytes(),
                 sig,
             },
-            AuthMsg::ClientChallenge { nonce: self.client_nonce },
+            AuthMsg::ClientChallenge {
+                nonce: self.client_nonce,
+            },
         ))
     }
 
@@ -528,14 +547,22 @@ mod tests {
     }
 
     fn peer_for(name: &str, pubkey: Ed25519Pub, pin: SpkiHash) -> TrustedPeer {
-        TrustedPeer { name: name.into(), ed25519_pub: pubkey, spki_sha256: pin, added_at_ms: 1 }
+        TrustedPeer {
+            name: name.into(),
+            ed25519_pub: pubkey,
+            spki_sha256: pin,
+            added_at_ms: 1,
+        }
     }
 
     #[test]
     fn challenge_message_is_role_separated() {
         let e = exporter(1);
         let n = [9u8; 32];
-        assert_ne!(challenge_message(Role::Host, &e, &n), challenge_message(Role::Client, &e, &n));
+        assert_ne!(
+            challenge_message(Role::Host, &e, &n),
+            challenge_message(Role::Client, &e, &n)
+        );
     }
 
     #[test]
@@ -594,16 +621,25 @@ mod tests {
 
         let a = ClientIdentity::generate("a").unwrap();
         let b = ClientIdentity::generate("b").unwrap();
-        assert!(!set.upsert(peer_for("a", a.ed25519_pub(), [0u8; 32])).unwrap());
-        assert!(!set.upsert(peer_for("b", b.ed25519_pub(), [7u8; 32])).unwrap());
+        assert!(!set
+            .upsert(peer_for("a", a.ed25519_pub(), [0u8; 32]))
+            .unwrap());
+        assert!(!set
+            .upsert(peer_for("b", b.ed25519_pub(), [7u8; 32]))
+            .unwrap());
         assert_eq!(set.len(), 2);
         // Re-adding the same identity key replaces rather than duplicates.
-        assert!(set.upsert(peer_for("a renamed", a.ed25519_pub(), [0u8; 32])).unwrap());
+        assert!(set
+            .upsert(peer_for("a renamed", a.ed25519_pub(), [0u8; 32]))
+            .unwrap());
         assert_eq!(set.len(), 2);
         assert_eq!(set.find(&a.ed25519_pub()).unwrap().name, "a renamed");
 
         assert!(set.find_by_pin(&[7u8; 32]).is_some());
-        assert!(set.find_by_pin(&[0u8; 32]).is_none(), "all-zero pin must never match");
+        assert!(
+            set.find_by_pin(&[0u8; 32]).is_none(),
+            "all-zero pin must never match"
+        );
         assert!(!set.peers()[0].has_tls_pin());
         assert!(set.peers()[1].has_tls_pin());
 
@@ -620,7 +656,9 @@ mod tests {
     #[test]
     fn missing_store_blob_is_empty_not_error() {
         let store = MemoryStore::new();
-        assert!(TrustedPeers::load(&store, TRUSTED_HOSTS_KEY).unwrap().is_empty());
+        assert!(TrustedPeers::load(&store, TRUSTED_HOSTS_KEY)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -633,15 +671,22 @@ mod tests {
             version: STORE_VERSION,
             peers: vec![peer_for("bad\nname", id.ed25519_pub(), [0u8; 32])],
         };
-        store.write(TRUSTED_HOSTS_KEY, &postcard::to_stdvec(&stored).unwrap()).unwrap();
+        store
+            .write(TRUSTED_HOSTS_KEY, &postcard::to_stdvec(&stored).unwrap())
+            .unwrap();
         assert!(TrustedPeers::load(&store, TRUSTED_HOSTS_KEY).is_err());
     }
 
     #[test]
     fn trusted_peers_rejects_wrong_version() {
         let store = MemoryStore::new();
-        let stored = StoredPeers { version: 42, peers: vec![] };
-        store.write(TRUSTED_HOSTS_KEY, &postcard::to_stdvec(&stored).unwrap()).unwrap();
+        let stored = StoredPeers {
+            version: 42,
+            peers: vec![],
+        };
+        store
+            .write(TRUSTED_HOSTS_KEY, &postcard::to_stdvec(&stored).unwrap())
+            .unwrap();
         assert!(TrustedPeers::load(&store, TRUSTED_HOSTS_KEY).is_err());
     }
 
@@ -652,19 +697,23 @@ mod tests {
         let e = exporter(0x2A);
 
         let mut trusted = TrustedPeers::new();
-        trusted.upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32])).unwrap();
+        trusted
+            .upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32]))
+            .unwrap();
 
         let (mut h, challenge) = HostAuthenticator::start_with_nonce(&e, [1u8; 32]).unwrap();
         let mut c =
             ClientAuthenticator::start_with_nonce(&e, &host.ed25519_pub(), [2u8; 32]).unwrap();
 
-        let (client_auth, client_challenge) =
-            c.on_server_challenge(&challenge, client.signing_key()).unwrap();
+        let (client_auth, client_challenge) = c
+            .on_server_challenge(&challenge, client.signing_key())
+            .unwrap();
         let matched = h.on_client_auth(&client_auth, &trusted).unwrap();
         assert_eq!(matched.name, "laptop");
 
-        let (server_auth, ok) =
-            h.on_client_challenge(&client_challenge, host.signing_key()).unwrap();
+        let (server_auth, ok) = h
+            .on_client_challenge(&client_challenge, host.signing_key())
+            .unwrap();
         c.on_server_auth(&server_auth).unwrap();
         c.on_auth_ok(&ok).unwrap();
 
@@ -681,8 +730,12 @@ mod tests {
         let (mut h, challenge) = HostAuthenticator::start_with_nonce(&e, [1u8; 32]).unwrap();
         let mut c =
             ClientAuthenticator::start_with_nonce(&e, &host.ed25519_pub(), [2u8; 32]).unwrap();
-        let (client_auth, _) = c.on_server_challenge(&challenge, client.signing_key()).unwrap();
-        let err = h.on_client_auth(&client_auth, &TrustedPeers::new()).unwrap_err();
+        let (client_auth, _) = c
+            .on_server_challenge(&challenge, client.signing_key())
+            .unwrap();
+        let err = h
+            .on_client_auth(&client_auth, &TrustedPeers::new())
+            .unwrap_err();
         assert!(matches!(err, Error::Auth(_)));
     }
 
@@ -693,15 +746,21 @@ mod tests {
         let e = exporter(0x2C);
 
         let mut trusted = TrustedPeers::new();
-        trusted.upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32])).unwrap();
+        trusted
+            .upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32]))
+            .unwrap();
 
         let (mut h, challenge) = HostAuthenticator::start_with_nonce(&e, [3u8; 32]).unwrap();
-        let AuthMsg::ServerChallenge { nonce } = challenge else { panic!("wrong variant") };
+        let AuthMsg::ServerChallenge { nonce } = challenge else {
+            panic!("wrong variant")
+        };
 
         // Claim to be the trusted client, but sign with the impostor's key.
         let sig = sign_challenge(impostor.signing_key(), Role::Client, &e, &nonce).unwrap();
-        let forged =
-            AuthMsg::ClientAuth { client_ed25519_pub: client.ed25519_pub(), sig };
+        let forged = AuthMsg::ClientAuth {
+            client_ed25519_pub: client.ed25519_pub(),
+            sig,
+        };
         assert!(h.on_client_auth(&forged, &trusted).is_err());
         assert!(!h.is_complete());
     }
@@ -714,18 +773,21 @@ mod tests {
         let e = exporter(0x2D);
 
         let mut trusted = TrustedPeers::new();
-        trusted.upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32])).unwrap();
+        trusted
+            .upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32]))
+            .unwrap();
 
         // The client pinned `real_host`, but `evil_host` answers.
         let (mut h, challenge) = HostAuthenticator::start_with_nonce(&e, [4u8; 32]).unwrap();
         let mut c =
-            ClientAuthenticator::start_with_nonce(&e, &real_host.ed25519_pub(), [5u8; 32])
-                .unwrap();
-        let (client_auth, client_challenge) =
-            c.on_server_challenge(&challenge, client.signing_key()).unwrap();
+            ClientAuthenticator::start_with_nonce(&e, &real_host.ed25519_pub(), [5u8; 32]).unwrap();
+        let (client_auth, client_challenge) = c
+            .on_server_challenge(&challenge, client.signing_key())
+            .unwrap();
         h.on_client_auth(&client_auth, &trusted).unwrap();
-        let (server_auth, _) =
-            h.on_client_challenge(&client_challenge, evil_host.signing_key()).unwrap();
+        let (server_auth, _) = h
+            .on_client_challenge(&client_challenge, evil_host.signing_key())
+            .unwrap();
 
         assert!(c.on_server_auth(&server_auth).is_err());
         assert!(!c.is_complete());
@@ -736,7 +798,9 @@ mod tests {
         let host = HostIdentity::generate("desk").unwrap();
         let client = ClientIdentity::generate("laptop").unwrap();
         let mut trusted = TrustedPeers::new();
-        trusted.upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32])).unwrap();
+        trusted
+            .upsert(peer_for("laptop", client.ed25519_pub(), [0u8; 32]))
+            .unwrap();
 
         // Session 1: capture the client's signature.
         let e1 = exporter(0x30);
@@ -756,15 +820,18 @@ mod tests {
         let e = exporter(0x32);
         let host = HostIdentity::generate("h").unwrap();
         let (mut h, _) = HostAuthenticator::start_with_nonce(&e, [1u8; 32]).unwrap();
-        assert!(
-            h.on_client_challenge(&AuthMsg::ClientChallenge { nonce: [0u8; 32] }, host
-                .signing_key())
-                .is_err()
-        );
+        assert!(h
+            .on_client_challenge(
+                &AuthMsg::ClientChallenge { nonce: [0u8; 32] },
+                host.signing_key()
+            )
+            .is_err());
 
         let mut c =
             ClientAuthenticator::start_with_nonce(&e, &host.ed25519_pub(), [2u8; 32]).unwrap();
-        assert!(c.on_server_auth(&AuthMsg::ServerAuth { sig: vec![0u8; 64] }).is_err());
+        assert!(c
+            .on_server_auth(&AuthMsg::ServerAuth { sig: vec![0u8; 64] })
+            .is_err());
         assert!(!c.is_complete());
     }
 
@@ -775,15 +842,23 @@ mod tests {
         let e = exporter(0x33);
         let (mut h, challenge) = HostAuthenticator::start_with_nonce(&e, [1u8; 32]).unwrap();
         let mut trusted = TrustedPeers::new();
-        trusted.upsert(peer_for("c", client.ed25519_pub(), [0u8; 32])).unwrap();
+        trusted
+            .upsert(peer_for("c", client.ed25519_pub(), [0u8; 32]))
+            .unwrap();
         let mut c =
             ClientAuthenticator::start_with_nonce(&e, &host.ed25519_pub(), [2u8; 32]).unwrap();
-        let (ca, cc) = c.on_server_challenge(&challenge, client.signing_key()).unwrap();
+        let (ca, cc) = c
+            .on_server_challenge(&challenge, client.signing_key())
+            .unwrap();
         h.on_client_auth(&ca, &trusted).unwrap();
         let (sa, _) = h.on_client_challenge(&cc, host.signing_key()).unwrap();
         c.on_server_auth(&sa).unwrap();
 
-        let err = c.on_auth_ok(&AuthMsg::AuthFail { reason: "nope".into() }).unwrap_err();
+        let err = c
+            .on_auth_ok(&AuthMsg::AuthFail {
+                reason: "nope".into(),
+            })
+            .unwrap_err();
         assert!(matches!(err, Error::Auth(_)));
         assert!(!c.is_complete());
     }
@@ -795,8 +870,8 @@ mod tests {
         let e = exporter(0x5C);
         let host = HostIdentity::generate("h").unwrap();
         let (h, _) = HostAuthenticator::start_with_nonce(&e, [0x5Du8; 32]).unwrap();
-        let c = ClientAuthenticator::start_with_nonce(&e, &host.ed25519_pub(), [0x5Eu8; 32])
-            .unwrap();
+        let c =
+            ClientAuthenticator::start_with_nonce(&e, &host.ed25519_pub(), [0x5Eu8; 32]).unwrap();
 
         let leaked = |s: &str| s.contains("92") && s.contains("93");
         let hs = format!("{h:?}");
@@ -816,9 +891,12 @@ mod tests {
             // Valid Ed25519 public keys are needed, so derive real ones.
             let id = ClientIdentity::generate("p").unwrap();
             key.copy_from_slice(&id.ed25519_pub());
-            set.upsert(peer_for(&format!("p{i}"), key, [0u8; 32])).unwrap();
+            set.upsert(peer_for(&format!("p{i}"), key, [0u8; 32]))
+                .unwrap();
         }
         let extra = ClientIdentity::generate("extra").unwrap();
-        assert!(set.upsert(peer_for("extra", extra.ed25519_pub(), [0u8; 32])).is_err());
+        assert!(set
+            .upsert(peer_for("extra", extra.ed25519_pub(), [0u8; 32]))
+            .is_err());
     }
 }

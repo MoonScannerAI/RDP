@@ -160,17 +160,37 @@ mod tests {
     fn inbound_and_outbound_are_connected() {
         let (session, mut transport) = ClientSession::new();
 
-        transport.video_tx.send(EncodedFrame { frame_id: 1, keyframe: true, timestamp_ms: 5, data: vec![9] }).unwrap();
+        transport
+            .video_tx
+            .send(EncodedFrame {
+                frame_id: 1,
+                keyframe: true,
+                timestamp_ms: 5,
+                data: vec![9],
+            })
+            .unwrap();
         assert_eq!(session.video_rx.try_recv().unwrap().frame_id, 1);
 
-        transport.route_tx.send(Some(TransportRoute::Relayed)).unwrap();
-        assert_eq!(session.route_rx.try_recv().unwrap(), Some(TransportRoute::Relayed));
+        transport
+            .route_tx
+            .send(Some(TransportRoute::Relayed))
+            .unwrap();
+        assert_eq!(
+            session.route_rx.try_recv().unwrap(),
+            Some(TransportRoute::Relayed)
+        );
 
         assert!(send_input(&session.input_tx, InputMsg::ReleaseAll));
-        assert!(matches!(transport.input_rx.try_recv().unwrap(), InputMsg::ReleaseAll));
+        assert!(matches!(
+            transport.input_rx.try_recv().unwrap(),
+            InputMsg::ReleaseAll
+        ));
 
         session.send_control(ControlMsg::RequestKeyframe);
-        assert!(matches!(transport.control_rx.try_recv().unwrap(), ControlMsg::RequestKeyframe));
+        assert!(matches!(
+            transport.control_rx.try_recv().unwrap(),
+            ControlMsg::RequestKeyframe
+        ));
     }
 
     #[test]
@@ -185,7 +205,10 @@ mod tests {
     fn input_send_never_blocks_when_full() {
         let (session, _transport) = ClientSession::new();
         for _ in 0..INPUT_QUEUE_DEPTH {
-            assert!(send_input(&session.input_tx, InputMsg::Event(InputEvent::MouseMove { x: 0, y: 0 })));
+            assert!(send_input(
+                &session.input_tx,
+                InputMsg::Event(InputEvent::MouseMove { x: 0, y: 0 })
+            ));
         }
         // Queue is now full: the next send returns false immediately.
         assert!(!send_input(&session.input_tx, InputMsg::ReleaseAll));

@@ -167,7 +167,8 @@ pub enum HkeyRoot {
 pub fn reg_value_exists(root: HkeyRoot, subkey: &str, value: &str) -> bool {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_USERS, KEY_QUERY_VALUE,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_USERS,
+        KEY_QUERY_VALUE,
     };
 
     let root = match root {
@@ -180,7 +181,8 @@ pub fn reg_value_exists(root: HkeyRoot, subkey: &str, value: &str) -> bool {
 
     // SAFETY: pointers are valid for the duration of the calls; hkey is closed below.
     unsafe {
-        if RegOpenKeyExW(root, pcwstr(&subkey_w), None, KEY_QUERY_VALUE, &mut hkey) != ERROR_SUCCESS {
+        if RegOpenKeyExW(root, pcwstr(&subkey_w), None, KEY_QUERY_VALUE, &mut hkey) != ERROR_SUCCESS
+        {
             return false;
         }
         let mut size: u32 = 0;

@@ -71,7 +71,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("directdesk-cfg-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("directdesk-cfg-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -103,7 +104,9 @@ mod tests {
 
     #[test]
     fn roundtrips_through_written_json() {
-        let cfg = ServiceConfig { autostart_host: true };
+        let cfg = ServiceConfig {
+            autostart_host: true,
+        };
         assert_eq!(parse(&to_json(&cfg)), cfg);
     }
 
@@ -113,7 +116,10 @@ mod tests {
         let path = dir.join("service.json");
         let cfg = load_or_create(&path);
         assert!(!cfg.autostart_host);
-        assert!(path.exists(), "default config file should have been created");
+        assert!(
+            path.exists(),
+            "default config file should have been created"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!parse(&text).autostart_host);
         let _ = std::fs::remove_dir_all(&dir);

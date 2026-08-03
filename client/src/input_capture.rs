@@ -81,7 +81,12 @@ pub struct ChordState {
 
 impl ChordState {
     pub const fn new() -> Self {
-        Self { ctrl: false, alt: false, shift: false, armed: false }
+        Self {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            armed: false,
+        }
     }
 
     /// Called on capture start/stop — physical modifier state is unknown then.
@@ -202,7 +207,10 @@ fn pixel_of(pos: egui::Pos2, view: &VideoView) -> Option<(i64, i64)> {
     }
     let fx = (pos.x - view.rect.min.x) / view.rect.width();
     let fy = (pos.y - view.rect.min.y) / view.rect.height();
-    Some(((fx * view.remote_w as f32).floor() as i64, (fy * view.remote_h as f32).floor() as i64))
+    Some((
+        (fx * view.remote_w as f32).floor() as i64,
+        (fy * view.remote_h as f32).floor() as i64,
+    ))
 }
 
 /// Strict mapping: `None` when the point is in the letterbox margin (or off the
@@ -213,7 +221,10 @@ pub fn map_pointer(pos: egui::Pos2, view: &VideoView) -> Option<(u16, u16)> {
     if px < 0 || py < 0 || px >= view.remote_w as i64 || py >= view.remote_h as i64 {
         return None;
     }
-    Some((to_norm(px as u32, view.remote_w), to_norm(py as u32, view.remote_h)))
+    Some((
+        to_norm(px as u32, view.remote_w),
+        to_norm(py as u32, view.remote_h),
+    ))
 }
 
 /// Clamped mapping: pins to the nearest edge pixel. Used for moves and for
@@ -260,7 +271,10 @@ struct HookState {
     chord: ChordState,
 }
 
-static HOOK_STATE: Mutex<HookState> = Mutex::new(HookState { tx: None, chord: ChordState::new() });
+static HOOK_STATE: Mutex<HookState> = Mutex::new(HookState {
+    tx: None,
+    chord: ChordState::new(),
+});
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 static RELEASE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static KEYS_FORWARDED: AtomicU64 = AtomicU64::new(0);
@@ -321,9 +335,16 @@ mod hook {
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::warn!("SetWindowsHookExW(hMod=NULL) failed ({e}); retrying with module handle");
+                    tracing::warn!(
+                        "SetWindowsHookExW(hMod=NULL) failed ({e}); retrying with module handle"
+                    );
                     let hmod = GetModuleHandleW(None)?;
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(HINSTANCE(hmod.0)), 0)?
+                    SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(keyboard_proc),
+                        Some(HINSTANCE(hmod.0)),
+                        0,
+                    )?
                 }
             }
         };
@@ -379,7 +400,10 @@ mod hook {
             let thread_id = ready_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .map_err(|e| anyhow::anyhow!("hook thread did not start: {e}"))?;
-            Ok(Self { thread_id, handle: Some(handle) })
+            Ok(Self {
+                thread_id,
+                handle: Some(handle),
+            })
         }
 
         pub fn install(&self) {
@@ -427,7 +451,11 @@ mod hook {
                 ki: KEYBDINPUT {
                     wVk: Default::default(),
                     wScan: scan_code,
-                    dwFlags: if up { KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP } else { KEYEVENTF_SCANCODE },
+                    dwFlags: if up {
+                        KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+                    } else {
+                        KEYEVENTF_SCANCODE
+                    },
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -709,8 +737,14 @@ impl InputCapture {
         button: egui::PointerButton,
         pressed: bool,
     ) {
-        let Some(button) = map_button(button) else { return };
-        let mapped = if pressed { map_pointer(pos, view) } else { map_pointer_clamped(pos, view) };
+        let Some(button) = map_button(button) else {
+            return;
+        };
+        let mapped = if pressed {
+            map_pointer(pos, view)
+        } else {
+            map_pointer_clamped(pos, view)
+        };
         let Some((x, y)) = mapped else { return };
 
         // A button event carries its own position; flush any pending move first
@@ -726,7 +760,11 @@ impl InputCapture {
             &self.tx,
             InputMsg::Event(InputEvent::MouseButton {
                 button,
-                action: if pressed { KeyAction::Down } else { KeyAction::Up },
+                action: if pressed {
+                    KeyAction::Down
+                } else {
+                    KeyAction::Up
+                },
                 x,
                 y,
             }),
@@ -737,8 +775,18 @@ impl InputCapture {
         if delta == 0 {
             return;
         }
-        let Some((x, y)) = map_pointer(pos, view) else { return };
-        send_input(&self.tx, InputMsg::Event(InputEvent::MouseWheel { delta, horizontal, x, y }));
+        let Some((x, y)) = map_pointer(pos, view) else {
+            return;
+        };
+        send_input(
+            &self.tx,
+            InputMsg::Event(InputEvent::MouseWheel {
+                delta,
+                horizontal,
+                x,
+                y,
+            }),
+        );
     }
 
     /// Send `(x, y)` immediately, bypassing the rate cap.
@@ -824,17 +872,29 @@ mod tests {
         let mut c = ChordState::new();
         press(&mut c, SC_CTRL, false);
         press(&mut c, SC_LSHIFT, false);
-        assert_eq!(press(&mut c, SC_F12, false), ChordOutcome::Forward, "no Alt held");
+        assert_eq!(
+            press(&mut c, SC_F12, false),
+            ChordOutcome::Forward,
+            "no Alt held"
+        );
 
         let mut c = ChordState::new();
         press(&mut c, SC_ALT, false);
         press(&mut c, SC_LSHIFT, false);
-        assert_eq!(press(&mut c, SC_F12, false), ChordOutcome::Forward, "no Ctrl held");
+        assert_eq!(
+            press(&mut c, SC_F12, false),
+            ChordOutcome::Forward,
+            "no Ctrl held"
+        );
 
         let mut c = ChordState::new();
         press(&mut c, SC_CTRL, false);
         press(&mut c, SC_ALT, false);
-        assert_eq!(press(&mut c, SC_F12, false), ChordOutcome::Forward, "no Shift held");
+        assert_eq!(
+            press(&mut c, SC_F12, false),
+            ChordOutcome::Forward,
+            "no Shift held"
+        );
     }
 
     #[test]
@@ -893,10 +953,18 @@ mod tests {
         c.push(1, 1);
         c.push(2, 2);
         c.push(3, 3);
-        assert_eq!(c.take_due(t0), Some((3, 3)), "only the newest position survives");
+        assert_eq!(
+            c.take_due(t0),
+            Some((3, 3)),
+            "only the newest position survives"
+        );
         assert_eq!(c.coalesced_count(), 2);
         assert!(!c.has_pending());
-        assert_eq!(c.take_due(t0 + Duration::from_secs(1)), None, "slot is empty");
+        assert_eq!(
+            c.take_due(t0 + Duration::from_secs(1)),
+            None,
+            "slot is empty"
+        );
     }
 
     #[test]
@@ -982,8 +1050,16 @@ mod tests {
         let v = letterboxed_view();
         let above = egui::pos2(v.rect.center().x, v.rect.min.y - 50.0);
         let below = egui::pos2(v.rect.center().x, v.rect.max.y + 50.0);
-        assert_eq!(map_pointer_clamped(above, &v).unwrap().1, 0, "clamps to top row");
-        assert_eq!(map_pointer_clamped(below, &v).unwrap().1, u16::MAX, "clamps to bottom row");
+        assert_eq!(
+            map_pointer_clamped(above, &v).unwrap().1,
+            0,
+            "clamps to top row"
+        );
+        assert_eq!(
+            map_pointer_clamped(below, &v).unwrap().1,
+            u16::MAX,
+            "clamps to bottom row"
+        );
     }
 
     #[test]
@@ -1033,7 +1109,10 @@ mod tests {
         let big = mk(2560, 1440);
         let a = map_pointer(small.rect.center(), &small).unwrap();
         let b = map_pointer(big.rect.center(), &big).unwrap();
-        assert!(a.0.abs_diff(b.0) < 200 && a.1.abs_diff(b.1) < 200, "{a:?} vs {b:?}");
+        assert!(
+            a.0.abs_diff(b.0) < 200 && a.1.abs_diff(b.1) < 200,
+            "{a:?} vs {b:?}"
+        );
     }
 
     #[test]
@@ -1056,10 +1135,25 @@ mod tests {
 
     #[test]
     fn buttons_map_onto_the_contract() {
-        assert_eq!(map_button(egui::PointerButton::Primary), Some(MouseButton::Left));
-        assert_eq!(map_button(egui::PointerButton::Secondary), Some(MouseButton::Right));
-        assert_eq!(map_button(egui::PointerButton::Middle), Some(MouseButton::Middle));
-        assert_eq!(map_button(egui::PointerButton::Extra1), Some(MouseButton::X1));
-        assert_eq!(map_button(egui::PointerButton::Extra2), Some(MouseButton::X2));
+        assert_eq!(
+            map_button(egui::PointerButton::Primary),
+            Some(MouseButton::Left)
+        );
+        assert_eq!(
+            map_button(egui::PointerButton::Secondary),
+            Some(MouseButton::Right)
+        );
+        assert_eq!(
+            map_button(egui::PointerButton::Middle),
+            Some(MouseButton::Middle)
+        );
+        assert_eq!(
+            map_button(egui::PointerButton::Extra1),
+            Some(MouseButton::X1)
+        );
+        assert_eq!(
+            map_button(egui::PointerButton::Extra2),
+            Some(MouseButton::X2)
+        );
     }
 }

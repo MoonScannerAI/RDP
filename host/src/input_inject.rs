@@ -134,7 +134,11 @@ impl WinInjector {
 
     fn build(&self, ev: &InputEvent, with_move: bool) -> Option<INPUT> {
         match ev {
-            InputEvent::Key { scan_code, extended, action } => {
+            InputEvent::Key {
+                scan_code,
+                extended,
+                action,
+            } => {
                 let mut flags = KEYEVENTF_SCANCODE;
                 // Some clients send the full 0xE0xx scan code; normalize to the
                 // low byte plus the extended flag, which is what Windows wants.
@@ -167,7 +171,12 @@ impl WinInjector {
                     ay,
                 ))
             }
-            InputEvent::MouseButton { button, action, x, y } => {
+            InputEvent::MouseButton {
+                button,
+                action,
+                x,
+                y,
+            } => {
                 let down = matches!(action, KeyAction::Down);
                 let (flag, data) = match (button, down) {
                     (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
@@ -193,8 +202,17 @@ impl WinInjector {
                     Some(mouse_input(flag, data, 0, 0))
                 }
             }
-            InputEvent::MouseWheel { delta, horizontal, x, y } => {
-                let flag = if *horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL };
+            InputEvent::MouseWheel {
+                delta,
+                horizontal,
+                x,
+                y,
+            } => {
+                let flag = if *horizontal {
+                    MOUSEEVENTF_HWHEEL
+                } else {
+                    MOUSEEVENTF_WHEEL
+                };
                 let data = *delta as i32 as u32;
                 if with_move {
                     let (ax, ay) = self.to_virtual_abs(*x, *y);
@@ -276,7 +294,12 @@ mod tests {
     use super::*;
     use directdesk_shared::geometry::to_norm;
 
-    const SINGLE: VirtualScreen = VirtualScreen { left: 0, top: 0, width: 1920, height: 1080 };
+    const SINGLE: VirtualScreen = VirtualScreen {
+        left: 0,
+        top: 0,
+        width: 1920,
+        height: 1080,
+    };
 
     #[test]
     fn single_monitor_corners_map_to_extremes() {
@@ -305,7 +328,12 @@ mod tests {
     fn secondary_monitor_offsets_into_its_own_half() {
         // Two 1920x1080 monitors side by side; we capture the RIGHT one, whose
         // origin is x=1920 in a 3840-wide virtual desktop.
-        let screen = VirtualScreen { left: 0, top: 0, width: 3840, height: 1080 };
+        let screen = VirtualScreen {
+            left: 0,
+            top: 0,
+            width: 3840,
+            height: 1080,
+        };
         let frame = (1920, 1080);
         let (x0, _) = norm_to_virtual_abs(0, 0, frame, (1920, 0), screen);
         let (x1, _) = norm_to_virtual_abs(u16::MAX, 0, frame, (1920, 0), screen);
@@ -316,7 +344,12 @@ mod tests {
     #[test]
     fn negative_origin_monitor_maps_into_range() {
         // Left-hand monitor at x=-1920 in a 3840-wide desktop starting at -1920.
-        let screen = VirtualScreen { left: -1920, top: 0, width: 3840, height: 1080 };
+        let screen = VirtualScreen {
+            left: -1920,
+            top: 0,
+            width: 3840,
+            height: 1080,
+        };
         let frame = (1920, 1080);
         let (x0, _) = norm_to_virtual_abs(0, 0, frame, (-1920, 0), screen);
         let (x1, _) = norm_to_virtual_abs(u16::MAX, 0, frame, (-1920, 0), screen);
@@ -327,7 +360,12 @@ mod tests {
     #[test]
     fn roundtrip_pixel_to_abs_is_within_one_pixel() {
         let frame = (2560u32, 1440u32);
-        let screen = VirtualScreen { left: 0, top: 0, width: 2560, height: 1440 };
+        let screen = VirtualScreen {
+            left: 0,
+            top: 0,
+            width: 2560,
+            height: 1440,
+        };
         for px in (0..2560u32).step_by(97) {
             let n = to_norm(px, frame.0);
             let (ax, _) = norm_to_virtual_abs(n, 0, frame, (0, 0), screen);
@@ -339,7 +377,12 @@ mod tests {
 
     #[test]
     fn degenerate_screen_does_not_divide_by_zero() {
-        let screen = VirtualScreen { left: 0, top: 0, width: 1, height: 1 };
+        let screen = VirtualScreen {
+            left: 0,
+            top: 0,
+            width: 1,
+            height: 1,
+        };
         let (x, y) = norm_to_virtual_abs(30000, 30000, (1, 1), (0, 0), screen);
         assert!((0..=65535).contains(&x) && (0..=65535).contains(&y));
     }
@@ -350,15 +393,27 @@ mod tests {
         // real desktop: exercise HeldInput exactly as inject() does.
         let mut held = HeldInput::new();
         let evs = [
-            InputEvent::Key { scan_code: 0x2A, extended: false, action: KeyAction::Down },
-            InputEvent::Key { scan_code: 0x1D, extended: true, action: KeyAction::Down },
+            InputEvent::Key {
+                scan_code: 0x2A,
+                extended: false,
+                action: KeyAction::Down,
+            },
+            InputEvent::Key {
+                scan_code: 0x1D,
+                extended: true,
+                action: KeyAction::Down,
+            },
             InputEvent::MouseButton {
                 button: MouseButton::Left,
                 action: KeyAction::Down,
                 x: 1,
                 y: 1,
             },
-            InputEvent::Key { scan_code: 0x2A, extended: false, action: KeyAction::Up },
+            InputEvent::Key {
+                scan_code: 0x2A,
+                extended: false,
+                action: KeyAction::Up,
+            },
         ];
         for e in &evs {
             assert!(directdesk_shared::input::validate_event(e).is_ok());
@@ -369,8 +424,13 @@ mod tests {
         assert!(held.is_empty());
         assert!(rel.iter().all(|e| matches!(
             e,
-            InputEvent::Key { action: KeyAction::Up, .. }
-                | InputEvent::MouseButton { action: KeyAction::Up, .. }
+            InputEvent::Key {
+                action: KeyAction::Up,
+                ..
+            } | InputEvent::MouseButton {
+                action: KeyAction::Up,
+                ..
+            }
         )));
     }
 
@@ -383,7 +443,11 @@ mod tests {
             screen: SINGLE,
             injected: 0,
         };
-        let ev = InputEvent::Key { scan_code: 0xE04D, extended: false, action: KeyAction::Down };
+        let ev = InputEvent::Key {
+            scan_code: 0xE04D,
+            extended: false,
+            action: KeyAction::Down,
+        };
         let input = inj.build(&ev, false).unwrap();
         // SAFETY: we just built this as a keyboard INPUT.
         let ki = unsafe { input.Anonymous.ki };
@@ -402,7 +466,12 @@ mod tests {
             screen: SINGLE,
             injected: 0,
         };
-        let ev = InputEvent::MouseWheel { delta: -120, horizontal: false, x: 0, y: 0 };
+        let ev = InputEvent::MouseWheel {
+            delta: -120,
+            horizontal: false,
+            x: 0,
+            y: 0,
+        };
         let input = inj.build(&ev, false).unwrap();
         // SAFETY: we just built this as a mouse INPUT.
         let mi = unsafe { input.Anonymous.mi };
@@ -419,8 +488,16 @@ mod tests {
             screen: SINGLE,
             injected: 0,
         };
-        for (btn, want) in [(MouseButton::X1, XBUTTON1 as u32), (MouseButton::X2, XBUTTON2 as u32)] {
-            let ev = InputEvent::MouseButton { button: btn, action: KeyAction::Down, x: 0, y: 0 };
+        for (btn, want) in [
+            (MouseButton::X1, XBUTTON1 as u32),
+            (MouseButton::X2, XBUTTON2 as u32),
+        ] {
+            let ev = InputEvent::MouseButton {
+                button: btn,
+                action: KeyAction::Down,
+                x: 0,
+                y: 0,
+            };
             let input = inj.build(&ev, false).unwrap();
             // SAFETY: we just built this as a mouse INPUT.
             let mi = unsafe { input.Anonymous.mi };

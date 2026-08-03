@@ -101,7 +101,9 @@ pub struct TokioClock {
 impl TokioClock {
     /// A clock whose zero is now.
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { origin: tokio::time::Instant::now() })
+        Arc::new(Self {
+            origin: tokio::time::Instant::now(),
+        })
     }
 }
 
@@ -170,7 +172,10 @@ impl RaceClock for ManualClock {
     }
 
     fn sleep_until(&self, at_ms: u64) -> Sleep {
-        Box::pin(ManualSleep { at_ms, state: self.state.clone() })
+        Box::pin(ManualSleep {
+            at_ms,
+            state: self.state.clone(),
+        })
     }
 }
 
@@ -220,7 +225,11 @@ impl<T: 'static> Candidate<T> {
     where
         F: Future<Output = Result<T>> + Send + 'static,
     {
-        Self { route, name: name.into(), attempt: Box::pin(attempt) }
+        Self {
+            route,
+            name: name.into(),
+            attempt: Box::pin(attempt),
+        }
     }
 
     /// A candidate that is not implemented yet (hole punching, relay).
@@ -252,7 +261,14 @@ pub struct AttemptFailure {
 
 impl fmt::Display for AttemptFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({}) after {} ms: {}", self.name, self.route.label(), self.at_ms, self.detail)
+        write!(
+            f,
+            "{} ({}) after {} ms: {}",
+            self.name,
+            self.route.label(),
+            self.at_ms,
+            self.detail
+        )
     }
 }
 
@@ -331,10 +347,14 @@ impl RaceConfig {
     /// Reject configurations that cannot make a sensible decision.
     pub fn validate(&self, candidates: usize) -> Result<()> {
         if candidates == 0 {
-            return Err(Error::Invalid("route race needs at least one candidate".into()));
+            return Err(Error::Invalid(
+                "route race needs at least one candidate".into(),
+            ));
         }
         if self.overall_timeout_ms == 0 {
-            return Err(Error::Invalid("race overall timeout must be non-zero".into()));
+            return Err(Error::Invalid(
+                "race overall timeout must be non-zero".into(),
+            ));
         }
         // The last candidate must get a chance to start before the deadline,
         // otherwise the ladder silently degrades to a shorter one.
@@ -441,7 +461,10 @@ impl<T> Race<T> {
     /// The virtual time at which each candidate was started, `None` if it never
     /// was. Exposed for tests and for the diagnostics timeline.
     pub fn start_times_ms(&self) -> Vec<Option<u64>> {
-        self.slots.iter().map(|s| s.started_at_ms.map(|t| t - self.start_ms)).collect()
+        self.slots
+            .iter()
+            .map(|s| s.started_at_ms.map(|t| t - self.start_ms))
+            .collect()
     }
 
     /// Drop every attempt still in flight. Cancellation is just `Drop` on the
@@ -464,7 +487,13 @@ impl<T> Race<T> {
         let failures = std::mem::take(&mut self.failures);
         self.cancel_all();
         self.done = true;
-        Poll::Ready(Ok(RaceOutcome { value, route, name, elapsed_ms, failures }))
+        Poll::Ready(Ok(RaceOutcome {
+            value,
+            route,
+            name,
+            elapsed_ms,
+            failures,
+        }))
     }
 
     fn finish_err(
@@ -490,11 +519,18 @@ impl<T> Race<T> {
             }
         }
         failures.sort_by_key(|f| {
-            self.slots.iter().position(|s| s.name == f.name).unwrap_or(usize::MAX)
+            self.slots
+                .iter()
+                .position(|s| s.name == f.name)
+                .unwrap_or(usize::MAX)
         });
         self.cancel_all();
         self.done = true;
-        Poll::Ready(Err(RaceError { failures, elapsed_ms, timed_out }))
+        Poll::Ready(Err(RaceError {
+            failures,
+            elapsed_ms,
+            timed_out,
+        }))
     }
 }
 
@@ -514,7 +550,10 @@ impl<T: Unpin> Future for Race<T> {
             // point of the ladder is to stop descending.
             if this.winner.is_none() {
                 while this.next_index < this.slots.len() {
-                    let due = this.config.stagger_ms.saturating_mul(this.next_index as u64);
+                    let due = this
+                        .config
+                        .stagger_ms
+                        .saturating_mul(this.next_index as u64);
                     if elapsed < due {
                         break;
                     }
@@ -574,13 +613,13 @@ impl<T: Unpin> Future for Race<T> {
                 if this.config.grace_ms == 0 {
                     return this.finish_ok(elapsed);
                 }
-                let deadline = *this.grace_deadline_ms.get_or_insert(now + this.config.grace_ms);
+                let deadline = *this
+                    .grace_deadline_ms
+                    .get_or_insert(now + this.config.grace_ms);
                 if now >= deadline {
                     return this.finish_ok(elapsed);
                 }
-            } else if this.next_index == this.slots.len()
-                && this.slots.iter().all(|s| s.finished)
-            {
+            } else if this.next_index == this.slots.len() && this.slots.iter().all(|s| s.finished) {
                 return this.finish_err(elapsed, false);
             }
 
@@ -597,9 +636,11 @@ impl<T: Unpin> Future for Race<T> {
             //        window, or the overall deadline.
             let mut wake_at = this.start_ms + this.config.overall_timeout_ms;
             if this.winner.is_none() && this.next_index < this.slots.len() {
-                let due = this
-                    .start_ms
-                    .saturating_add(this.config.stagger_ms.saturating_mul(this.next_index as u64));
+                let due = this.start_ms.saturating_add(
+                    this.config
+                        .stagger_ms
+                        .saturating_mul(this.next_index as u64),
+                );
                 wake_at = wake_at.min(due);
             }
             if let Some(d) = this.grace_deadline_ms {
@@ -737,7 +778,11 @@ mod tests {
 
     impl Script {
         fn new(clock: Arc<ManualClock>) -> Self {
-            Self { clock, drops: Arc::new(AtomicU64::new(0)), first_polls: Vec::new() }
+            Self {
+                clock,
+                drops: Arc::new(AtomicU64::new(0)),
+                first_polls: Vec::new(),
+            }
         }
 
         fn at(
@@ -782,9 +827,19 @@ mod tests {
         let c = RaceConfig::default();
         assert!(c.validate(5).is_ok());
         assert!(c.validate(0).is_err(), "no candidates is a caller bug");
-        assert!(RaceConfig { overall_timeout_ms: 0, ..c }.validate(5).is_err());
+        assert!(RaceConfig {
+            overall_timeout_ms: 0,
+            ..c
+        }
+        .validate(5)
+        .is_err());
         // A 250 ms stagger over 5 candidates needs a full second of headroom.
-        assert!(RaceConfig { overall_timeout_ms: 500, ..c }.validate(5).is_err());
+        assert!(RaceConfig {
+            overall_timeout_ms: 500,
+            ..c
+        }
+        .validate(5)
+        .is_err());
     }
 
     #[test]
@@ -793,7 +848,10 @@ mod tests {
         assert_eq!(LADDER[0].0, TransportRoute::DirectUdp);
         assert_eq!(LADDER[3].0, TransportRoute::DirectTcp);
         assert_eq!(LADDER[4].0, TransportRoute::Relayed);
-        assert!(!LADDER[4].0.is_direct(), "the relay rung must not claim to be direct");
+        assert!(
+            !LADDER[4].0.is_direct(),
+            "the relay rung must not claim to be direct"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -833,9 +891,21 @@ mod tests {
         let (_, out) = drive(&mut race, &clock, 5_000);
         out.expect("tcp should win");
 
-        assert_eq!(s.first_poll(0), Some(0), "the best candidate starts at once");
-        assert_eq!(s.first_poll(1), Some(250), "second candidate waits one stagger");
-        assert_eq!(s.first_poll(2), Some(500), "third candidate waits two staggers");
+        assert_eq!(
+            s.first_poll(0),
+            Some(0),
+            "the best candidate starts at once"
+        );
+        assert_eq!(
+            s.first_poll(1),
+            Some(250),
+            "second candidate waits one stagger"
+        );
+        assert_eq!(
+            s.first_poll(2),
+            Some(500),
+            "third candidate waits two staggers"
+        );
     }
 
     #[test]
@@ -856,7 +926,10 @@ mod tests {
         assert_eq!(outcome.route, TransportRoute::DirectTcp);
         assert_eq!(at, 1_300, "800 ms to connect plus a 500 ms grace window");
         // The hole-punch stub failed on the way; that belongs in diagnostics.
-        assert!(outcome.failures.iter().any(|f| f.route == TransportRoute::UdpHolePunched));
+        assert!(outcome
+            .failures
+            .iter()
+            .any(|f| f.route == TransportRoute::UdpHolePunched));
     }
 
     #[test]
@@ -876,7 +949,10 @@ mod tests {
         let outcome = out.expect("primary should win inside the grace window");
         assert_eq!(outcome.route, TransportRoute::DirectUdp);
         assert_eq!(at, 1_000, "resolves the instant the better route lands");
-        assert!(at < 1_300, "must not wait out the grace window it no longer needs");
+        assert!(
+            at < 1_300,
+            "must not wait out the grace window it no longer needs"
+        );
     }
 
     #[test]
@@ -890,13 +966,19 @@ mod tests {
         ];
         // Stagger off so the worse candidate is genuinely in flight and lands
         // *during* the grace window rather than never starting.
-        let cfg = RaceConfig { stagger_ms: 0, ..RaceConfig::default() };
+        let cfg = RaceConfig {
+            stagger_ms: 0,
+            ..RaceConfig::default()
+        };
         let mut race = race_with_clock(cands, cfg, clock.clone()).expect("build race");
         let (at, out) = drive(&mut race, &clock, 5_000);
         let outcome = out.expect("ipv6 should win");
         assert_eq!(outcome.route, TransportRoute::DirectIpv6);
         assert_eq!(outcome.value, "QUIC IPv6");
-        assert_eq!(at, 800, "300 ms + 500 ms grace for the still-running IPv4 attempt");
+        assert_eq!(
+            at, 800,
+            "300 ms + 500 ms grace for the still-running IPv4 attempt"
+        );
     }
 
     #[test]
@@ -938,8 +1020,14 @@ mod tests {
         // TCP was due at 500 ms and the relay at 750 ms, but IPv6 had already
         // connected by then. Descending the ladder past a working route is
         // exactly what this policy exists to prevent.
-        assert!(s.first_poll(2).is_none(), "the TCP rung must never have been started");
-        assert!(s.first_poll(3).is_none(), "the relay rung must never have been started");
+        assert!(
+            s.first_poll(2).is_none(),
+            "the TCP rung must never have been started"
+        );
+        assert!(
+            s.first_poll(3).is_none(),
+            "the relay rung must never have been started"
+        );
     }
 
     #[test]
@@ -959,7 +1047,11 @@ mod tests {
         out.expect("primary wins");
         // The winner's own future is dropped when it resolves; the two losers
         // are dropped by `cancel_all`, while the `Race` itself is still alive.
-        assert_eq!(drops.load(Ordering::SeqCst), 3, "every attempt future must be released");
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            3,
+            "every attempt future must be released"
+        );
     }
 
     #[test]
@@ -995,7 +1087,10 @@ mod tests {
         assert!(err.failures[2].detail.contains(NOT_IMPLEMENTED));
         assert!(err.failures[4].detail.contains(NOT_IMPLEMENTED));
         let text = err.to_string();
-        assert!(text.contains("QUIC IPv4") && text.contains("TCP/TLS fallback"), "{text}");
+        assert!(
+            text.contains("QUIC IPv4") && text.contains("TCP/TLS fallback"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1007,7 +1102,10 @@ mod tests {
             s.at(TransportRoute::DirectIpv6, "QUIC IPv6", 100, false),
             s.hangs(TransportRoute::DirectTcp, "TCP/TLS fallback"),
         ];
-        let cfg = RaceConfig { overall_timeout_ms: 2_000, ..RaceConfig::default() };
+        let cfg = RaceConfig {
+            overall_timeout_ms: 2_000,
+            ..RaceConfig::default()
+        };
         let mut race = race_with_clock(cands, cfg, clock.clone()).expect("build race");
         let (at, out) = drive(&mut race, &clock, 5_000);
         let err = out.expect_err("nothing connected");
@@ -1026,7 +1124,10 @@ mod tests {
             s.at(TransportRoute::DirectUdp, "QUIC IPv4", 1_000, true),
             s.at(TransportRoute::DirectTcp, "TCP/TLS fallback", 300, true),
         ];
-        let cfg = RaceConfig { grace_ms: 0, ..RaceConfig::default() };
+        let cfg = RaceConfig {
+            grace_ms: 0,
+            ..RaceConfig::default()
+        };
         let mut race = race_with_clock(cands, cfg, clock.clone()).expect("build race");
         let (at, out) = drive(&mut race, &clock, 5_000);
         assert_eq!(out.expect("tcp wins").route, TransportRoute::DirectTcp);
@@ -1042,7 +1143,10 @@ mod tests {
             s.hangs(TransportRoute::DirectIpv6, "QUIC IPv6"),
             s.at(TransportRoute::DirectTcp, "TCP/TLS fallback", 50, true),
         ];
-        let cfg = RaceConfig { stagger_ms: 0, ..RaceConfig::default() };
+        let cfg = RaceConfig {
+            stagger_ms: 0,
+            ..RaceConfig::default()
+        };
         let mut race = race_with_clock(cands, cfg, clock.clone()).expect("build race");
         let (_, out) = drive(&mut race, &clock, 5_000);
         out.expect("tcp wins");
@@ -1091,7 +1195,10 @@ mod tests {
     fn stubs_fail_immediately_and_name_themselves() {
         let clock = ManualClock::new();
         let cands: Vec<Candidate<&'static str>> = vec![hole_punch_stub(), relay_stub()];
-        let cfg = RaceConfig { stagger_ms: 0, ..RaceConfig::default() };
+        let cfg = RaceConfig {
+            stagger_ms: 0,
+            ..RaceConfig::default()
+        };
         let mut race = race_with_clock(cands, cfg, clock.clone()).expect("build race");
         let (at, out) = drive(&mut race, &clock, 1_000);
         let err = out.expect_err("stubs cannot connect");
@@ -1110,10 +1217,14 @@ mod tests {
         let cands: Vec<Candidate<&'static str>> = vec![
             Candidate::new(TransportRoute::DirectUdp, "QUIC IPv4", async { Ok("udp") }),
             hole_punch_stub(),
-            Candidate::new(TransportRoute::DirectTcp, "TCP/TLS fallback", async { Ok("tcp") }),
+            Candidate::new(TransportRoute::DirectTcp, "TCP/TLS fallback", async {
+                Ok("tcp")
+            }),
             relay_stub(),
         ];
-        let outcome = race_routes(cands, RaceConfig::default()).await.expect("udp wins");
+        let outcome = race_routes(cands, RaceConfig::default())
+            .await
+            .expect("udp wins");
         assert_eq!(outcome.route, TransportRoute::DirectUdp);
         assert_eq!(outcome.value, "udp");
         // Only the top rung ran, so nothing failed and nothing was staggered in.
@@ -1128,8 +1239,13 @@ mod tests {
             Candidate::unavailable(TransportRoute::DirectTcp, "TCP/TLS fallback", "refused"),
             relay_stub(),
         ];
-        let cfg = RaceConfig { stagger_ms: 0, ..RaceConfig::default() };
-        let err = race_routes(cands, cfg).await.expect_err("nothing can connect");
+        let cfg = RaceConfig {
+            stagger_ms: 0,
+            ..RaceConfig::default()
+        };
+        let err = race_routes(cands, cfg)
+            .await
+            .expect_err("nothing can connect");
         let text = err.to_string();
         assert!(text.contains("no udp here"), "{text}");
         assert!(text.contains("refused"), "{text}");

@@ -96,7 +96,10 @@ mod tests {
 
         let mut corrupt = p.clone();
         corrupt[HASH_LEN + 3] ^= 0xFF;
-        assert!(!verify_payload(7, &corrupt), "body corruption must fail the hash");
+        assert!(
+            !verify_payload(7, &corrupt),
+            "body corruption must fail the hash"
+        );
 
         // Fragments concatenated out of order: swap two halves of the body.
         let mut swapped = p.clone();

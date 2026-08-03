@@ -13,13 +13,12 @@
 use std::sync::Arc;
 
 use directdesk_client::config::ClientConfig;
-use directdesk_client::net::{self, ConnectParams};
+use directdesk_client::connect::{ConnectSupervisor, StreamCaps};
 use directdesk_client::renderer::FrameSlot;
 use directdesk_client::session::{ClientSession, TransportEndpoints};
 use directdesk_client::ui::{AppInit, ClientApp, SourceMode};
 use directdesk_client::{decoder, pipeline};
-use directdesk_shared::crypto::storage::DpapiFileStore;
-use tokio::sync::watch;
+use directdesk_shared::crypto::storage::{DpapiFileStore, SecretStore};
 
 const USAGE: &str = "\
 DirectDeskClient — DirectDesk remote desktop client
@@ -67,7 +66,9 @@ impl Default for Args {
 /// Consume the value that follows `argv[*i]`, advancing the cursor.
 fn value_after(argv: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     *i += 1;
-    argv.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value"))
+    argv.get(*i)
+        .cloned()
+        .ok_or_else(|| format!("{flag} needs a value"))
 }
 
 fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -128,6 +129,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut config = ClientConfig::load();
+    // An explicit `--host` both pre-fills the field and auto-triggers a connect.
+    let host_given = args.host.is_some();
     if let Some(host) = args.host {
         config.host_address = host;
     }
@@ -141,53 +144,64 @@ fn main() -> anyhow::Result<()> {
     let (session, transport) = ClientSession::new();
     let slot = Arc::new(FrameSlot::new());
 
-    let mode = if args.loopback_demo { SourceMode::LoopbackDemo } else { SourceMode::Live };
+    let mode = if args.loopback_demo {
+        SourceMode::LoopbackDemo
+    } else {
+        SourceMode::Live
+    };
 
-    // In Live mode with a configured host, spawn the real transport driver on a
-    // dedicated tokio runtime; it claims the transport endpoints. Its lifetime
-    // is tied to `driver`, whose shutdown signal is raised once the window
-    // closes. `--loopback-demo` is untouched: it has no transport at all.
-    let mut driver: Option<NetDriver> = None;
-    let (transport_for_app, transport_attached) = match mode {
+    // One long-lived runtime shared by the connect supervisor for the whole app.
+    // The supervisor holds only a `Handle`; this owns the worker threads and is
+    // dropped (shutting the runtime down) once the window closes.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    // The name shown on the host: a remembered name wins, else the machine name.
+    let display_name = {
+        let saved = config.display_name.trim();
+        if saved.is_empty() {
+            client_display_name()
+        } else {
+            saved.chars().filter(|c| !c.is_control()).take(64).collect()
+        }
+    };
+
+    // Build the connect supervisor for Live mode. `--loopback-demo` has no
+    // transport at all; if the secret store cannot be opened we keep the
+    // channels alive (so the UI still runs) but Connect stays disabled.
+    let (supervisor, transport_for_app) = match mode {
         SourceMode::LoopbackDemo => {
             tracing::warn!(
                 "--loopback-demo: synthetic frames at {} fps; decoder and network are BYPASSED",
                 args.demo_fps
             );
             spawn_input_sink(transport);
-            (None, false)
-        }
-        SourceMode::Live if config.host_address.trim().is_empty() => {
-            // No host configured: hold the channels open so they stay valid, and
-            // let the connect screen prompt for an address. (The connect button
-            // cannot yet trigger the driver — see the note in the return.)
-            (Some(transport), false)
+            (None, None)
         }
         SourceMode::Live => match DpapiFileStore::client() {
             Ok(store) => {
-                let params = build_connect_params(&config, args.pair_code.clone());
-                let (shutdown_tx, shutdown_rx) = watch::channel(false);
-                let store: Arc<dyn directdesk_shared::crypto::storage::SecretStore> =
-                    Arc::new(store);
-                let handle = std::thread::Builder::new()
-                    .name("directdesk-net".into())
-                    .spawn(move || {
-                        let rt = tokio::runtime::Builder::new_multi_thread()
-                            .enable_all()
-                            .build()
-                            .expect("build tokio runtime");
-                        rt.block_on(net::run_client(transport, params, store, shutdown_rx));
-                    })
-                    .expect("spawn transport thread");
-                driver = Some(NetDriver { shutdown: shutdown_tx, handle });
-                (None, true)
+                let store: Arc<dyn SecretStore> = Arc::new(store);
+                let supervisor = ConnectSupervisor::new(
+                    runtime.handle().clone(),
+                    store,
+                    transport,
+                    StreamCaps::default(),
+                );
+                (Some(supervisor), None)
             }
             Err(e) => {
                 tracing::error!("secret store unavailable ({e}); transport disabled");
-                (Some(transport), false)
+                (None, Some(transport))
             }
         },
     };
+
+    // An explicit CLI `--host` auto-triggers one connect on the first frame; a
+    // merely-remembered host just pre-fills the form. Needs a live supervisor.
+    let auto_connect = host_given && supervisor.is_some();
+    let initial_pair_code = args.pair_code.clone();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -208,7 +222,9 @@ fn main() -> anyhow::Result<()> {
             let ctx = cc.egui_ctx.clone();
             let repaint = move || ctx.request_repaint();
             let pipeline = match mode {
-                SourceMode::LoopbackDemo => pipeline::spawn_demo_source(slot.clone(), demo_fps, repaint),
+                SourceMode::LoopbackDemo => {
+                    pipeline::spawn_demo_source(slot.clone(), demo_fps, repaint)
+                }
                 SourceMode::Live => pipeline::spawn_decode_thread(video_rx, slot.clone(), repaint),
             };
             Ok(Box::new(ClientApp::new(
@@ -220,7 +236,10 @@ fn main() -> anyhow::Result<()> {
                     slot,
                     pipeline,
                     mode,
-                    transport_attached,
+                    supervisor,
+                    display_name,
+                    initial_pair_code,
+                    auto_connect,
                     capture_on_start,
                 },
             )))
@@ -228,36 +247,12 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
 
-    // The window has closed: stop the transport driver and let it drain.
-    if let Some(driver) = driver {
-        let _ = driver.shutdown.send(true);
-        let _ = driver.handle.join();
-    }
+    // The window has closed and `ClientApp` (with the supervisor) has been
+    // dropped, cancelling any live connection. Drop the runtime to stop its
+    // worker threads.
+    drop(runtime);
 
     Ok(())
-}
-
-/// Handle to the background transport runtime, so the window-close path can stop
-/// it cleanly rather than leaking the thread.
-struct NetDriver {
-    shutdown: watch::Sender<bool>,
-    handle: std::thread::JoinHandle<()>,
-}
-
-/// Assemble the connect parameters the transport driver needs from persisted
-/// config plus the optional one-time pairing code.
-fn build_connect_params(config: &ClientConfig, pair_code: Option<String>) -> ConnectParams {
-    ConnectParams {
-        host: config.host_address.clone(),
-        udp_port: config.udp_port,
-        tcp_port: config.tcp_port,
-        pairing_code: pair_code,
-        display_name: client_display_name(),
-        quality: config.quality_mode,
-        max_width: 3840,
-        max_height: 2160,
-        preferred_fps: 60,
-    }
 }
 
 /// A friendly name for this client, shown on the host after pairing. Derived
@@ -267,11 +262,7 @@ fn client_display_name() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "DirectDeskClient".to_string());
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(64)
-        .collect();
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
     if cleaned.trim().is_empty() {
         "DirectDeskClient".to_string()
     } else {
@@ -304,7 +295,14 @@ fn spawn_input_sink(mut transport: TransportEndpoints) {
                     tracing::info!(keys, moves, buttons, wheels, releases, "input sink totals");
                 }
             }
-            tracing::info!(keys, moves, buttons, wheels, releases, "input sink final totals");
+            tracing::info!(
+                keys,
+                moves,
+                buttons,
+                wheels,
+                releases,
+                "input sink final totals"
+            );
         })
         .expect("spawn input sink");
 }

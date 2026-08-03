@@ -57,12 +57,16 @@ const HARMLESS_SCAN_CODE: u16 = 0x76;
 
 #[test]
 fn loopback_pair_authenticate_stream_and_inject() {
+    // Serialize with other real-capture tests: one GPU capture/encode session
+    // per machine (see directdesk_host::testsupport).
+    let _capture = directdesk_host::testsupport::CaptureLock::acquire();
     // The host logs why it dropped anything; with `--nocapture` that is the
     // difference between a number and a diagnosis.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("DIRECTDESK_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,directdesk_host=info")),
+            tracing_subscriber::EnvFilter::try_from_env("DIRECTDESK_LOG").unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("warn,directdesk_host=info")
+            }),
         )
         .try_init();
 
@@ -90,8 +94,11 @@ fn loopback_pair_authenticate_stream_and_inject() {
     let status = Arc::new(Mutex::new(StatusSnapshot::default()));
     let pairing = Arc::new(PairingSlot::new());
 
-    let host_cfg =
-        HostConfig { udp_port: bind.port(), target_fps: 60, ..HostConfig::default() };
+    let host_cfg = HostConfig {
+        udp_port: bind.port(),
+        target_fps: 60,
+        ..HostConfig::default()
+    };
     let mut net_cfg = NetConfig::from_host_config(&host_cfg);
     net_cfg.bind = bind;
 
@@ -158,9 +165,15 @@ fn loopback_pair_authenticate_stream_and_inject() {
     println!("fps          : {:.1}", outcome.fps());
     println!("largest frame: {} bytes", outcome.largest);
     println!("first NAL    : {:02x?}", outcome.first_head);
-    println!("host sent    : {} frames, {} bytes", snapshot.frames_sent, snapshot.bytes_sent);
+    println!(
+        "host sent    : {} frames, {} bytes",
+        snapshot.frames_sent, snapshot.bytes_sent
+    );
     println!("host skipped : {} stale frames", snapshot.frames_coalesced);
-    println!("host held    : {} frames (no room)", snapshot.frames_backpressured);
+    println!(
+        "host held    : {} frames (no room)",
+        snapshot.frames_backpressured
+    );
     println!("input inject : {injected} events");
     if let Some(live) = mid.lock().as_ref() {
         println!(
@@ -176,7 +189,10 @@ fn loopback_pair_authenticate_stream_and_inject() {
     }
     println!("capture fps  : {:.1}", snapshot.pipeline.fps_capture);
     println!("encode fps   : {:.1}", snapshot.pipeline.fps_encode);
-    println!("encoder      : {}", snapshot.encoder.clone().unwrap_or_default());
+    println!(
+        "encoder      : {}",
+        snapshot.encoder.clone().unwrap_or_default()
+    );
     println!("route        : {}", outcome.route.label());
     drain_events(&host);
 
@@ -192,13 +208,20 @@ fn loopback_pair_authenticate_stream_and_inject() {
         outcome.elapsed
     );
     assert!(outcome.bytes > 0, "no video bytes arrived");
-    assert!(outcome.keyframes > 0, "no keyframe arrived; the client could never decode");
+    assert!(
+        outcome.keyframes > 0,
+        "no keyframe arrived; the client could never decode"
+    );
     assert!(
         outcome.first_head.starts_with(&[0, 0, 0, 1]) || outcome.first_head.starts_with(&[0, 0, 1]),
         "the first keyframe is not Annex-B: {:02x?}",
         outcome.first_head
     );
-    assert_eq!(outcome.route, TransportRoute::DirectUdp, "the host must report its real route");
+    assert_eq!(
+        outcome.route,
+        TransportRoute::DirectUdp,
+        "the host must report its real route"
+    );
     assert!(injected > 0, "no client input reached the host's injector");
     assert!(
         snapshot.frames_sent > 0 && snapshot.bytes_sent > 0,
@@ -210,7 +233,10 @@ fn loopback_pair_authenticate_stream_and_inject() {
         pairing.snapshot(host.now_ms()).is_none(),
         "the pairing code must be burned after use"
     );
-    assert!(snapshot.trusted_clients >= 1, "the paired client was not persisted");
+    assert!(
+        snapshot.trusted_clients >= 1,
+        "the paired client was not persisted"
+    );
 
     host.shutdown();
     let _ = wait_for(Duration::from_secs(10), || host.is_stopped().then_some(()));
@@ -255,14 +281,21 @@ async fn client_session(addr: SocketAddr, code: &str) -> Result<Outcome> {
     quic::write_framed(&mut streams.control.0, &hello).await?;
     let host_hello: Hello = quic::read_framed(&mut streams.control.1, MAX_AUTH_MSG).await?;
     validate_hello(&host_hello)?;
-    assert!(host_hello.agent.starts_with("directdesk-host"), "{}", host_hello.agent);
+    assert!(
+        host_hello.agent.starts_with("directdesk-host"),
+        "{}",
+        host_hello.agent
+    );
 
     let exporter = quic::channel_binding(&conn)?;
 
     // The host always challenges first; which message we answer with picks the
     // pairing branch or the steady-state branch.
     let challenge: AuthMsg = quic::read_auth(&mut streams.control.1).await?;
-    assert!(matches!(challenge, AuthMsg::ServerChallenge { .. }), "{challenge:?}");
+    assert!(
+        matches!(challenge, AuthMsg::ServerChallenge { .. }),
+        "{challenge:?}"
+    );
 
     // -- pairing ----------------------------------------------------------
     let host_key = pair(&mut streams, &conn, &exporter, code, &recorder).await?;
@@ -279,7 +312,10 @@ async fn client_session(addr: SocketAddr, code: &str) -> Result<Outcome> {
     authenticator.on_server_auth(&server_auth)?;
     let ok: AuthMsg = quic::read_auth(&mut streams.control.1).await?;
     authenticator.on_auth_ok(&ok)?;
-    assert!(authenticator.is_complete(), "mutual authentication did not complete");
+    assert!(
+        authenticator.is_complete(),
+        "mutual authentication did not complete"
+    );
     println!("authenticated: mutual, channel-bound");
 
     // -- session ----------------------------------------------------------
@@ -339,7 +375,10 @@ async fn client_session(addr: SocketAddr, code: &str) -> Result<Outcome> {
         "quic rx      : {} datagrams, {} bytes",
         quic.udp_rx.datagrams, quic.udp_rx.bytes
     );
-    println!("quic lost    : {} of {} sent", quic.path.lost_packets, quic.path.sent_packets);
+    println!(
+        "quic lost    : {} of {} sent",
+        quic.path.lost_packets, quic.path.sent_packets
+    );
     println!("keyframe reqs: {}", session.keyframes_requested());
     println!("client drops : {}", session.frames_dropped_local());
 
@@ -385,7 +424,9 @@ async fn client_session(addr: SocketAddr, code: &str) -> Result<Outcome> {
     };
 
     // -- goodbye -----------------------------------------------------------
-    session.close_graceful("loopback test finished", Duration::from_secs(3)).await;
+    session
+        .close_graceful("loopback test finished", Duration::from_secs(3))
+        .await;
     endpoint.wait_idle().await;
     Ok(outcome)
 }
@@ -398,8 +439,7 @@ async fn pair(
     code: &str,
     recorder: &Arc<ObservedPin>,
 ) -> Result<[u8; 32]> {
-    let (mut client, start) =
-        PairingClient::start(&PairingCode::parse(code)?, exporter, 0)?;
+    let (mut client, start) = PairingClient::start(&PairingCode::parse(code)?, exporter, 0)?;
     quic::write_framed(&mut streams.control.0, &start).await?;
 
     let response: AuthMsg = quic::read_auth(&mut streams.control.1).await?;
@@ -414,9 +454,17 @@ async fn pair(
     // The pin the TLS layer saw must match the one the host claims — that
     // cross-check is what makes trust-on-pair safe.
     let observed = quic::peer_spki_pin(conn)?;
-    assert_eq!(recorder.get(), Some(observed), "the recorder and the connection disagree");
+    assert_eq!(
+        recorder.get(),
+        Some(observed),
+        "the recorder and the connection disagree"
+    );
     let host_peer = client.accept_pair_complete(&complete, &observed, 0)?;
-    println!("paired with  : {} ({})", host_peer.name, host_peer.fingerprint_short());
+    println!(
+        "paired with  : {} ({})",
+        host_peer.name,
+        host_peer.fingerprint_short()
+    );
     Ok(host_peer.ed25519_pub)
 }
 

@@ -19,9 +19,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
     ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_CPU_ACCESS_READ, D3D11_FORMAT_SUPPORT_RENDER_TARGET, D3D11_FORMAT_SUPPORT_SHADER_SAMPLE,
-    D3D11_FORMAT_SUPPORT_TEXTURE2D, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_FORMAT_SUPPORT_TEXTURE2D, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
@@ -53,7 +52,12 @@ pub struct GpuConverter {
 }
 
 impl GpuConverter {
-    pub fn new(device: &ID3D11Device, context: &ID3D11DeviceContext, w: u32, h: u32) -> Result<Self> {
+    pub fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        w: u32,
+        h: u32,
+    ) -> Result<Self> {
         if w == 0 || h == 0 {
             return Err(Error::Encoder("converter needs non-zero dimensions".into()));
         }
@@ -76,10 +80,16 @@ impl GpuConverter {
 
         let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-            InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+            InputFrameRate: DXGI_RATIONAL {
+                Numerator: 60,
+                Denominator: 1,
+            },
             InputWidth: w,
             InputHeight: h,
-            OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+            OutputFrameRate: DXGI_RATIONAL {
+                Numerator: 60,
+                Denominator: 1,
+            },
             OutputWidth: w,
             OutputHeight: h,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
@@ -206,16 +216,11 @@ impl GpuConverter {
             // SAFETY: desc fully initialized (MipSlice defaults to 0).
             unsafe {
                 self.video_device
-                    .CreateVideoProcessorOutputView(
-                        &tex,
-                        &self.enumerator,
-                        &desc,
-                        Some(&mut view),
-                    )
+                    .CreateVideoProcessorOutputView(&tex, &self.enumerator, &desc, Some(&mut view))
                     .map_err(|e| Error::Encoder(format!("CreateVideoProcessorOutputView: {e}")))?;
             }
-            let view = view
-                .ok_or_else(|| Error::Encoder("null video processor output view".into()))?;
+            let view =
+                view.ok_or_else(|| Error::Encoder("null video processor output view".into()))?;
             self.ring.push((tex, view));
         }
         Ok(())
@@ -317,10 +322,21 @@ fn create_nv12_texture(
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_NV12,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: if staging { D3D11_USAGE_STAGING } else { D3D11_USAGE_DEFAULT },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: if staging {
+                D3D11_USAGE_STAGING
+            } else {
+                D3D11_USAGE_DEFAULT
+            },
             BindFlags: bind,
-            CPUAccessFlags: if staging { D3D11_CPU_ACCESS_READ.0 as u32 } else { 0 },
+            CPUAccessFlags: if staging {
+                D3D11_CPU_ACCESS_READ.0 as u32
+            } else {
+                0
+            },
             MiscFlags: 0,
         };
         let mut tex: Option<ID3D11Texture2D> = None;
@@ -339,7 +355,9 @@ fn create_nv12_texture(
             Err(e) => last = format!("bind {bind:#x}: {e}"),
         }
     }
-    Err(Error::Encoder(format!("CreateTexture2D(NV12) {w}x{h}: {last}")))
+    Err(Error::Encoder(format!(
+        "CreateTexture2D(NV12) {w}x{h}: {last}"
+    )))
 }
 
 /// Size in bytes of a tightly-packed NV12 image.
@@ -353,7 +371,13 @@ pub const fn nv12_len(w: u32, h: u32) -> usize {
 /// overwritten with a tightly-packed NV12 image: a `w * h` luma plane followed
 /// by a `w * (h / 2)` interleaved Cb/Cr plane. Odd `w`/`h` are handled by
 /// clamping the 2x2 chroma sample to the last valid pixel.
-pub fn bgra_to_nv12(src: &[u8], src_stride: usize, w: u32, h: u32, dst: &mut Vec<u8>) -> Result<()> {
+pub fn bgra_to_nv12(
+    src: &[u8],
+    src_stride: usize,
+    w: u32,
+    h: u32,
+    dst: &mut Vec<u8>,
+) -> Result<()> {
     let (wu, hu) = (w as usize, h as usize);
     if wu == 0 || hu == 0 {
         return Err(Error::Encoder("nv12 conversion needs non-zero size".into()));
@@ -452,7 +476,10 @@ mod tests {
         bgra_to_nv12(&solid(16, 16, 255, 255, 255), 16 * 4, 16, 16, &mut dst).unwrap();
         assert_eq!(dst[0], 235, "white luma must be 235 (limited range)");
         assert!((dst[16 * 16] as i32 - 128).abs() <= 1, "white Cb neutral");
-        assert!((dst[16 * 16 + 1] as i32 - 128).abs() <= 1, "white Cr neutral");
+        assert!(
+            (dst[16 * 16 + 1] as i32 - 128).abs() <= 1,
+            "white Cr neutral"
+        );
     }
 
     #[test]

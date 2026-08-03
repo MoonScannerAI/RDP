@@ -161,7 +161,10 @@ pub fn parse_binding_response(buf: &[u8], expect: &TransactionId) -> Result<Sock
     let body_len = declared as usize;
     let available = buf.len() - HEADER_LEN;
     if body_len > available {
-        return Err(StunError::BadLength { declared: body_len, available });
+        return Err(StunError::BadLength {
+            declared: body_len,
+            available,
+        });
     }
     let mut txid = [0u8; 12];
     txid.copy_from_slice(&buf[8..20]);
@@ -171,7 +174,9 @@ pub fn parse_binding_response(buf: &[u8], expect: &TransactionId) -> Result<Sock
 
     match msg_type {
         TYPE_BINDING_SUCCESS => {}
-        TYPE_BINDING_ERROR => return Err(parse_error_code(&buf[HEADER_LEN..HEADER_LEN + body_len])),
+        TYPE_BINDING_ERROR => {
+            return Err(parse_error_code(&buf[HEADER_LEN..HEADER_LEN + body_len]))
+        }
         other => return Err(StunError::UnexpectedType(other)),
     }
 
@@ -248,7 +253,9 @@ impl<'a> Iterator for AttrIter<'a> {
 /// concatenated with the transaction ID (IPv6).
 fn decode_address(value: &[u8], xor_txid: Option<&[u8; 12]>) -> Result<SocketAddr, StunError> {
     if value.len() < 4 {
-        return Err(StunError::TruncatedAttribute { attr: ATTR_XOR_MAPPED_ADDRESS });
+        return Err(StunError::TruncatedAttribute {
+            attr: ATTR_XOR_MAPPED_ADDRESS,
+        });
     }
     let family = value[1];
     let raw_port = u16::from_be_bytes([value[2], value[3]]);
@@ -261,7 +268,9 @@ fn decode_address(value: &[u8], xor_txid: Option<&[u8; 12]>) -> Result<SocketAdd
     match family {
         FAMILY_V4 => {
             if value.len() < 8 {
-                return Err(StunError::TruncatedAttribute { attr: ATTR_XOR_MAPPED_ADDRESS });
+                return Err(StunError::TruncatedAttribute {
+                    attr: ATTR_XOR_MAPPED_ADDRESS,
+                });
             }
             let mut octets = [0u8; 4];
             octets.copy_from_slice(&value[4..8]);
@@ -274,7 +283,9 @@ fn decode_address(value: &[u8], xor_txid: Option<&[u8; 12]>) -> Result<SocketAdd
         }
         FAMILY_V6 => {
             if value.len() < 20 {
-                return Err(StunError::TruncatedAttribute { attr: ATTR_XOR_MAPPED_ADDRESS });
+                return Err(StunError::TruncatedAttribute {
+                    attr: ATTR_XOR_MAPPED_ADDRESS,
+                });
             }
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&value[4..20]);
@@ -302,12 +313,17 @@ fn parse_error_code(body: &[u8]) -> StunError {
             let code = class * 100 + number.min(99);
             // Reason is UTF-8 per RFC 5389 and comes from a stranger: bound it
             // and replace anything invalid rather than trusting it.
-            let reason: String =
-                String::from_utf8_lossy(&value[4..]).chars().take(128).collect();
+            let reason: String = String::from_utf8_lossy(&value[4..])
+                .chars()
+                .take(128)
+                .collect();
             return StunError::ErrorResponse { code, reason };
         }
     }
-    StunError::ErrorResponse { code: 0, reason: "no error-code attribute".into() }
+    StunError::ErrorResponse {
+        code: 0,
+        reason: "no error-code attribute".into(),
+    }
 }
 
 #[cfg(test)]
@@ -315,8 +331,9 @@ mod tests {
     use super::*;
 
     /// RFC 5769 §2.1 sample transaction ID, reused by the sample responses.
-    const RFC5769_TXID: [u8; 12] =
-        [0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae];
+    const RFC5769_TXID: [u8; 12] = [
+        0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
+    ];
 
     /// Build a binding success response carrying one attribute.
     fn response_with(txid: &[u8; 12], attr_type: u16, value: &[u8]) -> Vec<u8> {
@@ -341,7 +358,10 @@ mod tests {
         assert_eq!(req.len(), HEADER_LEN);
         assert_eq!(u16::from_be_bytes([req[0], req[1]]), TYPE_BINDING_REQUEST);
         assert_eq!(u16::from_be_bytes([req[2], req[3]]), 0);
-        assert_eq!(u32::from_be_bytes([req[4], req[5], req[6], req[7]]), MAGIC_COOKIE);
+        assert_eq!(
+            u32::from_be_bytes([req[4], req[5], req[6], req[7]]),
+            MAGIC_COOKIE
+        );
         assert_eq!(&req[8..20], &RFC5769_TXID);
         assert_eq!(peek_transaction_id(&req), Some(txid));
     }
@@ -359,8 +379,7 @@ mod tests {
         // Exact XOR-MAPPED-ADDRESS bytes from RFC 5769 §2.2: 192.0.2.1:32853.
         let value = [0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43];
         let msg = response_with(&RFC5769_TXID, ATTR_XOR_MAPPED_ADDRESS, &value);
-        let got =
-            parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
+        let got = parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
         assert_eq!(got, "192.0.2.1:32853".parse::<SocketAddr>().unwrap());
     }
 
@@ -373,11 +392,12 @@ mod tests {
             0xf4, 0xb5, 0xbe, 0xd2, 0xb9, 0xd9,
         ];
         let msg = response_with(&RFC5769_TXID, ATTR_XOR_MAPPED_ADDRESS, &value);
-        let got =
-            parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
+        let got = parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
         assert_eq!(
             got,
-            "[2001:db8:1234:5678:11:2233:4455:6677]:32853".parse::<SocketAddr>().unwrap()
+            "[2001:db8:1234:5678:11:2233:4455:6677]:32853"
+                .parse::<SocketAddr>()
+                .unwrap()
         );
     }
 
@@ -386,8 +406,7 @@ mod tests {
         // Not XORed: 203.0.113.9:4711.
         let value = [0x00, 0x01, 0x12, 0x67, 203, 0, 113, 9];
         let msg = response_with(&RFC5769_TXID, ATTR_MAPPED_ADDRESS, &value);
-        let got =
-            parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
+        let got = parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
         assert_eq!(got, "203.0.113.9:4711".parse::<SocketAddr>().unwrap());
     }
 
@@ -412,8 +431,7 @@ mod tests {
         msg.extend_from_slice(&RFC5769_TXID);
         msg.extend_from_slice(&body);
 
-        let got =
-            parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
+        let got = parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
         assert_eq!(got, "192.0.2.1:32853".parse::<SocketAddr>().unwrap());
     }
 
@@ -437,8 +455,7 @@ mod tests {
         msg.extend_from_slice(&RFC5769_TXID);
         msg.extend_from_slice(&body);
 
-        let got =
-            parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
+        let got = parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap();
         assert_eq!(got, "192.0.2.1:32853".parse::<SocketAddr>().unwrap());
     }
 
@@ -447,7 +464,10 @@ mod tests {
         let value = [0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43];
         let msg = response_with(&RFC5769_TXID, ATTR_XOR_MAPPED_ADDRESS, &value);
         let other = TransactionId::from_bytes([9u8; 12]);
-        assert_eq!(parse_binding_response(&msg, &other), Err(StunError::TransactionMismatch));
+        assert_eq!(
+            parse_binding_response(&msg, &other),
+            Err(StunError::TransactionMismatch)
+        );
     }
 
     #[test]
@@ -480,7 +500,10 @@ mod tests {
 
         let mut msg = response_with(&RFC5769_TXID, ATTR_XOR_MAPPED_ADDRESS, &value);
         msg[3] = 13; // not a multiple of 4
-        assert_eq!(parse_binding_response(&msg, &txid), Err(StunError::UnalignedLength(13)));
+        assert_eq!(
+            parse_binding_response(&msg, &txid),
+            Err(StunError::UnalignedLength(13))
+        );
 
         let mut msg = response_with(&RFC5769_TXID, ATTR_XOR_MAPPED_ADDRESS, &value);
         msg[2] = 0x0f;
@@ -500,7 +523,9 @@ mod tests {
         msg[23] = 0xff;
         assert_eq!(
             parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)),
-            Err(StunError::TruncatedAttribute { attr: ATTR_XOR_MAPPED_ADDRESS })
+            Err(StunError::TruncatedAttribute {
+                attr: ATTR_XOR_MAPPED_ADDRESS
+            })
         );
     }
 
@@ -518,7 +543,10 @@ mod tests {
 
         let bad_family = [0x00, 0x07, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43];
         let msg = response_with(&RFC5769_TXID, ATTR_XOR_MAPPED_ADDRESS, &bad_family);
-        assert_eq!(parse_binding_response(&msg, &txid), Err(StunError::BadAddressFamily(0x07)));
+        assert_eq!(
+            parse_binding_response(&msg, &txid),
+            Err(StunError::BadAddressFamily(0x07))
+        );
     }
 
     #[test]
@@ -539,7 +567,13 @@ mod tests {
         msg[0..2].copy_from_slice(&TYPE_BINDING_ERROR.to_be_bytes());
         let err =
             parse_binding_response(&msg, &TransactionId::from_bytes(RFC5769_TXID)).unwrap_err();
-        assert_eq!(err, StunError::ErrorResponse { code: 400, reason: "Bad Request".into() });
+        assert_eq!(
+            err,
+            StunError::ErrorResponse {
+                code: 400,
+                reason: "Bad Request".into()
+            }
+        );
     }
 
     #[test]

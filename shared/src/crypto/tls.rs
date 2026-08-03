@@ -40,7 +40,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::crypto::identity::TlsIdentity;
-use crate::crypto::{SpkiHash, ct_eq, fingerprint_short, spki_sha256_from_cert_der};
+use crate::crypto::{ct_eq, fingerprint_short, spki_sha256_from_cert_der, SpkiHash};
 use crate::error::{Error, Result};
 use crate::protocol::ALPN;
 
@@ -114,14 +114,19 @@ impl std::fmt::Debug for PinningVerifier {
             ServerPinning::Pinned(p) => format!("pinned({})", fingerprint_short(p)),
             ServerPinning::TrustOnPair(_) => "trust-on-pair".to_string(),
         };
-        f.debug_struct("PinningVerifier").field("mode", &mode).finish()
+        f.debug_struct("PinningVerifier")
+            .field("mode", &mode)
+            .finish()
     }
 }
 
 impl PinningVerifier {
     /// Build a verifier for the given pinning policy.
     pub fn new(pinning: ServerPinning) -> Arc<Self> {
-        Arc::new(Self { pinning, provider: provider() })
+        Arc::new(Self {
+            pinning,
+            provider: provider(),
+        })
     }
 }
 
@@ -176,7 +181,9 @@ impl ServerCertVerifier for PinningVerifier {
         // QUIC is TLS 1.3 only, and our configs refuse 1.2, so reaching here
         // means something is badly misconfigured. Fail closed rather than
         // silently accepting a downgrade.
-        Err(rustls::Error::General("TLS 1.2 is not supported by DirectDesk".into()))
+        Err(rustls::Error::General(
+            "TLS 1.2 is not supported by DirectDesk".into(),
+        ))
     }
 
     fn verify_tls13_signature(
@@ -194,7 +201,9 @@ impl ServerCertVerifier for PinningVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -260,9 +269,9 @@ mod tests {
         let id = TlsIdentity::generate("host").unwrap();
         let v = PinningVerifier::new(ServerPinning::Pinned(*id.spki_sha256()));
         let cert = id.rustls_cert();
-        assert!(
-            v.verify_server_cert(&cert, &[], &sni().unwrap(), &[], unix_now()).is_ok()
-        );
+        assert!(v
+            .verify_server_cert(&cert, &[], &sni().unwrap(), &[], unix_now())
+            .is_ok());
     }
 
     #[test]
@@ -271,7 +280,9 @@ mod tests {
         let evil = TlsIdentity::generate("evil").unwrap();
         let v = PinningVerifier::new(ServerPinning::Pinned(*good.spki_sha256()));
         let cert = evil.rustls_cert();
-        assert!(v.verify_server_cert(&cert, &[], &sni().unwrap(), &[], unix_now()).is_err());
+        assert!(v
+            .verify_server_cert(&cert, &[], &sni().unwrap(), &[], unix_now())
+            .is_err());
     }
 
     #[test]
@@ -281,7 +292,9 @@ mod tests {
         let v = PinningVerifier::new(ServerPinning::Pinned(*id.spki_sha256()));
         let cert = id.rustls_cert();
         let chain = [other.rustls_cert()];
-        assert!(v.verify_server_cert(&cert, &chain, &sni().unwrap(), &[], unix_now()).is_err());
+        assert!(v
+            .verify_server_cert(&cert, &chain, &sni().unwrap(), &[], unix_now())
+            .is_err());
     }
 
     #[test]
@@ -289,7 +302,9 @@ mod tests {
         let id = TlsIdentity::generate("host").unwrap();
         let v = PinningVerifier::new(ServerPinning::Pinned(*id.spki_sha256()));
         let junk = CertificateDer::from(vec![0x30, 0x02, 0x01, 0x00]);
-        assert!(v.verify_server_cert(&junk, &[], &sni().unwrap(), &[], unix_now()).is_err());
+        assert!(v
+            .verify_server_cert(&junk, &[], &sni().unwrap(), &[], unix_now())
+            .is_err());
     }
 
     #[test]
@@ -300,7 +315,8 @@ mod tests {
         assert!(recorder.get().is_none());
 
         let cert = id.rustls_cert();
-        v.verify_server_cert(&cert, &[], &sni().unwrap(), &[], unix_now()).unwrap();
+        v.verify_server_cert(&cert, &[], &sni().unwrap(), &[], unix_now())
+            .unwrap();
         assert_eq!(recorder.get(), Some(*id.spki_sha256()));
 
         recorder.clear();

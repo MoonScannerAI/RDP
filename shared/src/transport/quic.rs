@@ -15,6 +15,19 @@
 //!   connection prober flags.
 //! - **Datagrams enabled** for video. The receive buffer is sized for several
 //!   frames' worth of fragments so a scheduling hiccup does not shred a frame.
+//! - **UDP socket buffers sized explicitly.** quinn's own `Endpoint::server`
+//!   and `Endpoint::client` bind a socket with the OS default `SO_SNDBUF`/
+//!   `SO_RCVBUF` — ~64 KiB on Windows. A 2560x1600 stream bursts a keyframe of
+//!   ~150 fragments (~180 KiB) in one scheduler slice; when the sender's or
+//!   receiver's poller is briefly starved, a 64 KiB buffer cannot hold the
+//!   burst and the kernel drops the overflow. Such a drop is invisible to
+//!   `Connection::stats().path.lost` when it happens on the send side (the
+//!   datagram was never a tracked packet), so a host watching only `loss` would
+//!   see a clean link. We build the socket ourselves with [`socket2`], set both
+//!   buffers to [`DEFAULT_UDP_SEND_BUFFER`] / [`DEFAULT_UDP_RECV_BUFFER`], and
+//!   hand the std socket to `Endpoint::new`. (On a *fast* path — loopback — the
+//!   default buffers already suffice; this hardening matters on real Wi-Fi/LTE
+//!   links where a stalled poller and a small buffer coincide.)
 //! - **BBR congestion control** ([`Congestion::Bbr`], the default). quinn 0.11
 //!   ships `quinn::congestion::BbrConfig`, so no fallback is needed — but
 //!   [`Congestion::Cubic`] and [`Congestion::NewReno`] remain selectable
@@ -37,14 +50,16 @@ use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::crypto::identity::TlsIdentity;
 use crate::crypto::tls::{self, ServerPinning};
-use crate::crypto::{EXPORTER_CONTEXT, EXPORTER_LABEL, Exporter};
+use crate::crypto::{Exporter, EXPORTER_CONTEXT, EXPORTER_LABEL};
 use crate::error::{Error, Result};
-use crate::protocol::{MAX_AUTH_MSG, MAX_CONTROL_MSG, decode_strict, encode_framed, parse_frame_len};
+use crate::protocol::{
+    decode_strict, encode_framed, parse_frame_len, MAX_AUTH_MSG, MAX_CONTROL_MSG,
+};
 
 /// Keep-alive interval. Also holds NAT mappings open.
 pub const DEFAULT_KEEP_ALIVE_MS: u64 = 5_000;
@@ -61,6 +76,18 @@ pub const DEFAULT_DATAGRAM_SEND_BUFFER: usize = 2 * 1024 * 1024;
 
 /// Conservative initial MTU. QUIC's PLPMTUD raises it from here.
 pub const DEFAULT_INITIAL_MTU: u16 = 1200;
+
+/// UDP socket send buffer (`SO_SNDBUF`). 4 MiB holds many frames' worth of
+/// fragments, so a burst from the encoder is absorbed by the kernel rather than
+/// dropped when the sender's poller cannot drain the socket in one slice. Far
+/// above the OS default (~64 KiB on Windows).
+pub const DEFAULT_UDP_SEND_BUFFER: usize = 4 * 1024 * 1024;
+
+/// UDP socket receive buffer (`SO_RCVBUF`). Same 4 MiB, for the mirror problem:
+/// a fast sender overruns a small receive buffer and the kernel discards
+/// datagrams before the receiver's poller reads them — a loss quinn never
+/// reports because the packet never reached it.
+pub const DEFAULT_UDP_RECV_BUFFER: usize = 4 * 1024 * 1024;
 
 /// Congestion controller selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -90,6 +117,11 @@ pub struct QuicParams {
     pub datagram_send_buffer: usize,
     /// Initial MTU guess.
     pub initial_mtu: u16,
+    /// UDP socket send buffer (`SO_SNDBUF`) in bytes. `0` leaves the OS default.
+    pub udp_send_buffer: usize,
+    /// UDP socket receive buffer (`SO_RCVBUF`) in bytes. `0` leaves the OS
+    /// default.
+    pub udp_recv_buffer: usize,
 }
 
 impl Default for QuicParams {
@@ -101,6 +133,8 @@ impl Default for QuicParams {
             datagram_recv_buffer: DEFAULT_DATAGRAM_RECV_BUFFER,
             datagram_send_buffer: DEFAULT_DATAGRAM_SEND_BUFFER,
             initial_mtu: DEFAULT_INITIAL_MTU,
+            udp_send_buffer: DEFAULT_UDP_SEND_BUFFER,
+            udp_recv_buffer: DEFAULT_UDP_RECV_BUFFER,
         }
     }
 }
@@ -117,7 +151,9 @@ impl QuicParams {
             ));
         }
         if self.initial_mtu < 1200 {
-            return Err(Error::Invalid("initial MTU below the QUIC minimum of 1200".into()));
+            return Err(Error::Invalid(
+                "initial MTU below the QUIC minimum of 1200".into(),
+            ));
         }
         Ok(())
     }
@@ -146,9 +182,7 @@ pub fn transport_config(params: &QuicParams) -> Result<Arc<quinn::TransportConfi
             tc.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
         }
         Congestion::NewReno => {
-            tc.congestion_controller_factory(Arc::new(
-                quinn::congestion::NewRenoConfig::default(),
-            ));
+            tc.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
         }
     }
 
@@ -186,7 +220,56 @@ pub fn server_endpoint(
     // session, and QUIC path validation makes that safe.
     cfg.migration(true);
 
-    Endpoint::server(cfg, bind).map_err(|e| Error::Transport(format!("bind {bind}: {e}")))
+    let socket = bind_udp_socket(bind, params)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Error::Transport("no tokio runtime for the QUIC endpoint".into()))?;
+    Endpoint::new(quinn::EndpointConfig::default(), Some(cfg), socket, runtime)
+        .map_err(|e| Error::Transport(format!("bind {bind}: {e}")))
+}
+
+/// Bind a UDP socket with the send/receive buffers `params` asks for.
+///
+/// This is the whole point of not using `Endpoint::server`/`client`: those bind
+/// a socket with the OS default buffers, and on Windows that default (~64 KiB)
+/// is far too small to hold a keyframe's worth of fragments. A fast sender then
+/// overruns the kernel buffer and the datagrams are dropped *before quinn sees
+/// them* — loss quinn cannot count. Buffer sizing is best-effort: the OS may
+/// clamp the request (and often doubles it for bookkeeping), so a failure to
+/// grow is logged, not fatal.
+fn bind_udp_socket(bind: SocketAddr, params: &QuicParams) -> Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| Error::Transport(format!("create UDP socket: {e}")))?;
+
+    // Match quinn's own dual-stack behaviour when binding the IPv6 wildcard, so
+    // an IPv4 client can still reach a `[::]`-bound host.
+    if bind.is_ipv6() && bind.ip().is_unspecified() {
+        let _ = socket.set_only_v6(false);
+    }
+
+    // Set buffers before bind. Best-effort; the OS may clamp to its own max.
+    if params.udp_send_buffer > 0 {
+        if let Err(e) = socket.set_send_buffer_size(params.udp_send_buffer) {
+            tracing::warn!(
+                "could not set UDP send buffer to {}: {e}",
+                params.udp_send_buffer
+            );
+        }
+    }
+    if params.udp_recv_buffer > 0 {
+        if let Err(e) = socket.set_recv_buffer_size(params.udp_recv_buffer) {
+            tracing::warn!(
+                "could not set UDP recv buffer to {}: {e}",
+                params.udp_recv_buffer
+            );
+        }
+    }
+
+    socket
+        .bind(&bind.into())
+        .map_err(|e| Error::Transport(format!("bind {bind}: {e}")))?;
+    Ok(socket.into())
 }
 
 /// Build a connecting (client) endpoint with a pinning policy baked in.
@@ -204,8 +287,11 @@ pub fn client_endpoint(
     let mut cfg = quinn::ClientConfig::new(Arc::new(quic_crypto));
     cfg.transport_config(transport_config(params)?);
 
-    let mut endpoint =
-        Endpoint::client(bind).map_err(|e| Error::Transport(format!("bind {bind}: {e}")))?;
+    let socket = bind_udp_socket(bind, params)?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Error::Transport("no tokio runtime for the QUIC endpoint".into()))?;
+    let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+        .map_err(|e| Error::Transport(format!("bind {bind}: {e}")))?;
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
 }
@@ -244,7 +330,9 @@ pub fn peer_spki_pin(conn: &Connection) -> Result<crate::crypto::SpkiHash> {
     let chain = identity
         .downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
         .map_err(|_| Error::Crypto("unexpected peer identity type".into()))?;
-    let first = chain.first().ok_or_else(|| Error::Crypto("empty certificate chain".into()))?;
+    let first = chain
+        .first()
+        .ok_or_else(|| Error::Crypto("empty certificate chain".into()))?;
     crate::crypto::spki_sha256_from_cert_der(first.as_ref())
 }
 
@@ -275,10 +363,7 @@ pub async fn write_framed<T: Serialize>(stream: &mut SendStream, msg: &T) -> Res
 ///
 /// The length prefix is validated by [`parse_frame_len`] *before* the body
 /// buffer is allocated, so a hostile 4-gigabyte prefix costs us nothing.
-pub async fn read_framed<T: DeserializeOwned>(
-    stream: &mut RecvStream,
-    limit: usize,
-) -> Result<T> {
+pub async fn read_framed<T: DeserializeOwned>(stream: &mut RecvStream, limit: usize) -> Result<T> {
     let mut prefix = [0u8; 4];
     stream
         .read_exact(&mut prefix)
@@ -331,10 +416,13 @@ impl std::fmt::Debug for SessionStreams {
 /// them: input starving behind a bulk transfer is a latency bug that only shows
 /// up under load.
 pub async fn open_streams(conn: &Connection) -> Result<SessionStreams> {
-    let control = open_tagged(conn, crate::protocol::Channel::Control, super::PRIORITY_CONTROL)
-        .await?;
-    let input =
-        open_tagged(conn, crate::protocol::Channel::Input, super::PRIORITY_INPUT).await?;
+    let control = open_tagged(
+        conn,
+        crate::protocol::Channel::Control,
+        super::PRIORITY_CONTROL,
+    )
+    .await?;
+    let input = open_tagged(conn, crate::protocol::Channel::Input, super::PRIORITY_INPUT).await?;
     Ok(SessionStreams { control, input })
 }
 
@@ -392,7 +480,9 @@ pub async fn accept_streams(conn: &Connection) -> Result<SessionStreams> {
 
     match (control, input) {
         (Some(control), Some(input)) => Ok(SessionStreams { control, input }),
-        _ => Err(Error::Protocol("client did not open both session streams".into())),
+        _ => Err(Error::Protocol(
+            "client did not open both session streams".into(),
+        )),
     }
 }
 
@@ -412,20 +502,33 @@ mod tests {
         assert!(p.validate().is_ok());
         assert!(transport_config(&p).is_ok());
 
-        let mut bad = QuicParams { idle_timeout_ms: 0, ..QuicParams::default() };
+        let mut bad = QuicParams {
+            idle_timeout_ms: 0,
+            ..QuicParams::default()
+        };
         assert!(bad.validate().is_err());
 
-        bad = QuicParams { keep_alive_ms: 20_000, idle_timeout_ms: 15_000, ..Default::default() };
+        bad = QuicParams {
+            keep_alive_ms: 20_000,
+            idle_timeout_ms: 15_000,
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
 
-        bad = QuicParams { initial_mtu: 500, ..Default::default() };
+        bad = QuicParams {
+            initial_mtu: 500,
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
     }
 
     #[test]
     fn all_congestion_controllers_build() {
         for c in [Congestion::Bbr, Congestion::Cubic, Congestion::NewReno] {
-            let p = QuicParams { congestion: c, ..Default::default() };
+            let p = QuicParams {
+                congestion: c,
+                ..Default::default()
+            };
             assert!(transport_config(&p).is_ok(), "{c:?} failed to build");
         }
     }
@@ -445,9 +548,12 @@ mod tests {
         let server = server_endpoint(loopback(), id.tls(), &params).unwrap();
         assert!(server.local_addr().is_ok());
 
-        let client =
-            client_endpoint(loopback(), ServerPinning::Pinned(*id.spki_sha256()), &params)
-                .unwrap();
+        let client = client_endpoint(
+            loopback(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
         assert!(client.local_addr().is_ok());
     }
 
@@ -466,8 +572,7 @@ mod tests {
             let host_exporter = channel_binding(&conn).expect("host exporter");
             let mut streams = accept_streams(&conn).await.expect("accept streams");
 
-            let auth: AuthMsg =
-                read_auth(&mut streams.control.1).await.expect("read auth");
+            let auth: AuthMsg = read_auth(&mut streams.control.1).await.expect("read auth");
             assert!(matches!(auth, AuthMsg::PairStart { .. }));
             write_framed(&mut streams.control.0, &ControlMsg::Ping { token: 7 })
                 .await
@@ -481,10 +586,15 @@ mod tests {
             host_exporter
         });
 
-        let client_ep =
-            client_endpoint(loopback(), ServerPinning::Pinned(*id.spki_sha256()), &params)
-                .unwrap();
-        let conn = connect(&client_ep, server_addr).await.expect("client handshake");
+        let client_ep = client_endpoint(
+            loopback(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
+        let conn = connect(&client_ep, server_addr)
+            .await
+            .expect("client handshake");
         let client_exporter = channel_binding(&conn).expect("client exporter");
 
         assert_eq!(peer_spki_pin(&conn).unwrap(), *id.spki_sha256());
@@ -493,18 +603,25 @@ mod tests {
         let mut streams = open_streams(&conn).await.expect("open streams");
         write_framed(
             &mut streams.control.0,
-            &AuthMsg::PairStart { spake_msg: vec![0xAB; 33] },
+            &AuthMsg::PairStart {
+                spake_msg: vec![0xAB; 33],
+            },
         )
         .await
         .expect("write auth");
 
-        let pong: ControlMsg = read_control(&mut streams.control.1).await.expect("read control");
+        let pong: ControlMsg = read_control(&mut streams.control.1)
+            .await
+            .expect("read control");
         assert!(matches!(pong, ControlMsg::Ping { token: 7 }));
 
-        conn.send_datagram(bytes::Bytes::from_static(b"video-fragment")).expect("send datagram");
+        conn.send_datagram(bytes::Bytes::from_static(b"video-fragment"))
+            .expect("send datagram");
 
-        let host_exporter =
-            tokio::time::timeout(Duration::from_secs(10), host_task).await.unwrap().unwrap();
+        let host_exporter = tokio::time::timeout(Duration::from_secs(10), host_task)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             host_exporter, client_exporter,
             "both ends must derive the same channel binding"
@@ -512,6 +629,104 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         client_ep.wait_idle().await;
+    }
+
+    /// Establish a real loopback QUIC connection with `params`, feed `frames`
+    /// video-sized frames of `frags` datagrams each — one burst every 16 ms,
+    /// exactly how the host's `video_pump` paces a 60 fps stream from a
+    /// dedicated thread — and return `(offered, received)`.
+    ///
+    /// `offered` counts `send_datagram` calls that returned `Ok`; `received`
+    /// counts datagrams the far end actually read. quinn returns `Ok` even while
+    /// silently evicting an older buffered datagram to make room, so `received`
+    /// is the only honest measure of what crossed — the whole reason the
+    /// application-level loss estimator exists.
+    async fn measure_datagram_delivery(
+        params: &QuicParams,
+        frames: usize,
+        frags: usize,
+        payload_len: usize,
+    ) -> (usize, usize) {
+        let id = HostIdentity::generate("burst-host").unwrap();
+        let server = server_endpoint(loopback(), id.tls(), params).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let send_conn = conn.clone();
+            let sent = tokio::task::spawn_blocking(move || {
+                let payload = vec![0xABu8; payload_len];
+                let mut ok = 0usize;
+                for _ in 0..frames {
+                    for _ in 0..frags {
+                        if send_conn
+                            .send_datagram(bytes::Bytes::from(payload.clone()))
+                            .is_ok()
+                        {
+                            ok += 1;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+                ok
+            })
+            .await
+            .unwrap();
+            // Stay open until the receiver has drained.
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+            sent
+        });
+
+        let client_ep =
+            client_endpoint(loopback(), ServerPinning::Pinned(*id.spki_sha256()), params).unwrap();
+        let conn = connect(&client_ep, server_addr).await.expect("connect");
+
+        let mut received = 0usize;
+        // Read until the link falls quiet for a beat past the last burst.
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(500), conn.read_datagram()).await
+        {
+            received += 1;
+        }
+
+        conn.close(0u32.into(), b"done");
+        let sent = server_task.await.unwrap();
+        client_ep.wait_idle().await;
+        (sent, received)
+    }
+
+    /// A bursty, video-shaped datagram stream on loopback arrives essentially
+    /// intact with the configured buffers — the transport is not where video is
+    /// being lost. Guards the endpoint/socket construction (custom `socket2`
+    /// socket handed to `Endpoint::new`, enlarged UDP buffers) against a
+    /// regression that would start dropping datagrams a receiver never counts.
+    ///
+    /// ~130 fragments per frame is a 2560x1600-sized keyframe burst; 200 frames
+    /// at 60 fps is a few seconds of the heaviest traffic the encoder produces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bursty_video_datagrams_are_delivered_intact() {
+        const FRAMES: usize = 200;
+        const FRAGS: usize = 130;
+        const PAYLOAD: usize = 1100;
+
+        let (offered, received) =
+            measure_datagram_delivery(&QuicParams::default(), FRAMES, FRAGS, PAYLOAD).await;
+        let ratio = received as f64 / offered.max(1) as f64;
+        println!(
+            "bursty delivery: {received}/{offered} = {:.1}%",
+            ratio * 100.0
+        );
+
+        assert!(
+            ratio > 0.95,
+            "loopback must deliver a bursty video flow ~intact, got {:.1}% ({received}/{offered})",
+            ratio * 100.0
+        );
     }
 
     /// A client pinning the wrong key must not complete the handshake.
@@ -535,12 +750,9 @@ mod tests {
             &params,
         )
         .unwrap();
-        let res = tokio::time::timeout(
-            Duration::from_secs(10),
-            connect(&client_ep, server_addr),
-        )
-        .await
-        .expect("connect attempt should not hang");
+        let res = tokio::time::timeout(Duration::from_secs(10), connect(&client_ep, server_addr))
+            .await
+            .expect("connect attempt should not hang");
         assert!(res.is_err(), "handshake must fail on a pin mismatch");
 
         host_task.abort();
@@ -567,7 +779,9 @@ mod tests {
             &params,
         )
         .unwrap();
-        let conn = connect(&client_ep, server_addr).await.expect("client handshake");
+        let conn = connect(&client_ep, server_addr)
+            .await
+            .expect("client handshake");
 
         assert_eq!(recorder.get(), Some(*id.spki_sha256()));
         assert_eq!(peer_spki_pin(&conn).unwrap(), *id.spki_sha256());
@@ -591,21 +805,33 @@ mod tests {
             let mut streams = accept_streams(&conn).await.expect("accept streams");
             // A control-sized message is legal on the control channel but must
             // be refused when the auth cap is in force.
-            let err = read_auth::<ControlMsg>(&mut streams.control.1).await.unwrap_err();
+            let err = read_auth::<ControlMsg>(&mut streams.control.1)
+                .await
+                .unwrap_err();
             assert!(matches!(err, Error::Oversized { .. }), "got {err:?}");
             let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
         });
 
-        let client_ep =
-            client_endpoint(loopback(), ServerPinning::Pinned(*id.spki_sha256()), &params)
-                .unwrap();
-        let conn = connect(&client_ep, server_addr).await.expect("client handshake");
+        let client_ep = client_endpoint(
+            loopback(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
+        let conn = connect(&client_ep, server_addr)
+            .await
+            .expect("client handshake");
         let mut streams = open_streams(&conn).await.expect("open streams");
 
         let big = ControlMsg::ClipboardText("x".repeat(MAX_AUTH_MSG + 100));
-        write_framed(&mut streams.control.0, &big).await.expect("write big");
+        write_framed(&mut streams.control.0, &big)
+            .await
+            .expect("write big");
 
-        tokio::time::timeout(Duration::from_secs(10), host_task).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host_task)
+            .await
+            .unwrap()
+            .unwrap();
         conn.close(0u32.into(), b"done");
         client_ep.wait_idle().await;
     }

@@ -72,9 +72,15 @@ fn read_tlv(buf: &[u8]) -> Result<Tlv<'_>> {
         .checked_add(content_len)
         .ok_or_else(|| Error::Invalid("der: length overflow".into()))?;
     if buf.len() < total_len {
-        return Err(Error::Invalid("der: element runs past end of buffer".into()));
+        return Err(Error::Invalid(
+            "der: element runs past end of buffer".into(),
+        ));
     }
-    Ok(Tlv { tag, content: &buf[content_start..total_len], total_len })
+    Ok(Tlv {
+        tag,
+        content: &buf[content_start..total_len],
+        total_len,
+    })
 }
 
 /// Extract the raw DER `SubjectPublicKeyInfo` element (including its own
@@ -104,7 +110,9 @@ pub fn subject_public_key_info(cert_der: &[u8]) -> Result<&[u8]> {
     }
     let tbs = read_tlv(cert.content)?;
     if tbs.tag != TAG_SEQUENCE {
-        return Err(Error::Invalid("der: tbsCertificate is not a SEQUENCE".into()));
+        return Err(Error::Invalid(
+            "der: tbsCertificate is not a SEQUENCE".into(),
+        ));
     }
 
     let mut rest = tbs.content;
@@ -122,7 +130,9 @@ pub fn subject_public_key_info(cert_der: &[u8]) -> Result<&[u8]> {
 
     let spki = read_tlv(rest)?;
     if spki.tag != TAG_SEQUENCE {
-        return Err(Error::Invalid("der: subjectPublicKeyInfo is not a SEQUENCE".into()));
+        return Err(Error::Invalid(
+            "der: subjectPublicKeyInfo is not a SEQUENCE".into(),
+        ));
     }
     Ok(&rest[..spki.total_len])
 }

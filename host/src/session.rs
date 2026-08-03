@@ -103,8 +103,16 @@ impl SessionDescription {
             self.width,
             self.height,
             self.encoder,
-            if self.gpu_convert { "GPU VideoProcessor" } else { "CPU BT.709" },
-            if self.gpu_encode_input { "GPU texture" } else { "CPU NV12" },
+            if self.gpu_convert {
+                "GPU VideoProcessor"
+            } else {
+                "CPU BT.709"
+            },
+            if self.gpu_encode_input {
+                "GPU texture"
+            } else {
+                "CPU NV12"
+            },
         )
     }
 }
@@ -230,7 +238,9 @@ impl HostSession {
 
     /// Change the encoder's target bitrate; applied on the next frame.
     pub fn set_bitrate(&self, kbps: u32) {
-        self.shared.bitrate_req.store(kbps.max(1), Ordering::Relaxed);
+        self.shared
+            .bitrate_req
+            .store(kbps.max(1), Ordering::Relaxed);
     }
 
     /// Release every key/button currently held on behalf of the client.
@@ -247,7 +257,11 @@ impl HostSession {
     }
 
     pub fn describe(&self) -> SessionDescription {
-        self.shared.desc.lock().clone().unwrap_or_else(|| self.desc.clone())
+        self.shared
+            .desc
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.desc.clone())
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
@@ -440,7 +454,8 @@ fn media_thread(
                 break 'encode Err(e);
             }
             let stride = frame.width as usize * 4;
-            if let Err(e) = bgra_to_nv12(&cpu_bgra, stride, frame.width, frame.height, &mut cpu_nv12)
+            if let Err(e) =
+                bgra_to_nv12(&cpu_bgra, stride, frame.width, frame.height, &mut cpu_nv12)
             {
                 break 'encode Err(e);
             }
@@ -536,7 +551,11 @@ fn maybe_report(
     s.fps_capture = *captured as f32 / secs;
     s.fps_encode = *encoded as f32 / secs;
     s.bitrate_kbps = ((*bytes as f64 * 8.0 / secs as f64) / 1000.0) as u32;
-    s.pipeline_ms = if *encoded > 0 { *pipeline_ms / *encoded as f32 } else { 0.0 };
+    s.pipeline_ms = if *encoded > 0 {
+        *pipeline_ms / *encoded as f32
+    } else {
+        0.0
+    };
     s.frames_dropped = shared.counters.dropped.load(Ordering::Relaxed) as u32;
     s.keyframes_requested = shared.counters.keyframes.load(Ordering::Relaxed) as u32;
     drop(s);
@@ -548,7 +567,12 @@ fn maybe_report(
     *pipeline_ms = 0.0;
 }
 
-type Pipeline = (DdaCapture, Option<GpuConverter>, MfH264Encoder, SessionDescription);
+type Pipeline = (
+    DdaCapture,
+    Option<GpuConverter>,
+    MfH264Encoder,
+    SessionDescription,
+);
 
 fn build_pipeline(cfg: &SessionConfig) -> Result<Pipeline> {
     let mut capture = DdaCapture::new()?;

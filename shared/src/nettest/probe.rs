@@ -76,8 +76,12 @@ pub const DEFAULT_STUN_SERVERS: &[&str] = &[
 /// Destinations used to ask the routing table which local address egresses.
 /// No packet is sent to any of them — `connect()` on a UDP socket only picks a
 /// route and binds a source address.
-const V4_ROUTE_PROBES: &[&str] =
-    &["8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53", "208.67.222.222:53"];
+const V4_ROUTE_PROBES: &[&str] = &[
+    "8.8.8.8:53",
+    "1.1.1.1:53",
+    "9.9.9.9:53",
+    "208.67.222.222:53",
+];
 const V6_ROUTE_PROBES: &[&str] = &["[2001:4860:4860::8888]:53", "[2606:4700:4700::1111]:53"];
 
 /// Give up on any single DNS lookup after this long.
@@ -130,7 +134,10 @@ pub struct ProbeConfig {
 impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
-            stun_servers: DEFAULT_STUN_SERVERS.iter().map(|s| (*s).to_string()).collect(),
+            stun_servers: DEFAULT_STUN_SERVERS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             stun_timeout_ms: 3_000,
             total_budget_ms: 10_000,
             remap_delay_ms: 1_200,
@@ -257,7 +264,11 @@ pub fn classify_mapping(
         let reflexive = samples[0].reflexive;
         let open = matches!((local_v4, reflexive.ip()), (Some(l), IpAddr::V4(r)) if l == r);
         return MappingVerdict {
-            mapping: if open { NatMapping::Open } else { NatMapping::EndpointIndependent },
+            mapping: if open {
+                NatMapping::Open
+            } else {
+                NatMapping::EndpointIndependent
+            },
             servers_agreeing: agreeing,
             servers_probed: probed,
         };
@@ -303,8 +314,10 @@ pub async fn run_probe(config: &ProbeConfig) -> ProbeReport {
     observations.extend(tcp_observations);
 
     for gap in &config.known_firewall_gaps {
-        observations
-            .push(Observation::FirewallRuleMissing { port: gap.port, transport: gap.transport });
+        observations.push(Observation::FirewallRuleMissing {
+            port: gap.port,
+            transport: gap.transport,
+        });
     }
 
     let mut report = ProbeReport::new(started_at_ms);
@@ -366,7 +379,10 @@ async fn udp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
     }
 
     // --- round 1: every server, one socket -----------------------------------
-    let budget = clamp_to_deadline(Duration::from_millis(u64::from(config.stun_timeout_ms)), deadline);
+    let budget = clamp_to_deadline(
+        Duration::from_millis(u64::from(config.stun_timeout_ms)),
+        deadline,
+    );
     let round = stun_round(&primary, &targets, budget).await;
     let mut probes_sent = round.probes_sent;
 
@@ -378,7 +394,10 @@ async fn udp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
     }
 
     if round.answers.is_empty() {
-        obs.push(Observation::UdpBlocked { probes_sent, timeout_ms: config.stun_timeout_ms });
+        obs.push(Observation::UdpBlocked {
+            probes_sent,
+            timeout_ms: config.stun_timeout_ms,
+        });
         return obs;
     }
 
@@ -390,21 +409,33 @@ async fn udp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
     if let SocketAddr::V4(v4) = reflexive {
         let addr = *v4.ip();
         if is_public_v4(addr) {
-            obs.push(Observation::PublicV4Discovered { addr, port: v4.port() });
+            obs.push(Observation::PublicV4Discovered {
+                addr,
+                port: v4.port(),
+            });
             if let Some(local) = local_v4 {
                 if is_private_v4(local) && local != addr {
-                    obs.push(Observation::BehindNat { local, reflexive: addr });
+                    obs.push(Observation::BehindNat {
+                        local,
+                        reflexive: addr,
+                    });
                 }
             }
         } else if is_cgnat_v4(addr) {
             // RFC 6598 reserved this range for exactly this situation, so seeing
             // it as our own reflexive address is direct evidence.
-            obs.push(Observation::PossibleCgnat { reflexive: addr, confidence: Confidence::High });
+            obs.push(Observation::PossibleCgnat {
+                reflexive: addr,
+                confidence: Confidence::High,
+            });
         } else if is_private_v4(addr) && local_v4.is_some_and(|l| l != addr) {
             // A private reflexive address that is not ours means at least one
             // more translation layer we cannot see past. Could be a carrier,
             // could be an enterprise edge — hence Medium.
-            obs.push(Observation::PossibleCgnat { reflexive: addr, confidence: Confidence::Medium });
+            obs.push(Observation::PossibleCgnat {
+                reflexive: addr,
+                confidence: Confidence::Medium,
+            });
         }
     }
 
@@ -412,7 +443,10 @@ async fn udp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
     let samples: Vec<MappingSample> = round
         .answers
         .iter()
-        .map(|a| MappingSample { server: a.server_addr, reflexive: a.reflexive })
+        .map(|a| MappingSample {
+            server: a.server_addr,
+            reflexive: a.reflexive,
+        })
         .collect();
     let mut verdict = classify_mapping(
         local_v4,
@@ -429,7 +463,10 @@ async fn udp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
                     Duration::from_millis(u64::from(config.stun_timeout_ms).min(1_500)),
                     deadline,
                 );
-                let target = [Target { name: first.server_name.clone(), addr: first.server_addr }];
+                let target = [Target {
+                    name: first.server_name.clone(),
+                    addr: first.server_addr,
+                }];
                 let second = stun_round(&secondary, &target, probe_budget).await;
                 probes_sent += second.probes_sent;
                 if let Some(answer) = second.answers.first() {
@@ -462,7 +499,10 @@ async fn udp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
         let probe_budget = Duration::from_millis(u64::from(config.stun_timeout_ms).min(1_500));
         if Instant::now() + delay + probe_budget <= deadline {
             tokio::time::sleep(delay).await;
-            let target = [Target { name: first.server_name.clone(), addr: first.server_addr }];
+            let target = [Target {
+                name: first.server_name.clone(),
+                addr: first.server_addr,
+            }];
             let again = stun_round(&primary, &target, probe_budget).await;
             probes_sent += again.probes_sent;
             if let Some(answer) = again.answers.first() {
@@ -520,7 +560,10 @@ async fn tcp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
     }
 
     let addr = targets[0].addr;
-    let budget = clamp_to_deadline(Duration::from_millis(u64::from(config.tcp_timeout_ms)), deadline);
+    let budget = clamp_to_deadline(
+        Duration::from_millis(u64::from(config.tcp_timeout_ms)),
+        deadline,
+    );
     let started = Instant::now();
     match tokio::time::timeout(budget, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => {
@@ -532,7 +575,10 @@ async fn tcp_phase(config: &ProbeConfig, deadline: Instant) -> Vec<Observation> 
             });
         }
         Ok(Err(e)) => {
-            obs.push(Observation::DirectTcpUnavailable { addr, reason: e.to_string() });
+            obs.push(Observation::DirectTcpUnavailable {
+                addr,
+                reason: e.to_string(),
+            });
         }
         Err(_) => {
             obs.push(Observation::DirectTcpUnavailable {
@@ -605,7 +651,11 @@ async fn stun_round(sock: &UdpSocket, targets: &[Target], budget: Duration) -> R
         }
 
         // First attempt gets half the budget so a retransmission still fits.
-        let window_end = if attempt == 0 { round_start + budget / 2 } else { round_end };
+        let window_end = if attempt == 0 {
+            round_start + budget / 2
+        } else {
+            round_end
+        };
         let mut errors = 0u32;
 
         while !answered.iter().all(|a| *a) {
@@ -697,7 +747,10 @@ async fn resolve_targets(names: &[String], deadline: Instant) -> (Vec<Target>, V
 
         if let Ok(ip) = host.parse::<IpAddr>() {
             if ip.is_ipv4() {
-                targets.push(Target { name: name.clone(), addr: SocketAddr::new(ip, port) });
+                targets.push(Target {
+                    name: name.clone(),
+                    addr: SocketAddr::new(ip, port),
+                });
             }
             continue;
         }
@@ -725,7 +778,10 @@ async fn resolve_targets(names: &[String], deadline: Instant) -> (Vec<Target>, V
         };
 
         match resolved {
-            Some(ip) => targets.push(Target { name: name.clone(), addr: SocketAddr::new(ip, port) }),
+            Some(ip) => targets.push(Target {
+                name: name.clone(),
+                addr: SocketAddr::new(ip, port),
+            }),
             None => failed.push(name.clone()),
         }
     }
@@ -885,7 +941,9 @@ mod tests {
     #[test]
     fn global_v6_detection() {
         assert!(is_global_unicast_v6("2606:4700::1111".parse().unwrap()));
-        assert!(is_global_unicast_v6("2001:4860:4860::8888".parse().unwrap()));
+        assert!(is_global_unicast_v6(
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
         assert!(!is_global_unicast_v6("2001:db8::1".parse().unwrap()));
         assert!(!is_global_unicast_v6("fe80::1".parse().unwrap()));
         assert!(!is_global_unicast_v6("fd00::1".parse().unwrap()));
@@ -1004,9 +1062,15 @@ mod tests {
 
     #[test]
     fn host_port_splitting() {
-        assert_eq!(split_host_port("stun.l.google.com:19302"), Some(("stun.l.google.com", 19302)));
+        assert_eq!(
+            split_host_port("stun.l.google.com:19302"),
+            Some(("stun.l.google.com", 19302))
+        );
         assert_eq!(split_host_port("1.2.3.4:3478"), Some(("1.2.3.4", 3478)));
-        assert_eq!(split_host_port("[2001:db8::1]:3478"), Some(("2001:db8::1", 3478)));
+        assert_eq!(
+            split_host_port("[2001:db8::1]:3478"),
+            Some(("2001:db8::1", 3478))
+        );
         assert_eq!(split_host_port("no-port"), None);
         assert_eq!(split_host_port("host:notaport"), None);
         assert_eq!(split_host_port(":3478"), None);
@@ -1017,14 +1081,23 @@ mod tests {
     #[test]
     fn default_config_is_sane() {
         let c = ProbeConfig::default();
-        assert!(c.stun_servers.len() >= 3, "need enough servers to classify mapping");
+        assert!(
+            c.stun_servers.len() >= 3,
+            "need enough servers to classify mapping"
+        );
         // The port-dependence test needs one hostname listed on two ports.
-        let mut hosts: Vec<&str> =
-            c.stun_servers.iter().filter_map(|s| split_host_port(s).map(|(h, _)| h)).collect();
+        let mut hosts: Vec<&str> = c
+            .stun_servers
+            .iter()
+            .filter_map(|s| split_host_port(s).map(|(h, _)| h))
+            .collect();
         hosts.sort_unstable();
         let before = hosts.len();
         hosts.dedup();
-        assert!(before > hosts.len(), "default list must repeat a host on two ports");
+        assert!(
+            before > hosts.len(),
+            "default list must repeat a host on two ports"
+        );
         // Every phase must fit the overall budget.
         assert!(c.stun_timeout_ms + c.remap_delay_ms <= c.total_budget_ms);
         assert!(c.tcp_target.is_none());
@@ -1035,7 +1108,10 @@ mod tests {
     fn config_roundtrips_through_postcard() {
         let c = ProbeConfig::default()
             .with_tcp_target("example.invalid:7443")
-            .with_firewall_gaps([FirewallGap { port: 7443, transport: ProbeTransport::Tcp }]);
+            .with_firewall_gaps([FirewallGap {
+                port: 7443,
+                transport: ProbeTransport::Tcp,
+            }]);
         let bytes = postcard::to_stdvec(&c).unwrap();
         let back: ProbeConfig = crate::protocol::decode_strict(&bytes).unwrap();
         assert_eq!(c, back);
@@ -1133,12 +1209,17 @@ mod tests {
 
         let report = run_probe(&offline_config(vec![a, b])).await;
 
-        assert!(report.udp_works(), "loopback STUN must round-trip: {report:?}");
+        assert!(
+            report.udp_works(),
+            "loopback STUN must round-trip: {report:?}"
+        );
         assert_eq!(report.nat_mapping(), Some(NatMapping::EndpointIndependent));
-        assert!(report.observations.contains(&Observation::PublicV4Discovered {
-            addr: Ipv4Addr::new(24, 30, 100, 7),
-            port: 5555,
-        }));
+        assert!(report
+            .observations
+            .contains(&Observation::PublicV4Discovered {
+                addr: Ipv4Addr::new(24, 30, 100, 7),
+                port: 5555,
+            }));
         assert!(!report
             .observations
             .iter()
@@ -1163,7 +1244,10 @@ mod tests {
 
         let report = run_probe(&offline_config(vec![a, b])).await;
 
-        assert_eq!(report.nat_mapping(), Some(NatMapping::AddressAndPortDependent));
+        assert_eq!(
+            report.nat_mapping(),
+            Some(NatMapping::AddressAndPortDependent)
+        );
         assert!(!report.nat_mapping().unwrap().hole_punch_friendly());
     }
 
@@ -1248,8 +1332,10 @@ mod tests {
     #[tokio::test]
     async fn dead_servers_produce_unreachable_and_blocked() {
         // 127.0.0.1 with nothing listening: sends succeed, nothing answers.
-        let dead: Vec<SocketAddr> =
-            vec!["127.0.0.1:9".parse().unwrap(), "127.0.0.1:10".parse().unwrap()];
+        let dead: Vec<SocketAddr> = vec![
+            "127.0.0.1:9".parse().unwrap(),
+            "127.0.0.1:10".parse().unwrap(),
+        ];
         let mut cfg = offline_config(dead);
         cfg.stun_timeout_ms = 300;
         cfg.total_budget_ms = 3_000;
@@ -1265,11 +1351,17 @@ mod tests {
             2
         );
         let blocked = report.observations.iter().find_map(|o| match o {
-            Observation::UdpBlocked { probes_sent, timeout_ms } => Some((*probes_sent, *timeout_ms)),
+            Observation::UdpBlocked {
+                probes_sent,
+                timeout_ms,
+            } => Some((*probes_sent, *timeout_ms)),
             _ => None,
         });
         let (sent, timeout) = blocked.expect("expected UdpBlocked");
-        assert!(sent >= 2, "should have counted the datagrams it sent, got {sent}");
+        assert!(
+            sent >= 2,
+            "should have counted the datagrams it sent, got {sent}"
+        );
         assert_eq!(timeout, 300);
         assert!(!report.udp_works());
         assert_eq!(report.nat_mapping(), None);
@@ -1338,14 +1430,22 @@ mod tests {
     #[tokio::test]
     async fn known_firewall_gaps_are_echoed_into_the_report() {
         let cfg = offline_config(vec![]).with_firewall_gaps([
-            FirewallGap { port: 7443, transport: ProbeTransport::Tcp },
-            FirewallGap { port: 7443, transport: ProbeTransport::Udp },
+            FirewallGap {
+                port: 7443,
+                transport: ProbeTransport::Tcp,
+            },
+            FirewallGap {
+                port: 7443,
+                transport: ProbeTransport::Udp,
+            },
         ]);
         let report = run_probe(&cfg).await;
-        assert!(report.observations.contains(&Observation::FirewallRuleMissing {
-            port: 7443,
-            transport: ProbeTransport::Udp
-        }));
+        assert!(report
+            .observations
+            .contains(&Observation::FirewallRuleMissing {
+                port: 7443,
+                transport: ProbeTransport::Udp
+            }));
         assert_eq!(report.problems().count(), 2);
     }
 
@@ -1366,14 +1466,20 @@ mod tests {
         let started = Instant::now();
         let report = run_probe(&cfg).await;
         let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_millis(2_500), "run took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(2_500),
+            "run took {elapsed:?}"
+        );
         assert!(report.duration_ms <= 2_500);
     }
 
     #[tokio::test]
     async fn report_timestamp_and_duration_are_populated() {
         let report = run_probe(&offline_config(vec![])).await;
-        assert!(report.started_at_ms > 1_600_000_000_000, "unix ms looks wrong");
+        assert!(
+            report.started_at_ms > 1_600_000_000_000,
+            "unix ms looks wrong"
+        );
         assert!(report.duration_ms < 10_000);
     }
 
@@ -1398,6 +1504,9 @@ mod tests {
         println!("problems:      {}", report.problems().count());
 
         assert!(report.duration_ms <= cfg.total_budget_ms + 1_500);
-        assert!(!report.observations.is_empty(), "a live run should observe something");
+        assert!(
+            !report.observations.is_empty(),
+            "a live run should observe something"
+        );
     }
 }
