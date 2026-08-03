@@ -1,0 +1,14 @@
+[package]
+name = "directdesk-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "DirectDeskHost"
+path = "src/main.rs"
+
+[dependencies]
+directdesk-shared = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
