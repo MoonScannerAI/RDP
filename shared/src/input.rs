@@ -55,7 +55,9 @@ pub fn validate_event(ev: &InputEvent) -> Result<()> {
         InputEvent::Key { scan_code, .. } => {
             // Scan codes are 7-bit + extended flag; 0 is invalid.
             if *scan_code == 0 || *scan_code > 0xFF {
-                return Err(Error::Invalid(format!("scan code {scan_code:#x} out of range")));
+                return Err(Error::Invalid(format!(
+                    "scan code {scan_code:#x} out of range"
+                )));
             }
         }
         InputEvent::MouseWheel { delta, .. } => {
@@ -74,13 +76,22 @@ mod tests {
 
     #[test]
     fn rejects_zero_scan_code() {
-        let ev = InputEvent::Key { scan_code: 0, extended: false, action: KeyAction::Down };
+        let ev = InputEvent::Key {
+            scan_code: 0,
+            extended: false,
+            action: KeyAction::Down,
+        };
         assert!(validate_event(&ev).is_err());
     }
 
     #[test]
     fn accepts_normal_events() {
         assert!(validate_event(&InputEvent::MouseMove { x: 100, y: 200 }).is_ok());
-        assert!(validate_event(&InputEvent::Key { scan_code: 0x1E, extended: false, action: KeyAction::Up }).is_ok());
+        assert!(validate_event(&InputEvent::Key {
+            scan_code: 0x1E,
+            extended: false,
+            action: KeyAction::Up
+        })
+        .is_ok());
     }
 }

@@ -61,7 +61,10 @@ pub struct NullEncoder {
 
 impl NullEncoder {
     pub fn new() -> Self {
-        Self { next_keyframe: true, frame_id: 0 }
+        Self {
+            next_keyframe: true,
+            frame_id: 0,
+        }
     }
 }
 

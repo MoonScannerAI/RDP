@@ -4,11 +4,61 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "directdesk_host"
+path = "src/lib.rs"
+
 [[bin]]
 name = "DirectDeskHost"
 path = "src/main.rs"
 
+[[bin]]
+name = "capture_harness"
+path = "src/bin/capture_harness.rs"
+required-features = ["harness"]
+
+[features]
+# The host UI needs eframe/egui unconditionally now, so they are plain
+# dependencies. `harness` only gates the extra de-risk binary.
+default = ["harness"]
+harness = []
+
 [dependencies]
 directdesk-shared = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+eframe = { workspace = true }
+egui = { workspace = true }
+tray-icon = { workspace = true }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

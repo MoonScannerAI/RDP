@@ -60,11 +60,17 @@ pub mod features {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthMsg {
     /// Client → host: begin pairing with a fresh SPAKE2 first message.
-    PairStart { spake_msg: Vec<u8> },
+    PairStart {
+        spake_msg: Vec<u8>,
+    },
     /// Host → client: SPAKE2 response.
-    PairResponse { spake_msg: Vec<u8> },
+    PairResponse {
+        spake_msg: Vec<u8>,
+    },
     /// Both directions: HMAC(confirm_key, transcript || tls_exporter || role).
-    PairConfirm { mac: [u8; 32] },
+    PairConfirm {
+        mac: [u8; 32],
+    },
     /// Host → client after pairing: host's long-term identity.
     PairComplete {
         host_ed25519_pub: [u8; 32],
@@ -78,13 +84,21 @@ pub enum AuthMsg {
         sig: Vec<u8>,
     },
     /// Host → client: fresh nonce the client must sign.
-    ServerChallenge { nonce: [u8; 32] },
+    ServerChallenge {
+        nonce: [u8; 32],
+    },
     /// Host → client: signature over (tls_exporter || client_nonce) with host key.
-    ServerAuth { sig: Vec<u8> },
+    ServerAuth {
+        sig: Vec<u8>,
+    },
     /// Client → host: nonce for the host to sign.
-    ClientChallenge { nonce: [u8; 32] },
+    ClientChallenge {
+        nonce: [u8; 32],
+    },
     AuthOk,
-    AuthFail { reason: String },
+    AuthFail {
+        reason: String,
+    },
 }
 
 /// Session control messages (Control channel, after auth).
@@ -109,7 +123,9 @@ pub enum ControlMsg {
         codec: Codec,
     },
     QualityChange(QualityMode),
-    BitrateLimit { max_kbps: Option<u32> },
+    BitrateLimit {
+        max_kbps: Option<u32>,
+    },
     ClipboardText(String),
     /// Periodic stats exchange for diagnostics UI.
     Stats(ConnStats),
@@ -118,10 +134,16 @@ pub enum ControlMsg {
     /// Host is on the secure desktop (UAC/lock) — capture unavailable.
     SecureDesktopActive(bool),
     /// Graceful disconnect with a human-readable reason.
-    Bye { reason: String },
+    Bye {
+        reason: String,
+    },
     /// Liveness. Echoed with the same token.
-    Ping { token: u64 },
-    Pong { token: u64 },
+    Ping {
+        token: u64,
+    },
+    Pong {
+        token: u64,
+    },
 }
 
 /// Input events ride their own reliable stream (except mouse-move → datagram).
@@ -150,7 +172,10 @@ pub enum QualityMode {
 pub fn encode_framed<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
     let body = postcard::to_stdvec(msg)?;
     if body.len() > MAX_CONTROL_MSG {
-        return Err(Error::Oversized { got: body.len(), limit: MAX_CONTROL_MSG });
+        return Err(Error::Oversized {
+            got: body.len(),
+            limit: MAX_CONTROL_MSG,
+        });
     }
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -221,7 +246,11 @@ mod tests {
 
     #[test]
     fn rejects_wrong_version() {
-        let h = Hello { version: 999, features: 0, agent: "x".into() };
+        let h = Hello {
+            version: 999,
+            features: 0,
+            agent: "x".into(),
+        };
         assert!(validate_hello(&h).is_err());
     }
 }

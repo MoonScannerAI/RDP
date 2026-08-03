@@ -71,7 +71,13 @@ impl FragHeader {
             return Err(Error::Invalid("empty fragment payload".into()));
         }
         Ok((
-            FragHeader { frame_id, frag_index, frag_count, keyframe: flags & FLAG_KEYFRAME != 0, timestamp_ms },
+            FragHeader {
+                frame_id,
+                frag_index,
+                frag_count,
+                keyframe: flags & FLAG_KEYFRAME != 0,
+                timestamp_ms,
+            },
             payload,
         ))
     }
@@ -93,7 +99,10 @@ pub fn fragment_frame(frame: &EncodedFrame, max_datagram: usize) -> Result<Vec<V
         return Err(Error::Invalid("empty frame".into()));
     }
     if frame.data.len() > MAX_FRAME_BYTES {
-        return Err(Error::Oversized { got: frame.data.len(), limit: MAX_FRAME_BYTES });
+        return Err(Error::Oversized {
+            got: frame.data.len(),
+            limit: MAX_FRAME_BYTES,
+        });
     }
     let chunk = max_datagram
         .checked_sub(FRAG_HEADER_LEN)
@@ -103,7 +112,10 @@ pub fn fragment_frame(frame: &EncodedFrame, max_datagram: usize) -> Result<Vec<V
     }
     let count = frame.data.len().div_ceil(chunk);
     if count > MAX_FRAGS_PER_FRAME as usize {
-        return Err(Error::Oversized { got: count, limit: MAX_FRAGS_PER_FRAME as usize });
+        return Err(Error::Oversized {
+            got: count,
+            limit: MAX_FRAGS_PER_FRAME as usize,
+        });
     }
     let mut out = Vec::with_capacity(count);
     for (i, piece) in frame.data.chunks(chunk).enumerate() {
@@ -127,13 +139,24 @@ mod tests {
     use super::*;
 
     fn mk(len: usize) -> EncodedFrame {
-        EncodedFrame { frame_id: 7, keyframe: true, timestamp_ms: 1234, data: vec![0xAB; len] }
+        EncodedFrame {
+            frame_id: 7,
+            keyframe: true,
+            timestamp_ms: 1234,
+            data: vec![0xAB; len],
+        }
     }
 
     #[test]
     fn header_roundtrip() {
         let mut buf = Vec::new();
-        let h = FragHeader { frame_id: 1, frag_index: 2, frag_count: 5, keyframe: true, timestamp_ms: 99 };
+        let h = FragHeader {
+            frame_id: 1,
+            frag_index: 2,
+            frag_count: 5,
+            keyframe: true,
+            timestamp_ms: 99,
+        };
         h.encode(&mut buf);
         buf.push(0xFF); // one payload byte
         let (back, payload) = FragHeader::decode(&buf).unwrap();
@@ -154,7 +177,14 @@ mod tests {
     fn rejects_bad_headers() {
         // frag_index >= frag_count
         let mut buf = Vec::new();
-        FragHeader { frame_id: 1, frag_index: 5, frag_count: 5, keyframe: false, timestamp_ms: 0 }.encode(&mut buf);
+        FragHeader {
+            frame_id: 1,
+            frag_index: 5,
+            frag_count: 5,
+            keyframe: false,
+            timestamp_ms: 0,
+        }
+        .encode(&mut buf);
         buf.push(0);
         assert!(FragHeader::decode(&buf).is_err());
         // short buffer

@@ -15,8 +15,9 @@ pub struct LogGuard {
 /// Initialize tracing: console + optional daily-rotated file under `log_dir`.
 /// `component` names the file, e.g. "host" → host.YYYY-MM-DD.log.
 pub fn init(component: &str, log_dir: Option<PathBuf>) -> LogGuard {
-    let filter = EnvFilter::try_from_env("DIRECTDESK_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("info,quinn=warn,rustls=warn,wgpu_core=warn,wgpu_hal=warn"));
+    let filter = EnvFilter::try_from_env("DIRECTDESK_LOG").unwrap_or_else(|_| {
+        EnvFilter::new("info,quinn=warn,rustls=warn,wgpu_core=warn,wgpu_hal=warn")
+    });
 
     let console = fmt::layer().with_target(true).with_ansi(false);
 
@@ -24,7 +25,10 @@ pub fn init(component: &str, log_dir: Option<PathBuf>) -> LogGuard {
         Some(dir) => {
             let appender = tracing_appender::rolling::daily(dir, format!("{component}.log"));
             let (nb, guard) = tracing_appender::non_blocking(appender);
-            let layer = fmt::layer().with_target(true).with_ansi(false).with_writer(nb);
+            let layer = fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(nb);
             (Some(layer), Some(guard))
         }
         None => (None, None),
@@ -38,7 +42,9 @@ pub fn init(component: &str, log_dir: Option<PathBuf>) -> LogGuard {
 
     install_panic_hook(component);
 
-    LogGuard { _file_guard: file_guard }
+    LogGuard {
+        _file_guard: file_guard,
+    }
 }
 
 /// Default log directory: %LOCALAPPDATA%\DirectDesk\logs

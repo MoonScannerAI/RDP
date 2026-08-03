@@ -167,6 +167,9 @@ mod tests {
             t += 1_100;
             a.observe(t, 0.5, 400.0);
         }
-        assert_eq!(a.current(), AdaptConfig::for_mode(QualityMode::LowBandwidth).floor_kbps);
+        assert_eq!(
+            a.current(),
+            AdaptConfig::for_mode(QualityMode::LowBandwidth).floor_kbps
+        );
     }
 }

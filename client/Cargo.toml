@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "directdesk_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "DirectDeskClient"
 path = "src/main.rs"
@@ -12,3 +16,28 @@ path = "src/main.rs"
 directdesk-shared = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+
+[dev-dependencies]
+# The end-to-end loopback test stands up a real QUIC host endpoint (real TLS
+# pinning, SPAKE2 pairing and mutual auth via directdesk-shared) and, when the
+# capture stack is available, sources real H.264 frames from the host pipeline.
+directdesk-host = { path = "../host", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_Media_MediaFoundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
