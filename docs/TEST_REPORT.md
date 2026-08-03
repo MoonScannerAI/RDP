@@ -92,19 +92,31 @@ see [BUILDING.md](BUILDING.md).
 
 | Feature | How tested | Result | Date |
 |---|---|---|---|
-| Direct TCP:47991 session established when UDP is blocked | | | |
-| Input-priority queues: video backlog never delays input | | | |
-| Obsolete queued video discarded, IDR requested on replace | | | |
-| Route label shows "Direct TCP" (never mislabeled) | | | |
-| Clean reconnect after TCP drop | | | |
+| TCP/TLS session over loopback with SPKI pinning + exporter agreement | `tcp.rs` unit tests (real 127.0.0.1 TLS) | PASS | 2026-08-04 |
+| Input-priority queues: video backlog never delays input | `input_beats_the_queued_video_backlog` | PASS | 2026-08-04 |
+| Media segmentation: input interleaves mid-frame (~64 KiB, not whole frame) | `input_interleaves_within_a_multi_segment_frame` — input overtook 29/32 segments of a 2 MiB frame | PASS | 2026-08-04 |
+| Obsolete queued video dropped (latest-wins) + IDR requested on drop/gap | `reassembler_handles_gaps_drops_and_corruption` | PASS | 2026-08-04 |
+| Staggered route racing (happy-eyeballs) picks + labels route honestly | `race.rs` 19 tests (ManualClock) | PASS | 2026-08-04 |
+| Full end-to-end TCP host↔client swap under live UDP block | needs two machines / induced UDP block | NOT RUN | — |
 
 ## M5 — Adaptive bitrate + quality modes
 
 | Feature | How tested | Result | Date |
 |---|---|---|---|
-| Quality mode switch (Text/Desktop, Balanced, Motion, Low bandwidth) live during a session | | | |
-| Bitrate adapts down under induced loss (via `netsim`) and recovers | | | |
-| Default 1080p30 @ 8 Mbps target / 15 Mbps ceiling confirmed end-to-end | | | |
+| Quality mode switch applies mode ceiling/floor; BitrateLimit clamps | `quality_mode_switch_applies_ceiling_and_floor`, `caps_narrow_but_never_widen`, `bitrate_limit_clamps_the_adaptor_output` | PASS | 2026-08-04 |
+| Bitrate adapts DOWN on real loss and recovers UP when clean | `adaptor_backs_off_on_real_loss_then_recovers` (synthetic ConnStats) | PASS | 2026-08-04 |
+| Adaptor driven by TRUE app-level loss (sees quinn's silent datagram discards) | `session::video_loss` unit tests + wired in host `status_loop` | PASS | 2026-08-04 |
+| Clean link raises bitrate, no false downshift (startup overrun gated) | real loopback: raised to 8750 kbps at 0% loss; `startup_overrun_does_not_spuriously_downshift` | PASS | 2026-08-04 |
+| TextDesktop frame-rate biasing on static screen | encoder-limited (MF MFT exposes no runtime FPS setter) — bitrate range applied only | PARTIAL | 2026-08-04 |
+
+## Cross-binary interop (keystone)
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| REAL DirectDeskHost ↔ REAL DirectDeskClient: fresh pairing streams video | `client/tests/interop.rs` case (a) — 147 real frames | PASS | 2026-08-04 |
+| Steady-state reconnect (no code) against trusted host | interop case (b) | PASS | 2026-08-04 |
+| Wrong pairing code fails cleanly, host burns the code | interop case (c) | PASS | 2026-08-04 |
+| Host presenting a different SPKI rejected at pinning (anti-MITM) | interop case (d) | PASS | 2026-08-04 |
 
 ## M6 — Integration test matrix (netsim-driven)
 
