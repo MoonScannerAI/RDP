@@ -44,6 +44,7 @@ struct Args {
     demo_fps: u32,
     decoder_selftest: bool,
     capture_on_start: bool,
+    hold_capture: bool,
     help: bool,
 }
 
@@ -58,6 +59,7 @@ impl Default for Args {
             demo_fps: 60,
             decoder_selftest: false,
             capture_on_start: false,
+            hold_capture: false,
             help: false,
         }
     }
@@ -95,6 +97,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--loopback-demo" => args.loopback_demo = true,
             "--decoder-selftest" => args.decoder_selftest = true,
             "--capture-on-start" => args.capture_on_start = true,
+            "--hold-capture" => args.hold_capture = true,
             "-h" | "--help" => args.help = true,
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -214,6 +217,7 @@ fn main() -> anyhow::Result<()> {
     let video_rx = session.video_rx.clone();
     let demo_fps = args.demo_fps;
     let capture_on_start = args.capture_on_start;
+    let hold_capture = args.hold_capture;
 
     eframe::run_native(
         "DirectDesk",
@@ -241,6 +245,7 @@ fn main() -> anyhow::Result<()> {
                     initial_pair_code,
                     auto_connect,
                     capture_on_start,
+                    hold_capture,
                 },
             )))
         }),

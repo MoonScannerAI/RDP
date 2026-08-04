@@ -68,8 +68,15 @@ fn serve(force_minimized: bool) -> anyhow::Result<()> {
     );
 
     // The listener lives on its own runtime threads; egui keeps the main one.
+    // Six workers, not three: the quinn connection driver plus the input
+    // ingress hops (input_read_loop -> input_loop) share this pool with a
+    // dozen other tasks, while capture/encode/video-egress run as their own
+    // normal-priority OS threads that peg cores under 1080p load. Three workers
+    // let full video encode starve inbound keystrokes, so typed keys only
+    // landed on the host when the client minimized and video demand collapsed.
+    // More workers keep the driver and input path scheduled under that load.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(3)
+        .worker_threads(6)
         .thread_name("dd-net")
         .enable_all()
         .build()?;

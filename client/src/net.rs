@@ -314,11 +314,33 @@ async fn run_session_loop(
     closed: &Arc<tokio::sync::Notify>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
+    // Every 2s, log the hook's enqueue count next to what the input write_loop
+    // has actually put on the wire. If `enqueued` climbs while `written` stalls
+    // (window open, video decoding hard), the client's own send path is starved
+    // — distinct from the host starving on injection. Cheap; diagnosis only.
+    let mut diag = tokio::time::interval(Duration::from_secs(2));
+    diag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if session.is_closed() {
             return false;
         }
         tokio::select! {
+            _ = diag.tick() => {
+                // `tx_dgrams` is the QUIC engine's real count of UDP datagrams
+                // actually sent. If `written` (handed to QUIC) climbs while
+                // `tx_dgrams` barely moves with the window open, the client's
+                // driver is buffering keystrokes and not transmitting them until
+                // the render loop quiets (minimize) — a client-side stall. If
+                // `tx_dgrams` keeps climbing while typing does nothing on the
+                // host, the bytes are leaving and the stall is downstream (host).
+                let tx_dgrams = session.connection().stats().udp_tx.datagrams;
+                tracing::info!(
+                    enqueued = crate::input_capture::keys_forwarded_total(),
+                    written = session.input_events_written(),
+                    tx_dgrams = tx_dgrams,
+                    "input tx diag",
+                );
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     session.close_graceful("client shutdown", Duration::from_secs(2)).await;

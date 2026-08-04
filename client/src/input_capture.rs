@@ -262,6 +262,50 @@ pub fn wheel_delta(unit: egui::MouseWheelUnit, amount: f32) -> i16 {
     raw.clamp(-3840.0, 3840.0) as i16
 }
 
+/// Map an egui logical/physical key to a US Set-1 hardware scan code and its
+/// extended flag — the wire format the host injects with `KEYEVENTF_SCANCODE`.
+/// Returns `None` for keys egui does not model (skipped). The nav cluster and
+/// arrows are `extended` (E0-prefixed). Layout note: we send the physical key's
+/// scan code and synthesize modifiers, so the host reproduces the same glyph.
+pub fn egui_key_to_scancode(key: egui::Key) -> Option<(u16, bool)> {
+    use egui::Key::*;
+    let sc: (u16, bool) = match key {
+        // Letters
+        A => (0x1E, false), B => (0x30, false), C => (0x2E, false), D => (0x20, false),
+        E => (0x12, false), F => (0x21, false), G => (0x22, false), H => (0x23, false),
+        I => (0x17, false), J => (0x24, false), K => (0x25, false), L => (0x26, false),
+        M => (0x32, false), N => (0x31, false), O => (0x18, false), P => (0x19, false),
+        Q => (0x10, false), R => (0x13, false), S => (0x1F, false), T => (0x14, false),
+        U => (0x16, false), V => (0x2F, false), W => (0x11, false), X => (0x2D, false),
+        Y => (0x15, false), Z => (0x2C, false),
+        // Number row
+        Num1 => (0x02, false), Num2 => (0x03, false), Num3 => (0x04, false),
+        Num4 => (0x05, false), Num5 => (0x06, false), Num6 => (0x07, false),
+        Num7 => (0x08, false), Num8 => (0x09, false), Num9 => (0x0A, false),
+        Num0 => (0x0B, false),
+        // Editing / whitespace
+        Enter => (0x1C, false), Escape => (0x01, false), Backspace => (0x0E, false),
+        Tab => (0x0F, false), Space => (0x39, false),
+        // Punctuation
+        Minus => (0x0C, false), Equals => (0x0D, false),
+        OpenBracket => (0x1A, false), CloseBracket => (0x1B, false),
+        Backslash => (0x2B, false), Semicolon => (0x27, false), Quote => (0x28, false),
+        Backtick => (0x29, false), Comma => (0x33, false), Period => (0x34, false),
+        Slash => (0x35, false),
+        // Nav cluster + arrows (extended)
+        Insert => (0x52, true), Delete => (0x53, true), Home => (0x47, true),
+        End => (0x4F, true), PageUp => (0x49, true), PageDown => (0x51, true),
+        ArrowUp => (0x48, true), ArrowLeft => (0x4B, true),
+        ArrowRight => (0x4D, true), ArrowDown => (0x50, true),
+        // Function keys
+        F1 => (0x3B, false), F2 => (0x3C, false), F3 => (0x3D, false), F4 => (0x3E, false),
+        F5 => (0x3F, false), F6 => (0x40, false), F7 => (0x41, false), F8 => (0x42, false),
+        F9 => (0x43, false), F10 => (0x44, false), F11 => (0x57, false), F12 => (0x58, false),
+        _ => return None,
+    };
+    Some(sc)
+}
+
 // ---------------------------------------------------------------------------
 // Global hook state
 // ---------------------------------------------------------------------------
@@ -285,6 +329,21 @@ static HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Set by the hook thread when `SetWindowsHookExW` fails, since installation
 /// happens asynchronously on that thread.
 static HOOK_INSTALL_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// True while the DirectDesk window is the foreground/focused window. When set,
+/// the low-level hook stops forwarding+swallowing and passes keys through, so
+/// egui receives them and the focused-window path ([`InputCapture::on_key_event`])
+/// handles capture instead. This routes around Windows withholding low-level-hook
+/// delivery from our own GPU-heavy foreground window (observed as `hook_calls`
+/// frozen at 0 while focused). Background capture still uses the hook.
+static WINDOW_FOREGROUND: AtomicBool = AtomicBool::new(false);
+
+/// Process-wide enqueue count (keys placed on the outbound channel by the hook),
+/// readable without the capture handle so the net supervisor can log it beside
+/// the transmit-side count for starvation diagnosis.
+pub fn keys_forwarded_total() -> u64 {
+    KEYS_FORWARDED.load(Ordering::Relaxed)
+}
 
 #[cfg(windows)]
 mod hook {
@@ -333,7 +392,10 @@ mod hook {
         // fall back to the module handle.
         let hook = unsafe {
             match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) {
-                Ok(h) => h,
+                Ok(h) => {
+                    tracing::debug!("keyboard hook installed via NULL module handle");
+                    h
+                }
                 Err(e) => {
                     tracing::warn!(
                         "SetWindowsHookExW(hMod=NULL) failed ({e}); retrying with module handle"
@@ -381,6 +443,24 @@ mod hook {
             let handle = std::thread::Builder::new()
                 .name("directdesk-hook".into())
                 .spawn(move || {
+                    // WH_KEYBOARD_LL callbacks are dispatched on this thread
+                    // during message retrieval; if it is not serviced within
+                    // LowLevelHooksTimeout (300 ms) Windows silently stops
+                    // delivering keys (seen as hook_calls frozen at 0 while the
+                    // client renders video hard). Top priority keeps the pump
+                    // ahead of decode/render so key delivery never lapses.
+                    // SAFETY: GetCurrentThread is a pseudo-handle to this thread;
+                    // setting priority is a side-effect-free scheduler hint.
+                    unsafe {
+                        use windows::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+                        };
+                        if let Err(e) =
+                            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+                        {
+                            tracing::warn!("could not raise hook-thread priority: {e}");
+                        }
+                    }
                     // Force the OS to create this thread's message queue before
                     // anyone posts to it, otherwise the first post is lost.
                     // SAFETY: PeekMessage on our own (empty) queue.
@@ -507,7 +587,12 @@ mod hook {
         // Counted before any filtering so "hook never called" and "hook called
         // but event ignored" are distinguishable in the logs.
         HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
-        if code == HC_ACTION as i32 && CAPTURING.load(Ordering::Relaxed) {
+        // When our window is foreground, the egui `on_key_event` path owns
+        // capture; pass keys through so egui sees them and we never double-send.
+        if code == HC_ACTION as i32
+            && CAPTURING.load(Ordering::Relaxed)
+            && !WINDOW_FOREGROUND.load(Ordering::Relaxed)
+        {
             // A panic here would unwind across an FFI boundary (UB / abort), so
             // it is contained. On panic we fall through to CallNextHookEx,
             // which is the fail-open, never-lock-the-keyboard behaviour.
@@ -612,6 +697,12 @@ pub struct InputCapture {
     moves: MoveCoalescer,
     buttons_held: u32,
     last_error: Option<String>,
+    /// Modifier state last mirrored to the host from the egui key path. egui
+    /// reports modifier *state* (not Shift/Ctrl/Alt key events), so we diff
+    /// against this and synthesize modifier scan codes on transitions.
+    tracked_shift: bool,
+    tracked_ctrl: bool,
+    tracked_alt: bool,
 }
 
 impl InputCapture {
@@ -624,6 +715,99 @@ impl InputCapture {
             moves: MoveCoalescer::new(MOUSE_MOVE_HZ),
             buttons_held: 0,
             last_error: None,
+            tracked_shift: false,
+            tracked_ctrl: false,
+            tracked_alt: false,
+        }
+    }
+
+    /// Track the window's foreground state. When focused, the egui key path
+    /// owns capture and the low-level hook passes through (see
+    /// [`WINDOW_FOREGROUND`]). On losing focus, release any modifier we
+    /// synthesized so nothing sticks down on the host.
+    pub fn set_window_foreground(&mut self, focused: bool) {
+        let was = WINDOW_FOREGROUND.swap(focused, Ordering::SeqCst);
+        if was && !focused {
+            self.release_synth_mods();
+        }
+    }
+
+    /// Focused-window keyboard capture (mirrors the mouse egui path). Maps the
+    /// key to a scan code, synthesizes modifier scan codes from egui's modifier
+    /// state, and forwards `InputEvent::Key`. Only used while the window is the
+    /// foreground window, where the global hook is unreliable.
+    pub fn on_key_event(
+        &mut self,
+        physical_key: Option<egui::Key>,
+        logical_key: egui::Key,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    ) {
+        let key = physical_key.unwrap_or(logical_key);
+
+        // Release chord parity (the hook path is inactive while focused).
+        if pressed
+            && modifiers.ctrl
+            && modifiers.alt
+            && modifiers.shift
+            && matches!(key, egui::Key::F12)
+        {
+            RELEASE_REQUESTED.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        // Mirror modifier transitions to the host before the key so capitals
+        // and Ctrl/Alt combos reproduce. A lone modifier release (no egui key
+        // event) is corrected on the next key press, and on focus loss.
+        if modifiers.shift != self.tracked_shift {
+            self.tracked_shift = modifiers.shift;
+            self.send_scan(SC_LSHIFT, false, modifiers.shift);
+        }
+        if modifiers.ctrl != self.tracked_ctrl {
+            self.tracked_ctrl = modifiers.ctrl;
+            self.send_scan(SC_CTRL, false, modifiers.ctrl);
+        }
+        if modifiers.alt != self.tracked_alt {
+            self.tracked_alt = modifiers.alt;
+            self.send_scan(SC_ALT, false, modifiers.alt);
+        }
+
+        if let Some((scan, extended)) = egui_key_to_scancode(key) {
+            self.send_scan(scan, extended, pressed);
+        }
+    }
+
+    /// Send one raw scan-code key event and count it like the hook path does.
+    fn send_scan(&self, scan_code: u16, extended: bool, down: bool) {
+        if scan_code == 0 || scan_code > 0xFF {
+            return;
+        }
+        let ok = send_input(
+            &self.tx,
+            InputMsg::Event(InputEvent::Key {
+                scan_code,
+                extended,
+                action: if down { KeyAction::Down } else { KeyAction::Up },
+            }),
+        );
+        if ok {
+            KEYS_FORWARDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Release any modifier the egui path is holding down on the host.
+    fn release_synth_mods(&mut self) {
+        if self.tracked_shift {
+            self.tracked_shift = false;
+            self.send_scan(SC_LSHIFT, false, false);
+        }
+        if self.tracked_ctrl {
+            self.tracked_ctrl = false;
+            self.send_scan(SC_CTRL, false, false);
+        }
+        if self.tracked_alt {
+            self.tracked_alt = false;
+            self.send_scan(SC_ALT, false, false);
         }
     }
 
@@ -692,6 +876,11 @@ impl InputCapture {
     pub fn release_all(&mut self) {
         self.moves.clear();
         self.buttons_held = 0;
+        // The host's ReleaseAll drops every held key, so just forget our
+        // synthesized-modifier state (don't send individual ups after it).
+        self.tracked_shift = false;
+        self.tracked_ctrl = false;
+        self.tracked_alt = false;
         send_input(&self.tx, InputMsg::ReleaseAll);
         tracing::debug!("sent ReleaseAll");
     }

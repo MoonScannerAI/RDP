@@ -1463,6 +1463,7 @@ fn video_pump(
     stop: Arc<AtomicBool>,
     counters: Arc<VideoCounters>,
 ) {
+    crate::session::lower_video_thread_priority("video-tx");
     let start = Instant::now();
     let mut idr = RateLimiter::new(KEYFRAME_MIN_INTERVAL_MS);
 
@@ -1708,6 +1709,10 @@ async fn status_loop(
             frames_dropped: media.frames_dropped,
             keyframes_requested: media.keyframes_requested,
             pipeline_ms: media.pipeline_ms,
+            // End-to-end input confirmation: report how many client keystrokes
+            // this host has actually injected, so the client can see whether the
+            // keys it sent are landing here.
+            input_injected: pipeline.input_events_injected(),
         };
 
         // Everything below is a delta over THIS window (a matched sliding
@@ -1777,6 +1782,7 @@ async fn status_loop(
             }
         }
 
+        let injected = pipeline.input_events_injected();
         inner.status_mut(|s| {
             s.transport = transport;
             s.pipeline = merged;
@@ -1788,8 +1794,13 @@ async fn status_loop(
             s.bytes_sent = bytes;
             s.frames_coalesced = counters.coalesced.load(Ordering::Relaxed);
             s.frames_backpressured = backpressured;
-            s.input_injected = pipeline.input_events_injected();
+            s.input_injected = injected;
         });
+        // Cumulative injected count beside the send rate: under full video load
+        // this should keep climbing as the client types (proving input is not
+        // starved by encode). It stalling while frames_sent races is the
+        // signature of the input-priority bug.
+        tracing::info!(input_injected = injected, frames_sent = sent, "host input diag");
     }
 }
 

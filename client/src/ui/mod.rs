@@ -54,6 +54,11 @@ pub struct AppInit {
     /// Test aid (`--capture-on-start`): install the keyboard hook immediately
     /// so the capture path can be exercised without a click.
     pub capture_on_start: bool,
+    /// Test aid (`--hold-capture`): install the hook on launch and keep it
+    /// installed across focus/minimize changes (only a window close, or the
+    /// release chord, tears it down). Lets the capture path be exercised on a
+    /// machine where another app keeps stealing foreground focus.
+    pub hold_capture: bool,
 }
 
 pub struct ClientApp {
@@ -92,6 +97,8 @@ pub struct ClientApp {
     /// Pending `--capture-on-start`; consumed on the first frame, because the
     /// hook must be installed from the thread running the message pump.
     capture_on_start: bool,
+    /// `--hold-capture` test mode: keep capture engaged through focus loss.
+    hold_capture: bool,
 }
 
 impl ClientApp {
@@ -137,17 +144,22 @@ impl ClientApp {
             notice: None,
             pointer: None,
             metrics_logged_at: Instant::now(),
-            capture_on_start: init.capture_on_start,
+            // `--hold-capture` implies the one-shot install too, so the flag
+            // works on its own without also passing `--capture-on-start`.
+            capture_on_start: init.capture_on_start || init.hold_capture,
+            hold_capture: init.hold_capture,
         }
     }
 
     /// Dump the live counters every couple of seconds. This is what makes a
     /// `--loopback-demo` run verifiable without touching the window.
-    fn log_metrics(&mut self) {
+    fn log_metrics(&mut self, ctx: &egui::Context) {
         if self.metrics_logged_at.elapsed() < std::time::Duration::from_secs(2) {
             return;
         }
         self.metrics_logged_at = Instant::now();
+        let (focused, minimized) =
+            ctx.input(|i| (i.focused, i.viewport().minimized.unwrap_or(false)));
         tracing::info!(
             fps_decode = format_args!("{:.1}", self.presenter.fps_decode()),
             fps_present = format_args!("{:.1}", self.presenter.fps_present()),
@@ -161,6 +173,14 @@ impl ClientApp {
             hook_active = self.input.hook_active(),
             moves = self.input.moves_sent(),
             capturing = self.input.is_capturing(),
+            // Window state, so a "typed but nothing captured" report can be tied
+            // to whether DirectDesk was the foreground/visible window.
+            focused = focused,
+            minimized = minimized,
+            // End-to-end confirmation from the host: how many of the keys we sent
+            // it actually injected. If this stays flat while `keys` climbs, the
+            // host is receiving but not injecting.
+            host_injected = self.stats.map(|s| s.input_injected).unwrap_or(0),
             "client metrics"
         );
     }
@@ -178,7 +198,13 @@ impl ClientApp {
             if !state.is_live() {
                 self.presenter.reset();
                 self.slot.clear();
-                self.input.stop_capture();
+                // In `--hold-capture` test mode, keep the hook installed across
+                // connection churn (connecting, WAN stalls, reconnects) so the
+                // capture path stays live regardless of link state. Normal mode
+                // still releases keys the moment the session is not live.
+                if !self.hold_capture {
+                    self.input.stop_capture();
+                }
             }
             self.state = state;
         }
@@ -236,7 +262,13 @@ impl ClientApp {
             ControlMsg::Bye { reason } => {
                 self.state = ConnectionState::Failed(format!("Host disconnected: {reason}"));
                 self.route = None;
-                self.input.stop_capture();
+                // `--hold-capture` keeps the hook across a host `Bye` so a
+                // transient disconnect/reconnect doesn't silently kill capture
+                // for the rest of the session (observed: a mid-stream `Bye` tore
+                // the hook down and it never re-armed). Normal mode releases.
+                if !self.hold_capture {
+                    self.input.stop_capture();
+                }
                 self.presenter.reset();
             }
             other => tracing::debug!("unhandled control message: {other:?}"),
@@ -258,7 +290,11 @@ impl ClientApp {
                 i.viewport().close_requested(),
             )
         });
-        if !focused || minimized || closing {
+        // In `--hold-capture` test mode we deliberately keep the hook installed
+        // across focus/minimize changes (a machine where another app steals
+        // foreground would otherwise never let capture stay on). A window close
+        // still releases, so we never leave keys stuck on exit.
+        if closing || (!self.hold_capture && (!focused || minimized)) {
             tracing::info!(focused, minimized, closing, "releasing capture");
             self.input.stop_capture();
             self.notice = Some("Input released (window lost focus)".into());
@@ -590,8 +626,32 @@ impl ClientApp {
         let (events, focused) = ui.ctx().input(|i| (i.events.clone(), i.focused));
         if focused {
             self.forward_pointer_events(&events, viewport, &view);
+            self.forward_key_events(&events);
         }
         self.input.pump();
+    }
+
+    /// Forward keystrokes captured through the window (egui) while it is the
+    /// foreground window — the reliable path there, since Windows starves the
+    /// global low-level hook when our GPU-heavy window is focused. Gated on
+    /// capture being enabled so the toggle / release chord still governs it.
+    fn forward_key_events(&mut self, events: &[egui::Event]) {
+        if !self.input.is_capturing() {
+            return;
+        }
+        for event in events {
+            if let egui::Event::Key {
+                key,
+                physical_key,
+                pressed,
+                modifiers,
+                ..
+            } = event
+            {
+                self.input
+                    .on_key_event(*physical_key, *key, *pressed, *modifiers);
+            }
+        }
     }
 
     fn forward_pointer_events(
@@ -678,10 +738,36 @@ impl eframe::App for ClientApp {
 
         // Wait for focus: the window is not focused on the first frame, and
         // `enforce_capture_invariants` would (correctly) drop capture again.
-        if self.capture_on_start && ctx.input(|i| i.focused) {
+        // `--hold-capture` installs without waiting for focus (the whole point
+        // is to survive not having it); plain `--capture-on-start` still waits
+        // for the first focused frame.
+        if self.capture_on_start && (self.hold_capture || ctx.input(|i| i.focused)) {
             self.capture_on_start = false;
-            tracing::warn!("--capture-on-start: installing the keyboard hook");
+            tracing::warn!(
+                hold_capture = self.hold_capture,
+                "installing the keyboard hook on start"
+            );
             self.input.start_capture();
+        }
+
+        // Backstop for `--hold-capture`: if capture fell off after the initial
+        // install (a teardown we missed, or Windows silently dropping the
+        // low-level hook), re-arm it. `is_capturing()` flips true immediately,
+        // so this fires once per real teardown rather than every frame.
+        if self.hold_capture && !self.capture_on_start && !self.input.is_capturing() {
+            tracing::warn!("hold-capture: re-arming keyboard hook after teardown");
+            self.input.start_capture();
+        }
+
+        // Capture follows focus (the normal, non-`--hold-capture` behaviour):
+        // acquire while DirectDesk is the focused, non-minimized window;
+        // `enforce_capture_invariants` releases it the instant focus is lost, so
+        // keystrokes typed into other local apps are never swallowed/forwarded.
+        if !self.hold_capture && !self.capture_on_start {
+            let active = ctx.input(|i| i.focused && !i.viewport().minimized.unwrap_or(false));
+            if active && !self.input.is_capturing() {
+                self.input.start_capture();
+            }
         }
 
         // An explicit CLI `--host` connects once, on the first frame, so the
@@ -694,10 +780,14 @@ impl eframe::App for ClientApp {
         }
 
         self.pointer = ctx.input(|i| i.pointer.latest_pos());
+        // Route capture by focus: when we're foreground the egui key path owns
+        // it and the low-level hook passes through; when not, the hook forwards.
+        self.input
+            .set_window_foreground(ctx.input(|i| i.focused));
         self.drain_session();
         self.enforce_capture_invariants(ctx);
         self.presenter.update(ctx, &self.slot);
-        self.log_metrics();
+        self.log_metrics(ctx);
 
         // Streaming means continuous repaint: the frame slot is written by a
         // background thread, so egui cannot know when new pixels exist. The

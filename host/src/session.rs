@@ -328,6 +328,7 @@ fn media_thread(
     init_tx: Sender<Result<SessionDescription>>,
     ctl_tx: Sender<InputCtl>,
 ) {
+    lower_video_thread_priority("capture/encode");
     let _mf = match MfThread::enter() {
         Ok(g) => g,
         Err(e) => {
@@ -630,12 +631,49 @@ fn build_pipeline(cfg: &SessionConfig) -> Result<Pipeline> {
 
 // ---- input thread ------------------------------------------------------------
 
+/// Nudge the injection thread above the capture/encode/video-egress threads
+/// so `SendInput` preempts them under full video load. This enforces the app's
+/// core "input takes priority over video" invariant at the OS scheduler.
+/// Best-effort: a failure just leaves it at normal priority.
+fn raise_input_thread_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    };
+    // SAFETY: GetCurrentThread returns a pseudo-handle to this very thread; the
+    // priority set is a documented, side-effect-free scheduler hint.
+    unsafe {
+        if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) {
+            tracing::warn!("could not raise input-thread priority: {e}");
+        }
+    }
+}
+
+/// Drop a video thread (capture/encode or datagram sender) below normal so it
+/// yields the CPU to the network runtime and input path. On a weak host, full
+/// 1080p capture+encode+send otherwise saturates every core and starves the
+/// async input-ingress tasks (input_read_loop -> input_loop) and the QUIC
+/// driver's receive side — the observed bug where typed keys did not inject
+/// until the client minimized and video stopped. The other half of the
+/// invariant that [`raise_input_thread_priority`] enforces from the top.
+pub(crate) fn lower_video_thread_priority(what: &str) {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    // SAFETY: pseudo-handle to this thread; priority is a scheduler hint only.
+    unsafe {
+        if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) {
+            tracing::warn!("could not lower {what}-thread priority: {e}");
+        }
+    }
+}
+
 fn input_thread(
     desc: SessionDescription,
     shared: Arc<Shared>,
     events: Receiver<InputEvent>,
     ctl: Receiver<InputCtl>,
 ) {
+    raise_input_thread_priority();
     let mut injector = WinInjector::new(desc.width, desc.height, desc.monitor_origin);
     loop {
         if shared.stop.load(Ordering::Relaxed) {

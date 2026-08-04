@@ -46,6 +46,11 @@ pub struct ConnStats {
     pub keyframes_requested: u32,
     /// Milliseconds capture→send on host, or receive→present on client.
     pub pipeline_ms: f32,
+    /// Host-only: cumulative client input events actually injected via
+    /// `SendInput`. Sent to the client so it can confirm, end to end, that
+    /// keystrokes it transmitted are landing on the host (vs. being received
+    /// but never injected). Zero/unused on the client's own stats.
+    pub input_injected: u64,
 }
 
 /// Validate stats received from the peer (they're informational; reject NaN

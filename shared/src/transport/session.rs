@@ -164,6 +164,11 @@ pub trait Session: Send + Sync {
 struct Counters {
     video_frames_dropped_local: AtomicU64,
     keyframes_requested: AtomicU64,
+    /// Input messages actually framed onto the wire by the input `write_loop`.
+    /// On the client this is the transmit-side twin of the hook's enqueue count
+    /// (`keys`): if enqueued keeps climbing while this stalls, the client's own
+    /// send path is starved (e.g. by decode/render), not just the host.
+    input_events_written: AtomicU64,
 }
 
 struct Shared {
@@ -330,6 +335,16 @@ impl QuicSession {
             .load(Ordering::Relaxed)
     }
 
+    /// Input messages actually framed onto the wire (transmit side). On the
+    /// client, compare against the hook's enqueue count to tell a starved local
+    /// send path apart from a starved host.
+    pub fn input_events_written(&self) -> u64 {
+        self.shared
+            .counters
+            .input_events_written
+            .load(Ordering::Relaxed)
+    }
+
     /// The underlying connection, for callers that need `export_keying_material`
     /// or the peer address.
     pub fn connection(&self) -> &Connection {
@@ -453,6 +468,15 @@ async fn write_loop<T: serde::Serialize + Send + 'static>(
             });
             shared.mark_closed(&format!("{label} stream write failed"));
             return;
+        }
+        // Transmit-side twin of the client's enqueue counter, for diagnosing
+        // whether the sender's own path (not the network or the host) is where
+        // keystrokes stall under load.
+        if label == "input" {
+            shared
+                .counters
+                .input_events_written
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     let _ = stream.finish();
