@@ -1395,9 +1395,10 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
         let streaming = streaming.clone();
         let stop = stop.clone();
         let counters = counters.clone();
+        let fps = inner.cfg.pipeline.target_fps.max(1);
         std::thread::Builder::new()
             .name("dd-video-tx".into())
-            .spawn(move || video_pump(conn, frames, pipeline, streaming, stop, counters))
+            .spawn(move || video_pump(conn, frames, pipeline, streaming, stop, counters, fps))
             .ok()
     };
     if video.is_none() {
@@ -1454,6 +1455,36 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
     reason
 }
 
+/// Below this fragment count a frame is small enough to send in one go; pacing
+/// only matters for the big multi-datagram frames (keyframes, heavy motion)
+/// that otherwise hit the link as a loss-inducing burst.
+const PACING_MIN_FRAGS: usize = 8;
+/// Datagrams per paced sub-burst (one `send_datagram` batch between sleeps).
+const PACING_BATCH: usize = 4;
+
+/// RAII: raise the Windows timer resolution to 1 ms for the video sender's
+/// lifetime so the sub-frame pacing sleeps are actually honoured — the default
+/// ~15 ms scheduler tick would round a 2 ms sleep up to 15 ms and wildly
+/// over-pace. Restored on drop.
+struct TimerResolution;
+impl TimerResolution {
+    fn acquire() -> Self {
+        // SAFETY: documented winmm call, paired with timeEndPeriod(1) in Drop.
+        unsafe {
+            let _ = windows::Win32::Media::timeBeginPeriod(1);
+        }
+        TimerResolution
+    }
+}
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        // SAFETY: matches the timeBeginPeriod(1) from acquire().
+        unsafe {
+            let _ = windows::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
+
 /// Fragment encoded frames into datagrams, newest-first.
 fn video_pump(
     conn: Connection,
@@ -1462,8 +1493,14 @@ fn video_pump(
     streaming: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     counters: Arc<VideoCounters>,
+    target_fps: u32,
 ) {
     crate::session::lower_video_thread_priority("video-tx");
+    let _timer = TimerResolution::acquire();
+    // Spread a frame's fragments across ~60% of a frame interval so the next
+    // frame is still not due when we finish, i.e. pacing adds smoothing without
+    // adding steady-state latency.
+    let pace_window = Duration::from_micros(1_000_000 / target_fps.max(1) as u64) * 3 / 5;
     let start = Instant::now();
     let mut idr = RateLimiter::new(KEYFRAME_MIN_INTERVAL_MS);
 
@@ -1527,7 +1564,20 @@ fn video_pump(
 
         let mut bytes = 0u64;
         let mut failed = false;
-        for frag in frags {
+        let n = frags.len();
+        // Small frames go out immediately; large ones are spread so a keyframe
+        // burst can't tail-drop (which would make quinn evict older queued
+        // datagrams and shred an in-flight frame).
+        let gap = if n > PACING_MIN_FRAGS {
+            let batches = (n as u32).div_ceil(PACING_BATCH as u32).max(1);
+            pace_window / batches
+        } else {
+            Duration::ZERO
+        };
+        for (i, frag) in frags.into_iter().enumerate() {
+            if !gap.is_zero() && i > 0 && i % PACING_BATCH == 0 {
+                std::thread::sleep(gap);
+            }
             bytes += frag.len() as u64;
             if let Err(e) = conn.send_datagram(Bytes::from(frag)) {
                 match e {

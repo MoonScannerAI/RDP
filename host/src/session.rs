@@ -55,7 +55,11 @@ impl Default for SessionConfig {
             target_fps: 60,
             bitrate_kbps: 12_000,
             gop_seconds: 4,
-            idle_repeat_ms: 33,
+            // A still desktop only needs a low-rate keepalive, not ~30 identical
+            // full-frame re-encodes/sec. 250 ms (~4/s) cuts static-screen
+            // bandwidth ~85% and, since each keepalive is forced to an IDR (see
+            // media_thread), lets a frozen screen self-heal from packet loss.
+            idle_repeat_ms: 250,
             force_cpu_convert: false,
             frame_queue_depth: 8,
         }
@@ -423,6 +427,14 @@ fn media_thread(
         shared.counters.captured.fetch_add(1, Ordering::Relaxed);
         win_captured += 1;
         let ts = frame.timestamp_ms;
+
+        // NOTE: idle keepalives are left as ordinary P-frames on purpose. Forcing
+        // an IDR on every static-screen keepalive made each one re-quantize the
+        // whole image slightly differently under CBR, which shows up as a visible
+        // flicker/pulse on colored backgrounds (invisible on white). P-frames of
+        // an unchanged image reproduce identical pixels, so they stay stable; loss
+        // recovery on a static screen is handled reactively by the client's
+        // existing keyframe request when it detects a dropped fragment.
 
         // --- convert + encode -------------------------------------------------
         let encoded = 'encode: {
