@@ -229,7 +229,12 @@ fn main() -> anyhow::Result<()> {
                 SourceMode::LoopbackDemo => {
                     pipeline::spawn_demo_source(slot.clone(), demo_fps, repaint)
                 }
-                SourceMode::Live => pipeline::spawn_decode_thread(video_rx, slot.clone(), repaint),
+                SourceMode::Live => {
+                    // The decode thread asks for a keyframe when a decode fails,
+                    // so it needs the outbound control channel.
+                    let control_tx = session.control_tx.clone();
+                    pipeline::spawn_decode_thread(video_rx, slot.clone(), control_tx, repaint)
+                }
             };
             Ok(Box::new(ClientApp::new(
                 cc,

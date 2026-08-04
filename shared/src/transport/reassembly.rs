@@ -166,9 +166,11 @@ impl ReassemblyConfig {
 /// Cumulative counters describing what the reassembler has seen.
 ///
 /// The fragment counters partition every [`Reassembler::push`] call exactly
-/// once: `fragments_received + fragments_duplicate + fragments_rejected`
-/// equals the number of pushes, where `fragments_rejected` equals the number
-/// of `Err` returns.
+/// once: `fragments_received + fragments_duplicate + fragments_rejected +
+/// fec_parity_received` equals the number of pushes, where `fragments_rejected`
+/// equals the number of `Err` returns. FEC recovery is *not* a push — it bumps
+/// `fec_recovered` (and a slot's internal received count) without touching any
+/// of the partition categories.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReassemblyStats {
     /// Frames fully reassembled and handed to the ready queue.
@@ -193,6 +195,11 @@ pub struct ReassemblyStats {
     /// Fragments refused with an error: malformed header, metadata that
     /// contradicts an existing slot, or a frame exceeding the byte cap.
     pub fragments_rejected: u64,
+    /// Parity fragments accepted into a slot (its own push category).
+    pub fec_parity_received: u64,
+    /// Data fragments reconstructed from a block's parity, never received on the
+    /// wire. Recovery bumps a slot's `received` count but is not a push.
+    pub fec_recovered: u64,
     /// Number of times [`Reassembler::take_keyframe_request`] returned true.
     pub keyframe_requests: u64,
 }
@@ -206,27 +213,51 @@ struct Slot {
     timestamp_ms: u32,
     /// One entry per `frag_index`; `None` until that fragment arrives.
     parts: Vec<Option<Vec<u8>>>,
-    /// Number of `Some` entries in `parts`.
+    /// Number of `Some` entries in `parts` (including FEC-recovered ones).
     received: u16,
     /// Sum of the stored payload lengths.
     bytes: usize,
     /// Injected clock value of the most recent accepted fragment.
     last_update_ms: u64,
+    /// FEC block size K (0 = no FEC). Read from the fragment header.
+    fec_k: u16,
+    /// One entry per FEC block; `None` until that block's parity arrives.
+    /// Empty when `fec_k == 0`.
+    parity: Vec<Option<Vec<u8>>>,
+    /// Byte length of the frame's final (short) data fragment, learned from a
+    /// parity fragment; needed to trim a recovered last fragment.
+    last_frag_len: u16,
+    /// Whether `timestamp_ms` is authoritative. A slot first opened by a parity
+    /// fragment has no real timestamp (parity repurposes that field), so the
+    /// first data fragment adopts one rather than colliding with it.
+    timestamp_known: bool,
 }
 
 impl Slot {
     fn new(header: &FragHeader, now_ms: u64) -> Self {
         // `frag_count` is validated to be 1..=MAX_FRAGS_PER_FRAME by
         // `FragHeader::decode`, so this allocation is bounded by 512 entries.
+        let fec_k = header.block_size as u16;
+        let parity = if fec_k > 0 {
+            vec![None; header.frag_count.div_ceil(fec_k) as usize]
+        } else {
+            Vec::new()
+        };
         Self {
             frame_id: header.frame_id,
             frag_count: header.frag_count,
             keyframe: header.keyframe,
+            // A parity fragment carries no real timestamp (0); the first data
+            // fragment fills it in. `timestamp_known` tracks which is which.
             timestamp_ms: header.timestamp_ms,
             parts: vec![None; header.frag_count as usize],
             received: 0,
             bytes: 0,
             last_update_ms: now_ms,
+            fec_k,
+            parity,
+            last_frag_len: 0,
+            timestamp_known: !header.parity,
         }
     }
 
@@ -363,19 +394,36 @@ impl Reassembler {
 
         let slot_pos = match self.slot_index(header.frame_id) {
             Some(pos) => {
-                let (frag_count, keyframe, timestamp_ms) = {
+                let (frag_count, keyframe, timestamp_ms, timestamp_known) = {
                     let slot = &self.slots[pos];
-                    (slot.frag_count, slot.keyframe, slot.timestamp_ms)
+                    (
+                        slot.frag_count,
+                        slot.keyframe,
+                        slot.timestamp_ms,
+                        slot.timestamp_known,
+                    )
                 };
-                if frag_count != header.frag_count
+                // Parity fragments repurpose the timestamp field, so only frame
+                // geometry and the keyframe flag are comparable for them. Data
+                // fragments additionally pin the capture timestamp — but only
+                // once one has been recorded, since a slot opened by a parity
+                // fragment carries no authoritative timestamp yet.
+                let contradiction = frag_count != header.frag_count
                     || keyframe != header.keyframe
-                    || timestamp_ms != header.timestamp_ms
-                {
+                    || (!header.parity && timestamp_known && timestamp_ms != header.timestamp_ms);
+                if contradiction {
                     self.stats.fragments_rejected += 1;
                     return Err(Error::Invalid(format!(
                         "fragment {}/{} of frame {} contradicts its slot",
                         header.frag_index, header.frag_count, header.frame_id
                     )));
+                }
+                // First data fragment for a parity-opened slot adopts the real
+                // timestamp.
+                if !header.parity && !timestamp_known {
+                    let slot = &mut self.slots[pos];
+                    slot.timestamp_ms = header.timestamp_ms;
+                    slot.timestamp_known = true;
                 }
                 pos
             }
@@ -399,6 +447,41 @@ impl Reassembler {
                 }
             }
         };
+
+        // Parity fragment: it never occupies a data slot. It records its block's
+        // parity, may enable an immediate single-loss recovery, and can itself
+        // complete a frame whose last missing data fragment it reconstructs.
+        if header.parity {
+            let block = header.frag_index as usize;
+            {
+                let slot = &mut self.slots[slot_pos];
+                if block >= slot.parity.len() {
+                    // Decode already bounds the block index against the block
+                    // count; a mismatch here means a slot opened with a
+                    // different K, which we do not trust.
+                    self.stats.fragments_rejected += 1;
+                    return Err(Error::Invalid(format!(
+                        "parity block {} out of range for frame {}",
+                        block, header.frame_id
+                    )));
+                }
+                if slot.parity[block].is_some() {
+                    self.stats.fragments_duplicate += 1;
+                    return Ok(false);
+                }
+                slot.parity[block] = Some(payload.to_vec());
+                slot.last_frag_len = header.last_frag_len;
+                slot.last_update_ms = now_ms;
+            }
+            self.stats.fec_parity_received += 1;
+            self.try_recover(slot_pos);
+            if self.slots[slot_pos].received < self.slots[slot_pos].frag_count {
+                return Ok(false);
+            }
+            let frame = self.slots.remove(slot_pos).into_frame();
+            self.complete(frame);
+            return Ok(true);
+        }
 
         let index = header.frag_index as usize;
         if self.slots[slot_pos].parts[index].is_some() {
@@ -430,6 +513,10 @@ impl Reassembler {
         }
         self.stats.fragments_received += 1;
 
+        // A newly arrived data fragment can drop a block from two-missing to
+        // one-missing, so parity recovery is retried on every data arrival.
+        self.try_recover(slot_pos);
+
         if self.slots[slot_pos].received < self.slots[slot_pos].frag_count {
             return Ok(false);
         }
@@ -437,6 +524,76 @@ impl Reassembler {
         let frame = self.slots.remove(slot_pos).into_frame();
         self.complete(frame);
         Ok(true)
+    }
+
+    /// XOR-recover a single missing data fragment per parity block.
+    ///
+    /// For each block whose parity fragment has arrived, if exactly one of the
+    /// block's data fragments is still missing it is reconstructed as the XOR of
+    /// the parity payload with every present data fragment in the block. A block
+    /// missing two or more fragments is beyond single-parity FEC and is left to
+    /// the normal timeout/keyframe path. Recovery bumps the slot's `received`
+    /// count and `fec_recovered`; it is never a push and never a duplicate.
+    fn try_recover(&mut self, slot_pos: usize) {
+        let slot = &mut self.slots[slot_pos];
+        if slot.fec_k == 0 {
+            return;
+        }
+        let k = slot.fec_k as usize;
+        let frag_count = slot.frag_count as usize;
+        let num_blocks = slot.parity.len();
+        for b in 0..num_blocks {
+            let Some(par) = slot.parity[b].as_ref() else {
+                continue;
+            };
+            let lo = b * k;
+            let hi = ((b + 1) * k).min(frag_count);
+            // Recoverable only when exactly one data index in the block is
+            // still missing.
+            let mut missing: Option<usize> = None;
+            let mut recoverable = true;
+            for i in lo..hi {
+                if slot.parts[i].is_none() {
+                    if missing.is_some() {
+                        recoverable = false;
+                        break;
+                    }
+                    missing = Some(i);
+                }
+            }
+            let (Some(m), true) = (missing, recoverable) else {
+                continue;
+            };
+            // Reconstruct: parity XOR every present data fragment in the block.
+            let mut recon = par.clone();
+            for i in lo..hi {
+                if i == m {
+                    continue;
+                }
+                if let Some(part) = slot.parts[i].as_ref() {
+                    for (j, &byte) in part.iter().enumerate() {
+                        recon[j] ^= byte;
+                    }
+                }
+            }
+            // Only the final data fragment is short; the parity header carries
+            // its true length. Every other recovered fragment is the full
+            // parity width.
+            let true_len = if m == frag_count - 1 {
+                slot.last_frag_len as usize
+            } else {
+                recon.len()
+            };
+            if true_len > recon.len() {
+                // Contradictory geometry: refuse to fabricate bytes.
+                continue;
+            }
+            recon.truncate(true_len);
+            slot.bytes = slot.bytes.saturating_add(recon.len());
+            slot.parts[m] = Some(recon);
+            slot.received += 1;
+            self.stats.fec_recovered += 1;
+        }
     }
 
     /// Pop the next completed frame, honouring
@@ -749,7 +906,9 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video::{fragment_frame, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME};
+    use crate::video::{
+        fragment_frame, fragment_frame_fec, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME,
+    };
 
     /// Deterministic payload of `len` bytes.
     fn payload(len: usize) -> Vec<u8> {
@@ -782,11 +941,33 @@ mod tests {
             frag_index,
             frag_count,
             keyframe,
+            parity: false,
+            block_size: 0,
+            last_frag_len: 0,
             timestamp_ms: ts,
         }
         .encode(&mut out);
         out.resize(FRAG_HEADER_LEN + payload_len, 0x5A);
         out
+    }
+
+    /// Fragments for one synthetic frame *with* FEC parity, via the real
+    /// `fragment_frame_fec`.
+    fn frags_fec(
+        id: u32,
+        keyframe: bool,
+        ts: u32,
+        len: usize,
+        mtu: usize,
+        k: u8,
+    ) -> Vec<Vec<u8>> {
+        let frame = EncodedFrame {
+            frame_id: id,
+            keyframe,
+            timestamp_ms: ts,
+            data: payload(len),
+        };
+        fragment_frame_fec(&frame, mtu, k).expect("fragment_frame_fec")
     }
 
     /// Push `order` (fragment indices) at a fixed instant; returns how many
@@ -1077,15 +1258,13 @@ mod tests {
         // Header with no payload.
         let empty = forge(1, 0, 1, false, 0, 0);
         assert!(r.push(&empty, 0).is_err());
-        // Reserved byte set.
-        let mut reserved = forge(1, 0, 1, false, 0, 8);
-        reserved[9] = 1;
-        assert!(r.push(&reserved, 0).is_err());
-        // Unknown flag bits.
+        // Offset 9 is now `block_size`, no longer a must-be-zero reserved byte;
+        // a non-zero value is a valid FEC K, so it must NOT be rejected here.
+        // Unknown flag bits (bit 2 and up are undefined) are still rejected.
         let mut flags = forge(1, 0, 1, false, 0, 8);
         flags[8] = 0b1000_0000;
         assert!(r.push(&flags, 0).is_err());
-        assert_eq!(r.stats().fragments_rejected, 4);
+        assert_eq!(r.stats().fragments_rejected, 3);
         assert_eq!(r.stats().fragments_received, 0);
         // Still usable.
         let f = frags(1, true, 5, 2000, 1024);
@@ -1526,5 +1705,162 @@ mod tests {
         let f = frags(0, true, 0, 64, 1200);
         assert!(r.push(&f[0], 0).expect("push"));
         assert_eq!(r.pop_frame().expect("frame").frame_id, 0);
+    }
+
+    /// FEC reconstructs a single lost data fragment per block with no stall:
+    /// dropping one data fragment in *every* block still completes the frame,
+    /// and the recovered keyframe satisfies the keyframe demand.
+    #[test]
+    fn fec_recovers_one_loss_per_block_without_keyframe() {
+        let mut r = Reassembler::new(ReassemblyConfig {
+            slot_timeout_ms: 100_000,
+            stale_frame_distance: 64,
+            ..cfg()
+        });
+        let k = 4u8;
+        let f = frags_fec(1, true, 42, 10_000, 1200, k);
+        let chunk = 1200 - FRAG_HEADER_LEN;
+        let n = 10_000usize.div_ceil(chunk);
+        let num_blocks = n.div_ceil(k as usize);
+        assert!(num_blocks >= 2, "want a multi-block frame");
+        assert_eq!(f.len(), n + num_blocks);
+
+        // The first data fragment of every block is lost. Data fragments are at
+        // [0, n); parity fragments at [n, f.len()).
+        let dropped: Vec<usize> = (0..num_blocks).map(|b| b * k as usize).collect();
+
+        // Push all parity first — this exercises the parity-before-data path,
+        // where the slot is first opened by a parity fragment.
+        let mut completed = 0;
+        for p in n..f.len() {
+            if r.push(&f[p], 0).expect("push parity") {
+                completed += 1;
+            }
+        }
+        for i in 0..n {
+            if dropped.contains(&i) {
+                continue;
+            }
+            if r.push(&f[i], 0).expect("push data") {
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 1, "frame completes via recovery");
+
+        let frame = r.pop_frame().expect("frame");
+        assert_eq!(frame.frame_id, 1);
+        assert!(frame.keyframe);
+        assert_eq!(frame.timestamp_ms, 42, "real timestamp adopted from data");
+        assert_eq!(frame.data, payload(10_000));
+        assert!(r.stats().fec_recovered >= num_blocks as u64);
+        assert_eq!(r.stats().fec_parity_received, num_blocks as u64);
+        // The keyframe reached the decoder, recovered and all: no demand.
+        assert!(!r.take_keyframe_request(0));
+    }
+
+    /// Two losses in one block are beyond single-parity FEC: the frame cannot
+    /// complete, and the slot eventually ages out and demands a keyframe.
+    #[test]
+    fn fec_cannot_recover_two_losses_in_a_block() {
+        let mut r = Reassembler::new(ReassemblyConfig {
+            slot_timeout_ms: 500,
+            stale_frame_distance: 64,
+            ..cfg()
+        });
+        let k = 4u8;
+        let f = frags_fec(7, false, 7, 10_000, 1200, k);
+
+        // Drop two data fragments from block 0 (indices 0 and 1).
+        let mut completed = 0;
+        for (idx, d) in f.iter().enumerate() {
+            if idx == 0 || idx == 1 {
+                continue;
+            }
+            if r.push(d, 1000).expect("push") {
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 0, "two losses in one block is unrecoverable");
+        assert!(r.pop_frame().is_none());
+
+        // No completion, so the slot times out and a keyframe is demanded.
+        r.tick(2000);
+        assert_eq!(r.stats().frames_dropped_incomplete, 1);
+        assert!(r.take_keyframe_request(2000));
+    }
+
+    /// A parity fragment for a frame that already completed must be ignored as a
+    /// late duplicate — no panic, no new push category, invariant intact.
+    #[test]
+    fn parity_for_completed_frame_is_ignored() {
+        let mut r = Reassembler::new(cfg());
+        let k = 4u8;
+        let f = frags_fec(3, true, 3, 10_000, 1200, k);
+        let n = 10_000usize.div_ceil(1200 - FRAG_HEADER_LEN);
+
+        // Every data fragment arrives: the frame completes without parity.
+        let mut completed = 0;
+        for i in 0..n {
+            if r.push(&f[i], 0).expect("push") {
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 1);
+
+        // A straggling parity fragment for that finished frame now arrives.
+        let before = r.stats();
+        let done = r.push(&f[n], 0).expect("push parity");
+        assert!(!done, "parity for a completed frame does nothing");
+        assert_eq!(r.stats().fec_parity_received, before.fec_parity_received);
+        assert_eq!(r.stats().fragments_duplicate, before.fragments_duplicate + 1);
+    }
+
+    /// The push partition must still hold with parity fragments, recovery,
+    /// duplicates and a malformed datagram all mixed together.
+    #[test]
+    fn stats_partition_holds_with_fec_fragments() {
+        let mut r = Reassembler::new(ReassemblyConfig {
+            slot_timeout_ms: 100_000,
+            stale_frame_distance: 64,
+            ..cfg()
+        });
+        let k = 4u8;
+        let f = frags_fec(20, true, 20, 10_000, 1200, k);
+        let n = 10_000usize.div_ceil(1200 - FRAG_HEADER_LEN);
+        let mut pushes = 0u64;
+
+        // Parity first (accepted into `fec_parity_received`), then data with
+        // index 1 dropped so a block genuinely recovers from its parity.
+        for p in n..f.len() {
+            let _ = r.push(&f[p], 0);
+            pushes += 1;
+        }
+        for i in 0..n {
+            if i == 1 {
+                continue;
+            }
+            let _ = r.push(&f[i], 0);
+            pushes += 1;
+        }
+        // One of each remaining category: duplicate parity, duplicate/late data,
+        // malformed datagram.
+        let _ = r.push(&f[n], 0);
+        pushes += 1;
+        let _ = r.push(&f[0], 0);
+        pushes += 1;
+        assert!(r.push(&[0u8; 3], 0).is_err());
+        pushes += 1;
+
+        let s = r.stats();
+        assert!(s.fec_parity_received >= 1, "parity was accepted");
+        assert!(s.fec_recovered >= 1, "a fragment was recovered");
+        assert_eq!(
+            s.fragments_received
+                + s.fragments_duplicate
+                + s.fragments_rejected
+                + s.fec_parity_received,
+            pushes,
+            "every push falls into exactly one partition category"
+        );
     }
 }

@@ -14,9 +14,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
+use directdesk_shared::protocol::ControlMsg;
 use directdesk_shared::traits::{Decoder, PixelFormat, RawFrame};
 use directdesk_shared::video::EncodedFrame;
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use crate::renderer::FrameSlot;
 
@@ -83,6 +85,7 @@ impl Drop for Pipeline {
 pub fn spawn_decode_thread(
     video_rx: Receiver<EncodedFrame>,
     slot: Arc<FrameSlot>,
+    control_tx: mpsc::Sender<ControlMsg>,
     repaint: impl Fn() + Send + 'static,
 ) -> Pipeline {
     let status = Arc::new(SourceStatus::default());
@@ -130,7 +133,16 @@ pub fn spawn_decode_thread(
                                 tracing::warn!(frame_id = frame.frame_id, "decode failed: {e}");
                                 status.set_error(Some(e.to_string()));
                                 // Corrupt state: only a fresh IDR can recover.
+                                // Flushing alone drops the bad reference chain
+                                // but leaves the decoder starved until the host
+                                // happens to send a keyframe — so ask for one.
+                                // `try_send` never blocks this thread; a full
+                                // control queue already has a keyframe request
+                                // pending, so dropping this one is harmless.
                                 decoder.flush();
+                                if let Err(err) = control_tx.try_send(ControlMsg::RequestKeyframe) {
+                                    tracing::warn!("keyframe request dropped: {err}");
+                                }
                             }
                         }
                     }

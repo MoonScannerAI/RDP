@@ -97,7 +97,7 @@ use directdesk_shared::transport::quic::{self, QuicParams, SessionStreams};
 use directdesk_shared::transport::session::{
     QuicSession, Session, SessionConfig as DriverConfig, SessionEvent,
 };
-use directdesk_shared::video::{fragment_frame, EncodedFrame};
+use directdesk_shared::video::{fragment_frame_fec, EncodedFrame};
 use directdesk_shared::{Error, Result};
 
 use crate::session::{HostSession, SessionConfig as PipelineConfig, SessionState};
@@ -1461,6 +1461,10 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
 const PACING_MIN_FRAGS: usize = 8;
 /// Datagrams per paced sub-burst (one `send_datagram` batch between sleeps).
 const PACING_BATCH: usize = 4;
+/// FEC block size K: one XOR-parity fragment is appended per this many data
+/// fragments, so any single lost data fragment in a block is reconstructed by
+/// the receiver with no keyframe stall. `0` would disable FEC.
+const FEC_BLOCK_SIZE: u8 = 10;
 
 /// RAII: raise the Windows timer resolution to 1 ms for the video sender's
 /// lifetime so the sub-frame pacing sleeps are actually honoured — the default
@@ -1554,7 +1558,11 @@ fn video_pump(
             continue;
         }
 
-        let frags = match fragment_frame(&frame, mtu) {
+        // FEC parity fragments are appended after the data fragments. The
+        // buffer-space precheck above still guards only the DATA frame; the
+        // parity is best-effort, so if it cannot be placed the frame is still
+        // whole and decodable on its own.
+        let frags = match fragment_frame_fec(&frame, mtu, FEC_BLOCK_SIZE) {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("cannot fragment frame {}: {e}", frame.frame_id);
@@ -1891,6 +1899,9 @@ pub fn expected_channels() -> [Channel; 2] {
 mod tests {
     use super::*;
     use directdesk_shared::crypto::pairing::PAIRING_CODE_DIGITS;
+    // Data-only fragmenter: `wire_size` models exactly its output, so the tests
+    // that pin that relationship exercise it directly.
+    use directdesk_shared::video::fragment_frame;
 
     // -- pairing window ----------------------------------------------------
 
