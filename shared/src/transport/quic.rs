@@ -64,9 +64,12 @@ use crate::protocol::{
 /// Keep-alive interval. Also holds NAT mappings open.
 pub const DEFAULT_KEEP_ALIVE_MS: u64 = 5_000;
 
-/// Idle timeout. Three keep-alive intervals, so a couple of lost keep-alives
-/// do not kill a working session.
-pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 15_000;
+/// Idle timeout. Sized so a session survives a multi-second capture stall (a
+/// host UAC/secure-desktop prompt freezes video until an operator dismisses it,
+/// often over a side channel) without the connection idling out. Six keep-alive
+/// intervals: several lost keep-alives, or a long freeze during which the host
+/// still emits keep-alives, do not kill a working session.
+pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
 
 /// Datagram receive buffer: roughly a few 1080p frames of fragments.
 pub const DEFAULT_DATAGRAM_RECV_BUFFER: usize = 4 * 1024 * 1024;
