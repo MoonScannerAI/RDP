@@ -57,6 +57,11 @@ struct HostObservations {
     inputs: Mutex<Vec<InputMsg>>,
     got_start_stream: AtomicBool,
     real_frames: AtomicBool,
+    /// Set only when [`spawn_frame_producer`]'s real-capture attempt actually
+    /// failed and it fell back to the synthetic Annex-B generator. Distinct
+    /// from "neither flag is set yet", which means the producer thread is
+    /// still inside `HostSession::start` and hasn't sent a frame at all.
+    synthetic_fallback: AtomicBool,
 }
 
 /// A running loopback host. Dropping / setting `stop` tears it down.
@@ -367,6 +372,7 @@ fn spawn_frame_producer(
                 host.shutdown();
             }
             Err(e) => {
+                obs.synthetic_fallback.store(true, Ordering::SeqCst);
                 eprintln!("[host] real capture unavailable ({e}); frame source: SYNTHETIC Annex-B");
                 let interval = Duration::from_millis(1000 / 60);
                 let mut id: u32 = 0;
@@ -492,20 +498,52 @@ async fn pair_stream_and_input_end_to_end() {
         .await
         .expect("queue input");
 
-    // Count frames arriving over the client's video channel for 3 s.
+    // Count frames arriving over the client's video channel.
+    //
+    // The 3s throughput window opens at the *first received frame*, not at
+    // Connected: spawn_frame_producer's real-capture path blocks inside
+    // HostSession::start (Media Foundation + DDA capture init — observed
+    // 1.0-3.5s) before it ever calls send_video for the first time. Starting
+    // the clock at Connected races that init and undercounts (or zeroes)
+    // frames through no fault of the streaming path itself. Waiting for the
+    // first frame first, with a generous separate deadline, isolates "the
+    // producer never started" from "the producer started but throughput is
+    // low" as two distinct failures.
     let mut frames = 0u64;
     let mut bytes = 0u64;
     let mut first_keyframe: Option<Vec<u8>> = None;
-    let window = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < window {
-        while let Ok(f) = client.video_rx.try_recv() {
+
+    // Phase A — wait (up to 15s) for the first frame. This frame counts
+    // toward the throughput total below.
+    let init_deadline = Instant::now() + Duration::from_secs(15);
+    let mut got_first = false;
+    while Instant::now() < init_deadline {
+        if let Ok(f) = client.video_rx.try_recv() {
             frames += 1;
             bytes += f.data.len() as u64;
             if f.keyframe && first_keyframe.is_none() {
                 first_keyframe = Some(f.data.clone());
             }
+            got_first = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Phase B — with the window now anchored to real producer activity,
+    // measure sustained throughput for 3s.
+    if got_first {
+        let window = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < window {
+            while let Ok(f) = client.video_rx.try_recv() {
+                frames += 1;
+                bytes += f.data.len() as u64;
+                if f.keyframe && first_keyframe.is_none() {
+                    first_keyframe = Some(f.data.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     // Give the injected input a moment to traverse the wire.
@@ -527,7 +565,22 @@ async fn pair_stream_and_input_end_to_end() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
+    // Three distinct producer states, not two: `real` and `synthetic_fallback`
+    // are only set once the corresponding branch of spawn_frame_producer
+    // actually ran; if neither is set, the producer thread is still (or was
+    // still, when the test gave up) blocked inside HostSession::start and
+    // never sent a single frame. Previously the diagnostics conflated
+    // "not started yet" with "genuine synthetic fallback" by printing
+    // "synthetic Annex-B" whenever `real_frames` was false.
     let real = host.obs.real_frames.load(Ordering::SeqCst);
+    let synthetic = host.obs.synthetic_fallback.load(Ordering::SeqCst);
+    let source = if real {
+        "REAL MF H.264"
+    } else if synthetic {
+        "synthetic Annex-B (fallback)"
+    } else {
+        "producer never started (no frame observed)"
+    };
     let head: Vec<u8> = first_keyframe
         .as_ref()
         .map(|d| d.iter().take(8).copied().collect())
@@ -538,14 +591,7 @@ async fn pair_stream_and_input_end_to_end() {
         .unwrap_or(false);
 
     eprintln!("=== e2e loopback results ===");
-    eprintln!(
-        "frame source     : {}",
-        if real {
-            "REAL MF H.264"
-        } else {
-            "synthetic Annex-B"
-        }
-    );
+    eprintln!("frame source     : {source}");
     eprintln!("frames in 3s     : {frames}");
     eprintln!("bytes received   : {bytes}");
     eprintln!(
@@ -562,7 +608,15 @@ async fn pair_stream_and_input_end_to_end() {
     client_task.abort();
     host.shutdown().await;
 
-    assert!(frames >= 60, "expected >= 60 frames in 3s, got {frames}");
+    assert!(
+        got_first,
+        "producer never delivered a frame within 15s; frame source: {source}"
+    );
+    assert!(
+        frames >= 60,
+        "expected >= 60 frames in the 3s window starting at the first received \
+         frame, got {frames}; frame source: {source}"
+    );
     assert!(bytes > 0, "no video bytes received");
     assert!(first_keyframe.is_some(), "no keyframe arrived");
     assert!(annexb, "first keyframe is not Annex-B: head {head:02x?}");
