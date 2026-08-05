@@ -52,6 +52,10 @@ pub struct HostConfig {
     /// Seconds between forced IDR frames.
     pub gop_seconds: u32,
     /// Re-send the last image after this long with no desktop change (ms).
+    /// `0` disables the keepalive entirely. See the migration in [`sanitized`]:
+    /// the old `33` default is healed on load.
+    ///
+    /// [`sanitized`]: HostConfig::sanitized
     pub idle_repeat_ms: u32,
     /// Start with the window hidden in the tray. `--minimized` also sets this
     /// for one run without persisting it.
@@ -70,7 +74,7 @@ impl Default for HostConfig {
             bitrate_kbps: 12_000,
             bitrate_cap_kbps: None,
             gop_seconds: 4,
-            idle_repeat_ms: 33,
+            idle_repeat_ms: 250,
             start_minimized: false,
         }
     }
@@ -192,6 +196,14 @@ impl HostConfig {
         }
         self.target_fps = self.target_fps.clamp(1, 240);
         self.gop_seconds = self.gop_seconds.clamp(1, 30);
+        // Migration: 33 ms was the old default — ~30 identical full frames a
+        // second on a still desktop. Every host that ever started once has it
+        // persisted, so the fix would never reach them without healing it here.
+        // The cost is that a *deliberate* 33 is no longer expressible; nothing
+        // offers it and 30/s of identical frames is not what anyone meant.
+        if self.idle_repeat_ms == 33 {
+            self.idle_repeat_ms = 250;
+        }
         self.idle_repeat_ms = self.idle_repeat_ms.min(5_000);
         self.bitrate_kbps = self.bitrate_kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
         self.bitrate_cap_kbps = self
@@ -293,6 +305,36 @@ mod tests {
         assert!(validate_name(&long).is_ok());
         assert!(validate_name(&sanitize_name("héllo wörld").unwrap()).is_ok());
         assert!(validate_name(&default_display_name()).is_ok());
+    }
+
+    #[test]
+    fn idle_repeat_heals_the_old_default() {
+        // A host that has run before has 33 persisted; the bandwidth fix has to
+        // reach it on load, not only on a fresh install.
+        let healed = HostConfig {
+            idle_repeat_ms: 33,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(healed.idle_repeat_ms, 250);
+        assert_eq!(HostConfig::default().idle_repeat_ms, 250);
+
+        // Any other value is the operator's, including 0 (keepalive off).
+        for kept in [0u32, 100] {
+            let c = HostConfig {
+                idle_repeat_ms: kept,
+                ..Default::default()
+            }
+            .sanitized();
+            assert_eq!(c.idle_repeat_ms, kept);
+        }
+        // The clamp still applies on top of the migration.
+        let clamped = HostConfig {
+            idle_repeat_ms: 99_999,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(clamped.idle_repeat_ms, 5_000);
     }
 
     #[test]

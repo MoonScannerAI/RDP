@@ -242,7 +242,14 @@ pub async fn run_client(
             // Generous: the decode thread drains eagerly and does latest-wins,
             // so we must not throw inbound video away at the transport seam.
             video_capacity: 256,
-            reassembly: ReassemblyConfig::default(),
+            // Tighter than the shared 500ms default: paired with the client's
+            // KeyframeGate (pipeline.rs), a gap should get a fresh IDR request
+            // on the wire sooner. Leave the shared default alone — sim
+            // baselines depend on it.
+            reassembly: ReassemblyConfig {
+                keyframe_request_min_interval_ms: 250,
+                ..ReassemblyConfig::default()
+            },
         };
         let (session, receivers) = match QuicSession::start(conn, streams, route, cfg) {
             Ok(pair) => pair,
@@ -447,6 +454,11 @@ async fn forward_events(
                 closed.notify_waiters();
                 return;
             }
+            // Intentional no-op: the reassembler already emitted the wire-level
+            // keyframe request (rate-limited by `keyframe_request_min_interval_ms`
+            // above) when it detected the gap. That path is authoritative —
+            // do NOT add a second `ControlMsg::RequestKeyframe` send here, or
+            // gaps end up double-requested.
             SessionEvent::KeyframeNeeded => {}
             SessionEvent::Warning { detail } => tracing::debug!("session warning: {detail}"),
         }

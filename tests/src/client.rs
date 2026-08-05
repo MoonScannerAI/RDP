@@ -66,6 +66,44 @@ pub struct PresentSlot {
     pub route: Route,
 }
 
+/// Mirrors the client's `KeyframeGate` (`client/src/pipeline.rs`, B1).
+///
+/// The reassembler hands over any frame that completes, in id order subject
+/// to latest-wins, with no idea whether the decoder actually has the
+/// reference a delta frame needs — that is what let the field bug's oversized
+/// frame get dropped (e.g. to a tail-burst loss the FEC block couldn't cover)
+/// and the very next, perfectly intact delta frame get decoded against a
+/// reference the decoder never received. The gate closes that hole: a delta
+/// frame is only admitted when its id is exactly one past the last frame
+/// admitted; anything else opens (or extends) a wait that only a keyframe can
+/// close. Only active when [`SimConfig::gate_delta_after_gap`] opts in, so it
+/// never perturbs a row that isn't testing it.
+#[derive(Debug, Clone, Copy, Default)]
+struct KeyframeGate {
+    last_id: Option<u32>,
+    waiting: bool,
+}
+
+impl KeyframeGate {
+    /// Whether `frame_id` may be handed to the decoder. Updates gate state.
+    fn admit(&mut self, frame_id: u32, keyframe: bool) -> bool {
+        if keyframe {
+            self.last_id = Some(frame_id);
+            self.waiting = false;
+            return true;
+        }
+        let contiguous = self
+            .last_id
+            .is_some_and(|last| frame_id == last.wrapping_add(1));
+        if self.waiting || !contiguous {
+            self.waiting = true;
+            return false;
+        }
+        self.last_id = Some(frame_id);
+        true
+    }
+}
+
 /// Fragment accounting for one loss-measurement window.
 #[derive(Debug, Clone, Copy, Default)]
 struct LossWindow {
@@ -113,6 +151,7 @@ pub struct SimClient {
     mux_reader: MuxReader,
     present: Option<PresentSlot>,
     route: Route,
+    gate: KeyframeGate,
 
     input_seq: u32,
     last_input_ms: Option<u64>,
@@ -150,6 +189,7 @@ impl SimClient {
             mux_reader: MuxReader::new(),
             present: None,
             route: Route::Datagram,
+            gate: KeyframeGate::default(),
             input_seq: 0,
             last_input_ms: None,
             last_ping_ms: None,
@@ -264,6 +304,13 @@ impl SimClient {
                 });
                 return Ok(());
             }
+        }
+        if self.cfg.gate_delta_after_gap && !self.gate.admit(frame.frame_id, frame.keyframe) {
+            ctx.log.push(SimEvent::FrameGated {
+                at_ms: ctx.now_ms,
+                frame_id: frame.frame_id,
+            });
+            return Ok(());
         }
         let decoded = self.decoder.decode(frame)?;
         let hash_ok = decoded
@@ -404,6 +451,7 @@ impl SimClient {
                 // referenced the old one rather than present half a frame.
                 self.reassembler.reset(ctx.now_ms);
                 self.decoder.flush();
+                self.gate = KeyframeGate::default();
             }
             _ => {}
         }

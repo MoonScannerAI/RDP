@@ -601,11 +601,26 @@ impl HostApp {
                         ui.strong("Pipeline");
                         ui.monospace(format!("{:.2} ms/frame", p.pipeline_ms));
                         ui.end_row();
+
+                        ui.strong("Paced bursts");
+                        ui.monospace(status.pace_deadline_bursts.to_string());
+                        ui.strong("Slowest frame");
+                        ui.monospace(format!("{} ms (1s)", status.emit_ms_max));
+                        ui.end_row();
+
+                        ui.strong("Unfragmentable");
+                        ui.monospace(status.frames_unfragmentable.to_string());
+                        ui.strong("Skipped (full)");
+                        ui.monospace(status.frames_backpressured.to_string());
+                        ui.end_row();
                     });
                 ui.label(
                 egui::RichText::new(
-                    "\"Skipped\" counts frames the encoder produced while the link was behind. \
-                     The newest frame is always the one sent.",
+                    "\"Skipped\" counts frames the encoder produced while the link was behind — \
+                     stale means a newer frame superseded it, full means the link had no room \
+                     for a whole one. The newest frame is always the one sent. \"Paced bursts\" \
+                     are big frames sent all at once because spreading them would have taken \
+                     too long.",
                 )
                 .small(),
             );

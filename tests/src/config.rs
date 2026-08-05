@@ -63,6 +63,52 @@ pub struct SimConfig {
     pub mux_bytes_per_tick: usize,
     /// Video backlog the fallback mux will hold before shedding the oldest.
     pub mux_max_video_backlog: usize,
+    /// FEC block size for datagram video fragmentation, mirroring
+    /// `host/src/net.rs`'s `FEC_BLOCK_SIZE`. `0` (the default) disables FEC
+    /// entirely and fragments via [`directdesk_shared::video::fragment_frame`],
+    /// which is every existing row's behavior, unchanged.
+    pub fec_block: u8,
+    /// A one-shot oversized-frame-plus-tail-loss injection (the B3 hardening
+    /// scenario). `None` for every row except the one that exercises it.
+    pub burst_injection: Option<BurstInjection>,
+    /// Mirrors the client's `KeyframeGate` (`client/src/pipeline.rs`, B1): when
+    /// set, the simulated client refuses to hand a delta frame to the decoder
+    /// unless its id is exactly one past the last frame it admitted, closing
+    /// the gap only on a keyframe. Off by default so it can never perturb a
+    /// row that isn't testing it.
+    pub gate_delta_after_gap: bool,
+}
+
+/// A single deliberately damaged frame: encoded oversized, then has specific
+/// fragments withheld from the wire before it is sent.
+///
+/// Two independent kinds of damage, so a test can combine them the way a real
+/// scene-change spike does — some fragments lost to ordinary background
+/// conditions scattered through the frame, plus a burst of consecutive loss
+/// landing on the *tail* of the transmission (a congested link or an eviction
+/// at the sender both look like this):
+///
+/// * `drop_data_indices` — arbitrary data fragment indices withheld
+///   regardless of position, one per FEC block, so that block needs its own
+///   parity fragment to recover.
+/// * `tail_drop_frags` — the last N fragments of the wire order
+///   [`fragment_frame_fec`](directdesk_shared::video::fragment_frame_fec)
+///   actually returns are withheld. Before B3 that wire order was every data
+///   fragment followed by every parity fragment, so any tail burst destroyed
+///   *all* of a frame's redundancy at once; after B3 each block's parity
+///   immediately follows its own data, so the same burst can cost at most the
+///   trailing block.
+#[derive(Debug, Clone)]
+pub struct BurstInjection {
+    /// The captured frame this applies to (matches `EncodedFrame::frame_id`).
+    pub frame_id: u32,
+    /// Encoded size to use for this one frame, standing in for the 6-18x
+    /// scene-change spike the field bug report measured.
+    pub size_bytes: usize,
+    /// Data fragment indices to withhold, independent of the tail burst.
+    pub drop_data_indices: Vec<u16>,
+    /// Fragments to withhold, counted back from the end of the wire order.
+    pub tail_drop_frags: usize,
 }
 
 impl Default for SimConfig {
@@ -82,6 +128,9 @@ impl Default for SimConfig {
             fallback_probe_ms: 1_000,
             mux_bytes_per_tick: 400,
             mux_max_video_backlog: 3,
+            fec_block: 0,
+            burst_injection: None,
+            gate_delta_after_gap: false,
         }
     }
 }

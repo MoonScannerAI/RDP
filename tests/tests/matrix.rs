@@ -20,7 +20,8 @@ use directdesk_tests::assertions::{
     assert_all_hashes_ok, assert_contiguous, assert_strictly_increasing, max_age_ms, mean_age_ms,
 };
 use directdesk_tests::{
-    assert_logs_match, MuxClass, Route, Sim, SimConfig, FRAME_RECORD_HEADER_LEN, MUX_HEADER_LEN,
+    assert_logs_match, BurstInjection, MuxClass, Route, Sim, SimConfig, FRAME_RECORD_HEADER_LEN,
+    MUX_HEADER_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -190,6 +191,41 @@ fn row_udp_blocked() -> Result<Sim> {
     Ok(sim)
 }
 
+/// B3: an 8x oversized frame, FEC-fragmented, takes a tail-burst loss.
+///
+/// Frame [`BURST_FRAME_ID`] is captured at 8x the normal size and fragmented
+/// with [`BURST_FEC_BLOCK`]-sized FEC blocks. Before it goes out, two kinds of
+/// damage are applied deterministically (see [`BurstInjection`]): one data
+/// fragment is withheld from each block but the trailing one — ordinary
+/// scattered loss — and then the trailing 4 fragments of the wire order are
+/// withheld outright, a burst landing on the tail of the transmission (a
+/// congested link or a sender-side eviction both look like this). Those 4
+/// fragments are exactly the trailing block's own data and parity, so that
+/// block has nothing left to recover from and the frame itself is lost. The
+/// row exists to show what does *not* also fail with it: the four other
+/// blocks each lost exactly one data fragment and kept their own parity — B3
+/// interleaves each block's parity immediately after its own data instead of
+/// clustering every block's parity at the tail, which is exactly where this
+/// burst lands — so all four recover.
+const BURST_FRAME_ID: u32 = 30;
+const BURST_FEC_BLOCK: u8 = 6;
+const DURATION_BURST: u64 = 8_000;
+
+fn row_oversized_tail_burst() -> Result<Sim> {
+    let mut cfg = SimConfig::new(link(50, 0, 0.0), 0xD1CE_000A);
+    cfg.fec_block = BURST_FEC_BLOCK;
+    cfg.gate_delta_after_gap = true;
+    cfg.burst_injection = Some(BurstInjection {
+        frame_id: BURST_FRAME_ID,
+        size_bytes: cfg.frame_bytes * 8,
+        drop_data_indices: vec![0, 6, 12, 18],
+        tail_drop_frags: 4,
+    });
+    let mut sim = Sim::new(cfg)?;
+    sim.run_to(DURATION_BURST)?;
+    Ok(sim)
+}
+
 /// A named row: its label and the builder that runs it end to end.
 type Row = (&'static str, fn() -> Result<Sim>);
 
@@ -205,6 +241,7 @@ fn all_rows() -> Vec<Row> {
         ("adaptation", row_adaptation),
         ("latency_ceiling", row_latency_ceiling),
         ("udp_blocked", row_udp_blocked),
+        ("oversized_tail_burst", row_oversized_tail_burst),
     ]
 }
 
@@ -870,6 +907,92 @@ fn blocked_datagrams_fall_back_to_the_reliable_path() -> Result<()> {
             "input {seq} took {latency} ms"
         );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Row 10 — B3: oversized frame, FEC blocks, tail-burst loss
+// ---------------------------------------------------------------------------
+
+#[test]
+fn oversized_frame_tail_burst_recovers_within_bound() -> Result<()> {
+    let sim = row_oversized_tail_burst()?;
+    let log = sim.log();
+    let presented = log.presented();
+    let cfg = sim.config();
+
+    // The burst frame's trailing block had zero surviving fragments (all of
+    // its own data and its parity were in the withheld tail); it can never
+    // complete and must never reach the screen.
+    assert!(
+        !presented.iter().any(|p| p.frame_id == BURST_FRAME_ID),
+        "the burst frame's trailing block was fully wiped; it must never complete"
+    );
+
+    // The direct, mechanical payoff of B3: the four *other* blocks each lost
+    // exactly one data fragment (scattered, independent of the burst) and
+    // recovered it from their own parity, which the tail burst never touched
+    // because B3 no longer clusters every block's parity at the tail.
+    let stats = sim.client().reassembly_stats();
+    assert!(
+        stats.fec_recovered >= 4,
+        "expected the four undamaged blocks to recover their scattered single \
+         losses via their own (undisturbed) parity, got {}",
+        stats.fec_recovered
+    );
+
+    // The keyframe gate actually intervened: at least one intact delta frame
+    // arrived before the recovery keyframe and was refused rather than shown
+    // — otherwise this row would prove nothing about "no P-frame after a gap".
+    assert!(
+        !log.gated_frames().is_empty(),
+        "the keyframe gate never fired, so this row proves nothing"
+    );
+
+    // No delta frame is ever presented across a gap: whenever presented ids
+    // are not contiguous, the frame on the far side of the hole is a keyframe.
+    for pair in presented.windows(2) {
+        if pair[1].frame_id != pair[0].frame_id + 1 {
+            assert!(
+                pair[1].keyframe,
+                "frame {} presented after a gap from {} without a keyframe",
+                pair[1].frame_id, pair[0].frame_id
+            );
+        }
+    }
+
+    // Recovery happens within a bound derived from the scenario, not guessed:
+    // the gap is detected the instant frame 31 completes (one frame interval
+    // after the burst frame was captured), one request/response round trip
+    // plus at most one more capture interval brings the keyframe back, and
+    // each end may be quantised by up to one tick.
+    let params = &cfg.params;
+    // 2 request/response round trips is the honest worst case: the *first*
+    // request is rate-limited from nothing (fires the instant the gap is
+    // detected), but it can lose the race with the host's capture-due check
+    // and land just after a capture already happened — costing a whole extra
+    // `keyframe_request_min_interval_ms` before the second request is even
+    // allowed. Each one-way leg may also be quantised by up to one tick.
+    let recovery_bound_ms = cfg.reassembly.keyframe_request_min_interval_ms
+        + cfg.frame_interval_ms
+        + 2 * params.latency_ms
+        + 4 * cfg.tick_ms;
+    let burst_capture_ms = log
+        .captured_at(BURST_FRAME_ID)
+        .expect("the burst frame must have been captured");
+    let keyframe = presented
+        .iter()
+        .find(|p| p.keyframe && p.frame_id > BURST_FRAME_ID)
+        .expect("the stream must recover with a keyframe after the burst");
+    assert!(
+        keyframe.at_ms <= burst_capture_ms + recovery_bound_ms,
+        "recovery keyframe presented at {} ms, past the {} ms bound",
+        keyframe.at_ms,
+        burst_capture_ms + recovery_bound_ms
+    );
+
+    assert_all_hashes_ok(&presented, "oversized tail burst");
+    assert_still_live(&sim, "oversized tail burst");
     Ok(())
 }
 

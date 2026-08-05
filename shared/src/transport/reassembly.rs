@@ -970,6 +970,33 @@ mod tests {
         fragment_frame_fec(&frame, mtu, k).expect("fragment_frame_fec")
     }
 
+    /// Map each fragment's *logical* index (data frag_index, or parity block
+    /// index) to its position in `f`. `fragment_frame_fec` interleaves each
+    /// block's parity fragment right after its data (B3), so tests that want
+    /// "the data fragments" or "block b's parity fragment" must look them up
+    /// by header field, not assume a tail-appended layout.
+    fn fec_positions(f: &[Vec<u8>]) -> (Vec<usize>, Vec<usize>) {
+        let mut data_pos = Vec::new();
+        let mut parity_pos = Vec::new();
+        for (pos, frag) in f.iter().enumerate() {
+            let (h, _) = FragHeader::decode(frag).expect("decode");
+            if h.parity {
+                let b = h.frag_index as usize;
+                if parity_pos.len() <= b {
+                    parity_pos.resize(b + 1, 0);
+                }
+                parity_pos[b] = pos;
+            } else {
+                let i = h.frag_index as usize;
+                if data_pos.len() <= i {
+                    data_pos.resize(i + 1, 0);
+                }
+                data_pos[i] = pos;
+            }
+        }
+        (data_pos, parity_pos)
+    }
+
     /// Push `order` (fragment indices) at a fixed instant; returns how many
     /// pushes reported a completed frame.
     fn push_order(r: &mut Reassembler, frags: &[Vec<u8>], order: &[usize], now_ms: u64) -> usize {
@@ -1725,15 +1752,17 @@ mod tests {
         assert!(num_blocks >= 2, "want a multi-block frame");
         assert_eq!(f.len(), n + num_blocks);
 
-        // The first data fragment of every block is lost. Data fragments are at
-        // [0, n); parity fragments at [n, f.len()).
+        // The first data fragment of every block is lost (dropped by logical
+        // data frag_index — B3 interleaves parity right after its block's
+        // data, so this is not a vector-position range).
         let dropped: Vec<usize> = (0..num_blocks).map(|b| b * k as usize).collect();
+        let (data_pos, parity_pos) = fec_positions(&f);
 
         // Push all parity first — this exercises the parity-before-data path,
         // where the slot is first opened by a parity fragment.
         let mut completed = 0;
-        for p in n..f.len() {
-            if r.push(&f[p], 0).expect("push parity") {
+        for &pos in &parity_pos {
+            if r.push(&f[pos], 0).expect("push parity") {
                 completed += 1;
             }
         }
@@ -1741,7 +1770,7 @@ mod tests {
             if dropped.contains(&i) {
                 continue;
             }
-            if r.push(&f[i], 0).expect("push data") {
+            if r.push(&f[data_pos[i]], 0).expect("push data") {
                 completed += 1;
             }
         }
@@ -1758,6 +1787,71 @@ mod tests {
         assert!(!r.take_keyframe_request(0));
     }
 
+    /// B3: parity is interleaved right after its own block's data instead of
+    /// appended at the frame's tail, so a burst of consecutive datagram loss
+    /// costs at most one block instead of every parity fragment. This pushes
+    /// fragments in `fragment_frame_fec`'s actual (now interleaved) wire
+    /// order — not a synthetic shuffle — and drops the *last* data fragment
+    /// of every block (the position a trailing burst would hit first): the
+    /// frame must still fully recover.
+    #[test]
+    fn interleaved_wire_order_recovers_one_loss_per_block() {
+        let mut r = Reassembler::new(ReassemblyConfig {
+            slot_timeout_ms: 100_000,
+            stale_frame_distance: 64,
+            ..cfg()
+        });
+        let k = 4u8;
+        let f = frags_fec(42, true, 99, 10_000, 1200, k);
+        let chunk = 1200 - FRAG_HEADER_LEN;
+        let n = 10_000usize.div_ceil(chunk);
+        let num_blocks = n.div_ceil(k as usize);
+        assert!(num_blocks >= 2, "want a multi-block frame");
+
+        // Verify the wire order really is interleaved (not tail-appended):
+        // decode fragments in emission order and confirm each block's parity
+        // directly follows its own data fragments.
+        {
+            let mut pos = 0usize;
+            for b in 0..num_blocks {
+                let hi = ((b + 1) * k as usize).min(n);
+                let lo = b * k as usize;
+                pos += hi - lo;
+                let (h, _) = FragHeader::decode(&f[pos]).unwrap();
+                assert!(h.parity && h.frag_index as usize == b, "block {b} parity out of place");
+                pos += 1;
+            }
+        }
+
+        // Drop the last data fragment of every block while pushing in exact
+        // wire order.
+        let dropped: std::collections::HashSet<usize> = (0..num_blocks)
+            .map(|b| ((b + 1) * k as usize).min(n) - 1)
+            .collect();
+
+        let mut completed = 0;
+        for frag in &f {
+            let (h, _) = FragHeader::decode(frag).unwrap();
+            if !h.parity && dropped.contains(&(h.frag_index as usize)) {
+                continue;
+            }
+            if r.push(frag, 0).expect("push") {
+                completed += 1;
+            }
+        }
+        assert_eq!(
+            completed, 1,
+            "frame recovers despite one loss per block, pushed in interleaved wire order"
+        );
+
+        let frame = r.pop_frame().expect("frame");
+        assert_eq!(frame.frame_id, 42);
+        assert!(frame.keyframe);
+        assert_eq!(frame.data, payload(10_000));
+        assert!(r.stats().fec_recovered >= num_blocks as u64);
+        assert!(!r.take_keyframe_request(0));
+    }
+
     /// Two losses in one block are beyond single-parity FEC: the frame cannot
     /// complete, and the slot eventually ages out and demands a keyframe.
     #[test]
@@ -1770,7 +1864,11 @@ mod tests {
         let k = 4u8;
         let f = frags_fec(7, false, 7, 10_000, 1200, k);
 
-        // Drop two data fragments from block 0 (indices 0 and 1).
+        // Drop two data fragments from block 0 (indices 0 and 1). Block 0's
+        // data fragments are always emitted first (B3 interleaves parity
+        // after each block's own data, but block order itself is unchanged),
+        // so vector positions 0 and 1 are guaranteed to be its first two data
+        // fragments regardless of interleaving.
         let mut completed = 0;
         for (idx, d) in f.iter().enumerate() {
             if idx == 0 || idx == 1 {
@@ -1797,11 +1895,12 @@ mod tests {
         let k = 4u8;
         let f = frags_fec(3, true, 3, 10_000, 1200, k);
         let n = 10_000usize.div_ceil(1200 - FRAG_HEADER_LEN);
+        let (data_pos, parity_pos) = fec_positions(&f);
 
         // Every data fragment arrives: the frame completes without parity.
         let mut completed = 0;
         for i in 0..n {
-            if r.push(&f[i], 0).expect("push") {
+            if r.push(&f[data_pos[i]], 0).expect("push") {
                 completed += 1;
             }
         }
@@ -1809,7 +1908,7 @@ mod tests {
 
         // A straggling parity fragment for that finished frame now arrives.
         let before = r.stats();
-        let done = r.push(&f[n], 0).expect("push parity");
+        let done = r.push(&f[parity_pos[0]], 0).expect("push parity");
         assert!(!done, "parity for a completed frame does nothing");
         assert_eq!(r.stats().fec_parity_received, before.fec_parity_received);
         assert_eq!(r.stats().fragments_duplicate, before.fragments_duplicate + 1);
@@ -1827,26 +1926,27 @@ mod tests {
         let k = 4u8;
         let f = frags_fec(20, true, 20, 10_000, 1200, k);
         let n = 10_000usize.div_ceil(1200 - FRAG_HEADER_LEN);
+        let (data_pos, parity_pos) = fec_positions(&f);
         let mut pushes = 0u64;
 
         // Parity first (accepted into `fec_parity_received`), then data with
         // index 1 dropped so a block genuinely recovers from its parity.
-        for p in n..f.len() {
-            let _ = r.push(&f[p], 0);
+        for &pos in &parity_pos {
+            let _ = r.push(&f[pos], 0);
             pushes += 1;
         }
         for i in 0..n {
             if i == 1 {
                 continue;
             }
-            let _ = r.push(&f[i], 0);
+            let _ = r.push(&f[data_pos[i]], 0);
             pushes += 1;
         }
         // One of each remaining category: duplicate parity, duplicate/late data,
         // malformed datagram.
-        let _ = r.push(&f[n], 0);
+        let _ = r.push(&f[parity_pos[0]], 0);
         pushes += 1;
-        let _ = r.push(&f[0], 0);
+        let _ = r.push(&f[data_pos[0]], 0);
         pushes += 1;
         assert!(r.push(&[0u8; 3], 0).is_err());
         pushes += 1;

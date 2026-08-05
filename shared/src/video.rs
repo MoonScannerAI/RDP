@@ -200,10 +200,20 @@ pub fn fragment_frame(frame: &EncodedFrame, max_datagram: usize) -> Result<Vec<V
 /// The data fragments are identical to [`fragment_frame`]'s (same chunking,
 /// same caps) except each carries `block_size` in its header so the receiver
 /// knows K without a side channel. The `N` data fragments are then grouped into
-/// blocks of `K`, and one parity fragment per block is appended after all the
-/// data fragments: its payload is the byte-wise XOR of the block's data
-/// payloads (each padded to the full chunk width), letting the receiver rebuild
-/// a single lost data fragment per block.
+/// blocks of `K`, and each block's parity fragment is emitted immediately after
+/// its `K` data fragments (not appended after every block's data, at the tail):
+/// its payload is the byte-wise XOR of the block's data payloads (each padded
+/// to the full chunk width), letting the receiver rebuild a single lost data
+/// fragment per block. Interleaving parity this way means a burst of tail loss
+/// on a lossy link costs at most one block's fragments instead of every parity
+/// fragment in the frame. Every datagram is self-describing (frame_id,
+/// frag_index/block index, parity flag) and the reassembler indexes fragments
+/// by those header fields rather than arrival order or position, so this is
+/// wire-compatible in both directions: an old client reassembles a new host's
+/// interleaved stream fine, and a new client reassembles an old host's
+/// tail-appended stream fine. (Block *membership* — which data fragments a
+/// given parity fragment covers — is unchanged: consecutive index ranges of
+/// size `K`, same as before.)
 ///
 /// With `block_size == 0` or a single data fragment there is nothing a parity
 /// block could recover, so only the data fragments are returned.
@@ -238,7 +248,7 @@ pub fn fragment_frame_fec(
     // needs to trim a reconstructed final fragment back to size.
     let last_frag_len = (frame.data.len() - (count - 1) * chunk) as u16;
 
-    let mut out = Vec::with_capacity(count);
+    let mut data_frags = Vec::with_capacity(count);
     for (i, piece) in frame.data.chunks(chunk).enumerate() {
         let mut dgram = Vec::with_capacity(FRAG_HEADER_LEN + piece.len());
         FragHeader {
@@ -253,16 +263,22 @@ pub fn fragment_frame_fec(
         }
         .encode(&mut dgram);
         dgram.extend_from_slice(piece);
-        out.push(dgram);
+        data_frags.push(dgram);
     }
 
     // No FEC requested, or a lone data fragment: parity would be pure overhead.
     if block_size == 0 || count <= 1 {
-        return Ok(out);
+        return Ok(data_frags);
     }
 
     let k = block_size as usize;
     let num_blocks = count.div_ceil(k);
+    let mut out = Vec::with_capacity(count + num_blocks);
+    // Blocks are consecutive index ranges [lo, hi) in ascending order, so
+    // draining `data_frags` in order and pulling one block's worth per
+    // iteration reunites each block's data with its own parity — no clone,
+    // no re-deriving indices.
+    let mut data_iter = data_frags.into_iter();
     for b in 0..num_blocks {
         let lo = b * k;
         let hi = ((b + 1) * k).min(count);
@@ -275,6 +291,15 @@ pub fn fragment_frame_fec(
             for (j, &byte) in piece.iter().enumerate() {
                 parity_payload[j] ^= byte;
             }
+        }
+        // Emit this block's K data fragments, then its parity fragment
+        // immediately after (interleaved) instead of at the frame's tail.
+        for _ in lo..hi {
+            out.push(
+                data_iter
+                    .next()
+                    .expect("data_frags has exactly `count` fragments, one per block index"),
+            );
         }
         let mut dgram = Vec::with_capacity(FRAG_HEADER_LEN + chunk);
         FragHeader {
@@ -406,11 +431,35 @@ mod tests {
         let n = frame.data.len().div_ceil(chunk);
         let num_blocks = n.div_ceil(k as usize);
         assert!(num_blocks >= 2, "want a multi-block frame");
-        // N data fragments then num_blocks parity fragments.
+        // N data fragments plus num_blocks parity fragments, interleaved:
+        // each block's parity immediately follows its K data fragments.
         assert_eq!(frags.len(), n + num_blocks);
         assert!(frags.iter().all(|f| f.len() <= mtu));
 
+        // Output order: decode every fragment in emission order and check each
+        // block's parity lands directly after its own data fragments, not
+        // appended after all data at the tail.
+        let mut pos = 0usize;
+        for b in 0..num_blocks {
+            let lo = b * k as usize;
+            let hi = ((b + 1) * k as usize).min(n);
+            for i in lo..hi {
+                let (h, _) = FragHeader::decode(&frags[pos]).unwrap();
+                assert!(!h.parity, "expected data fragment {i} at position {pos}");
+                assert_eq!(h.frag_index as usize, i);
+                pos += 1;
+            }
+            let (h, _) = FragHeader::decode(&frags[pos]).unwrap();
+            assert!(h.parity, "expected block {b}'s parity fragment at position {pos}");
+            assert_eq!(h.frag_index as usize, b);
+            pos += 1;
+        }
+        assert_eq!(pos, frags.len());
+
         // Data payloads, in index order, reconstruct the frame exactly.
+        // (Order-agnostic: the reassembler indexes by header fields, not
+        // position, so this also validates the wire contract those old/new
+        // peers rely on.)
         let mut data_payloads: Vec<Vec<u8>> = vec![Vec::new(); n];
         let mut parity: Vec<(usize, Vec<u8>)> = Vec::new();
         for f in &frags {
@@ -433,8 +482,8 @@ mod tests {
             let lo = b * k as usize;
             let hi = ((b + 1) * k as usize).min(n);
             let mut acc = par.clone();
-            for i in lo..hi {
-                for (j, &byte) in data_payloads[i].iter().enumerate() {
+            for payload in &data_payloads[lo..hi] {
+                for (j, &byte) in payload.iter().enumerate() {
                     acc[j] ^= byte;
                 }
             }

@@ -57,8 +57,8 @@ impl Default for SessionConfig {
             gop_seconds: 4,
             // A still desktop only needs a low-rate keepalive, not ~30 identical
             // full-frame re-encodes/sec. 250 ms (~4/s) cuts static-screen
-            // bandwidth ~85% and, since each keepalive is forced to an IDR (see
-            // media_thread), lets a frozen screen self-heal from packet loss.
+            // bandwidth; the keepalives are ordinary re-sent frames, not forced
+            // IDRs (see media_thread) — periodic IDRs come from the GOP.
             idle_repeat_ms: 250,
             force_cpu_convert: false,
             frame_queue_depth: 8,

@@ -8,7 +8,7 @@
 //!   straight into the slot, bypassing H.264 entirely, so the whole UI / input
 //!   / render loop is exercisable with no network and no host.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -27,6 +27,10 @@ use crate::renderer::FrameSlot;
 pub struct SourceStatus {
     description: Mutex<String>,
     error: Mutex<Option<String>>,
+    /// Delta frames [`KeyframeGate`] refused (gap or awaiting IDR after one).
+    /// Not read by the diagnostics panel yet — the getter exists so wiring
+    /// it in is a one-line addition elsewhere.
+    frames_gated: AtomicU64,
 }
 
 impl SourceStatus {
@@ -38,12 +42,66 @@ impl SourceStatus {
         self.error.lock().clone()
     }
 
+    /// Count of delta frames dropped by [`KeyframeGate`] pending a keyframe.
+    pub fn frames_gated(&self) -> u64 {
+        self.frames_gated.load(Ordering::Relaxed)
+    }
+
     fn set_description(&self, text: impl Into<String>) {
         *self.description.lock() = text.into();
     }
 
     fn set_error(&self, text: Option<String>) {
         *self.error.lock() = text;
+    }
+
+    fn record_frame_gated(&self) {
+        self.frames_gated.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Refuses delta frames until a keyframe re-establishes the reference chain.
+///
+/// A P-frame decoded against the wrong (or a missing) reference doesn't
+/// error — Media Foundation happily produces a *smeared* picture that looks
+/// plausible but is wrong. That is worse than showing nothing new: the gate
+/// gap-checks `frame_id` before every decode call and refuses anything that
+/// isn't a keyframe or the immediate successor of the last admitted frame,
+/// so the caller freezes on the last good picture instead of smearing until
+/// the next keyframe arrives.
+#[derive(Debug, Default)]
+struct KeyframeGate {
+    last_id: Option<u32>,
+    waiting: bool,
+}
+
+impl KeyframeGate {
+    /// Decide whether `frame_id` may be handed to the decoder.
+    ///
+    /// Returns `(decode, request_keyframe_now)`:
+    /// - A keyframe is always admitted; it resets the chain and clears
+    ///   `waiting` regardless of what came before.
+    /// - A delta frame is admitted only when it is exactly
+    ///   `last_id.wrapping_add(1)` *and* the gate isn't already waiting.
+    /// - Anything else (a gap, no chain yet, or already waiting) is
+    ///   refused. `request_keyframe_now` is `true` only on the transition
+    ///   into `waiting`, so a stalled sender is asked once, not every frame.
+    fn admit(&mut self, frame_id: u32, keyframe: bool) -> (bool, bool) {
+        if keyframe {
+            self.waiting = false;
+            self.last_id = Some(frame_id);
+            return (true, false);
+        }
+        let contiguous = self
+            .last_id
+            .is_some_and(|id| frame_id == id.wrapping_add(1));
+        if !self.waiting && contiguous {
+            self.last_id = Some(frame_id);
+            return (true, false);
+        }
+        let entering_wait = !self.waiting;
+        self.waiting = true;
+        (false, entering_wait)
     }
 }
 
@@ -113,12 +171,41 @@ pub fn spawn_decode_thread(
                 }
             };
 
+            let mut gate = KeyframeGate::default();
+
             loop {
                 match video_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(frame) => {
                         let Some(decoder) = decoder.as_mut() else {
                             continue;
                         };
+
+                        let (admitted, request_keyframe_now) =
+                            gate.admit(frame.frame_id, frame.keyframe);
+                        if !admitted {
+                            status.record_frame_gated();
+                            tracing::debug!(
+                                frame_id = frame.frame_id,
+                                keyframe = frame.keyframe,
+                                "dropping delta frame after gap; awaiting IDR"
+                            );
+                            if request_keyframe_now {
+                                // Entering the wait: flush the stale reference
+                                // chain once and ask for a fresh IDR. Same
+                                // mechanism as the decode-error path below —
+                                // `try_send` never blocks this thread, and a
+                                // full control queue already has a keyframe
+                                // request pending.
+                                decoder.flush();
+                                if let Err(err) =
+                                    control_tx.try_send(ControlMsg::RequestKeyframe)
+                                {
+                                    tracing::warn!("keyframe request dropped: {err}");
+                                }
+                            }
+                            continue;
+                        }
+
                         match decoder.decode(&frame) {
                             Ok(frames) => {
                                 let produced = frames.len();
@@ -295,6 +382,68 @@ mod tests {
         let a = synth_frame(64, 32, 10, 0);
         let b = synth_frame(64, 32, 11, 33);
         assert_ne!(a.data, b.data);
+    }
+
+    #[test]
+    fn keyframe_gate_admits_keyframe_and_resets() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(gate.admit(100, true), (true, false));
+        assert_eq!(gate.last_id, Some(100));
+        assert!(!gate.waiting);
+    }
+
+    #[test]
+    fn keyframe_gate_admits_contiguous_deltas() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(gate.admit(1, true), (true, false));
+        assert_eq!(gate.admit(2, false), (true, false));
+        assert_eq!(gate.admit(3, false), (true, false));
+        assert_eq!(gate.last_id, Some(3));
+        assert!(!gate.waiting);
+    }
+
+    #[test]
+    fn keyframe_gate_gap_requests_once_then_holds() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(gate.admit(1, true), (true, false));
+        // Frame 2 is lost; frame 3 arrives next — a gap.
+        assert_eq!(gate.admit(3, false), (false, true));
+        assert!(gate.waiting);
+        // Further deltas while waiting are dropped without re-requesting.
+        assert_eq!(gate.admit(4, false), (false, false));
+        assert_eq!(gate.admit(5, false), (false, false));
+    }
+
+    #[test]
+    fn keyframe_gate_with_no_prior_chain_gaps_on_first_delta() {
+        let mut gate = KeyframeGate::default();
+        // A delta frame with no keyframe ever seen has no chain to extend.
+        assert_eq!(gate.admit(42, false), (false, true));
+        assert!(gate.waiting);
+        assert_eq!(gate.admit(43, false), (false, false));
+    }
+
+    #[test]
+    fn keyframe_gate_keyframe_after_gap_readmits() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(gate.admit(1, true), (true, false));
+        assert_eq!(gate.admit(3, false), (false, true)); // gap -> waiting
+        assert_eq!(gate.admit(4, false), (false, false)); // still waiting
+        assert_eq!(gate.admit(50, true), (true, false)); // IDR readmits
+        assert!(!gate.waiting);
+        assert_eq!(gate.last_id, Some(50));
+        // Chain resumes from the new keyframe.
+        assert_eq!(gate.admit(51, false), (true, false));
+    }
+
+    #[test]
+    fn keyframe_gate_wraps_at_u32_boundary() {
+        let mut gate = KeyframeGate::default();
+        assert_eq!(gate.admit(u32::MAX, true), (true, false));
+        // u32::MAX.wrapping_add(1) == 0, so 0 is the contiguous successor.
+        assert_eq!(gate.admit(0, false), (true, false));
+        assert_eq!(gate.admit(1, false), (true, false));
+        assert_eq!(gate.last_id, Some(1));
     }
 
     #[test]

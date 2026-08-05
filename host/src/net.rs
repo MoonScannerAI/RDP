@@ -110,8 +110,15 @@ pub const AUTH_FAIL_LIMIT: u32 = 3;
 pub const AUTH_LOCKOUT_MS: u64 = 30_000;
 /// Failures older than this stop counting toward the limit.
 pub const AUTH_FAIL_WINDOW_MS: u64 = 60_000;
-/// Floor on how often a client's `RequestKeyframe` is honoured.
+/// Floor on how often the video pump asks for an IDR *of its own accord*
+/// (coalesced frames, backpressure, a frame it could not fragment). These are
+/// self-inflicted requests on an already-struggling link, so they stay rare.
 pub const KEYFRAME_MIN_INTERVAL_MS: u64 = 500;
+/// Floor on how often a *client's* `RequestKeyframe` is honoured. The client
+/// only asks when its own decoder is stuck (a frame-id gap), and it rate-limits
+/// itself; gating that a second time at 500 ms is what made recovery from a
+/// scene-change stall take up to 1.5 s on a high-RTT link.
+pub const CLIENT_KEYFRAME_MIN_INTERVAL_MS: u64 = 200;
 /// Period of the host's `Stats` / `RouteReport` broadcast.
 pub const STATUS_INTERVAL_MS: u64 = 1_000;
 /// Status windows a stream must run before the encoder-vs-carried `overrun`
@@ -379,13 +386,55 @@ impl RateLimiter {
 /// Bytes a frame will occupy in the datagram send buffer once fragmented.
 ///
 /// [`fragment_frame`] splits the payload into `mtu - FRAG_HEADER_LEN` chunks
-/// and puts a header on each, so the buffered total is the payload plus one
-/// header per fragment.
-pub fn wire_size(frame: &EncodedFrame, mtu: usize) -> usize {
+/// and puts a header on each, so the data total is the payload plus one header
+/// per fragment. [`fragment_frame_fec`] then adds one XOR-parity fragment per
+/// `fec_block` data fragments, and a parity payload is always a *full* chunk
+/// wide — it is the XOR of chunk-padded pieces — so parity costs a header plus
+/// the whole chunk, not an average share of the payload. Counting it is what
+/// keeps the backpressure precheck from under-estimating ~10% and letting
+/// quinn evict the datagrams already in flight.
+///
+/// `fec_block == 0` (or a single data fragment) models the data-only
+/// fragmenter, which is exactly what [`fragment_frame_fec`] emits in that case.
+pub fn wire_size(frame: &EncodedFrame, mtu: usize, fec_block: u8) -> usize {
     use directdesk_shared::video::FRAG_HEADER_LEN;
     let chunk = mtu.saturating_sub(FRAG_HEADER_LEN).max(1);
     let frags = frame.data.len().div_ceil(chunk);
-    frame.data.len() + frags * FRAG_HEADER_LEN
+    let data = frame.data.len() + frags * FRAG_HEADER_LEN;
+    if fec_block == 0 || frags <= 1 {
+        return data;
+    }
+    let parity = frags.div_ceil(fec_block as usize);
+    data + parity * (FRAG_HEADER_LEN + chunk)
+}
+
+/// Shortest sleep Windows can actually honour, even with the 1 ms timer
+/// resolution the video sender holds. Asking for less does not pace the burst,
+/// it just rounds every gap up — which is how a 285-fragment scene-change frame
+/// turned a 10 ms pacing window into a 35–200 ms stall.
+pub const MIN_PACE_SLEEP: Duration = Duration::from_millis(1);
+
+/// How to spread `n` fragments of one frame across `pace_window`: how many
+/// datagrams go out back-to-back, and how long to sleep between those batches.
+///
+/// A zero gap means "no pacing, send the lot" — either the frame is small
+/// enough not to need smoothing, or the window is too short to be divided into
+/// sleeps the OS could honour. The batch count is capped at the window's whole
+/// milliseconds precisely so every gap this returns is one Windows can serve:
+/// a big frame is then paced *coarsely* instead of being paced into a stall.
+pub fn pace_plan(n: usize, pace_window: Duration) -> (usize, Duration) {
+    if n <= PACING_MIN_FRAGS {
+        return (n.max(1), Duration::ZERO);
+    }
+    let max_batches = pace_window.as_millis().max(1) as usize;
+    let batches = n.div_ceil(PACING_BATCH).clamp(1, max_batches);
+    let batch_len = n.div_ceil(batches).max(1);
+    let gap = pace_window / batches as u32;
+    if gap < MIN_PACE_SLEEP {
+        (n, Duration::ZERO)
+    } else {
+        (batch_len, gap)
+    }
 }
 
 /// How far the encoder is outrunning what the connection actually carries,
@@ -608,6 +657,17 @@ pub struct StatusSnapshot {
     pub frames_coalesced: u64,
     /// Frames skipped because the connection had no room for a whole one.
     pub frames_backpressured: u64,
+    /// Frames whose pacing was abandoned part-way and the rest burst out,
+    /// because spreading them further would have missed the emit deadline.
+    /// Expected to track scene changes; a climbing count on a still desktop
+    /// means the link (or the encoder) is in trouble.
+    pub pace_deadline_bursts: u64,
+    /// Longest a single frame took to put on the wire during the most recent
+    /// status window, milliseconds. A gauge, not a total: it resets each window.
+    pub emit_ms_max: u64,
+    /// Frames dropped because they could not be fragmented at all (too many
+    /// fragments, or over the frame-size limit). Should stay at zero.
+    pub frames_unfragmentable: u64,
     pub frames_sent: u64,
     pub bytes_sent: u64,
     /// Client events that reached `SendInput` and were accepted. Counted at the
@@ -1342,6 +1402,18 @@ struct VideoCounters {
     coalesced: AtomicU64,
     /// Frames skipped because the connection had no room for all of them.
     backpressured: AtomicU64,
+    /// Frames whose pacing hit the emit deadline and were burst out.
+    pace_deadline_bursts: AtomicU64,
+    /// Longest single-frame emission, milliseconds. Swapped back to zero by the
+    /// status loop every window, so it is a per-window maximum, not a total.
+    emit_ms_max: AtomicU64,
+    /// Frames the fragmenter refused outright.
+    frames_unfragmentable: AtomicU64,
+    /// A *keyframe* was refused by the fragmenter. Latched here for the status
+    /// loop, which reads-and-clears it and feeds the adaptor a full congestion
+    /// event: without that the next IDR is just as big and the stream never
+    /// recovers. A flag rather than a count — one is already the whole story.
+    oversized_keyframe: AtomicBool,
 }
 
 /// Drive one authenticated client until the connection ends.
@@ -1448,6 +1520,11 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
         s.bytes_sent = counters.bytes_sent.load(Ordering::Relaxed);
         s.frames_coalesced = counters.coalesced.load(Ordering::Relaxed);
         s.frames_backpressured = counters.backpressured.load(Ordering::Relaxed);
+        s.pace_deadline_bursts = counters.pace_deadline_bursts.load(Ordering::Relaxed);
+        s.frames_unfragmentable = counters.frames_unfragmentable.load(Ordering::Relaxed);
+        // A per-window gauge, like `delivery`: with no session there is no
+        // window, so it reads zero rather than freezing at the last value.
+        s.emit_ms_max = 0;
         s.transport = ConnStats::default();
         s.delivery = WindowDelivery::default();
         s.quality_mode = None;
@@ -1550,7 +1627,7 @@ fn video_pump(
         // is as useless as a frame that never arrived, so the result is two
         // wasted frames instead of one. Skipping cleanly here costs one frame
         // and keeps every frame that is sent decodable.
-        if conn.datagram_send_buffer_space() < wire_size(&frame, mtu) {
+        if conn.datagram_send_buffer_space() < wire_size(&frame, mtu, FEC_BLOCK_SIZE) {
             counters.backpressured.fetch_add(1, Ordering::Relaxed);
             if idr.allow(start.elapsed().as_millis() as u64) {
                 pipeline.request_keyframe();
@@ -1558,14 +1635,42 @@ fn video_pump(
             continue;
         }
 
-        // FEC parity fragments are appended after the data fragments. The
-        // buffer-space precheck above still guards only the DATA frame; the
-        // parity is best-effort, so if it cannot be placed the frame is still
-        // whole and decodable on its own.
+        // The precheck above covers the data fragments *and* their parity, so
+        // what follows fits whole: nothing this frame sends can displace the
+        // datagrams already queued for the previous one.
         let frags = match fragment_frame_fec(&frame, mtu, FEC_BLOCK_SIZE) {
             Ok(f) => f,
             Err(e) => {
-                tracing::warn!("cannot fragment frame {}: {e}", frame.frame_id);
+                counters
+                    .frames_unfragmentable
+                    .fetch_add(1, Ordering::Relaxed);
+                if frame.keyframe {
+                    // A keyframe we cannot fragment is a hard freeze, not a
+                    // dropped frame: every later P-frame references an IDR the
+                    // client never received, and the IDR we are about to ask
+                    // for would be exactly as big. Latch it so the adaptor
+                    // treats this as full congestion and the next one is
+                    // smaller — that is the loop-termination guard.
+                    counters.oversized_keyframe.store(true, Ordering::Relaxed);
+                    tracing::error!(
+                        frame_id = frame.frame_id,
+                        bytes = frame.data.len(),
+                        keyframe = frame.keyframe,
+                        "cannot fragment keyframe ({e}); cutting bitrate so the next IDR fits"
+                    );
+                } else {
+                    tracing::warn!(
+                        frame_id = frame.frame_id,
+                        bytes = frame.data.len(),
+                        keyframe = frame.keyframe,
+                        "cannot fragment frame ({e}); dropping it"
+                    );
+                }
+                // Dropping a frame breaks the client's reference chain just as
+                // coalescing does, so it earns an IDR through the same limiter.
+                if idr.allow(start.elapsed().as_millis() as u64) {
+                    pipeline.request_keyframe();
+                }
                 continue;
             }
         };
@@ -1576,15 +1681,22 @@ fn video_pump(
         // Small frames go out immediately; large ones are spread so a keyframe
         // burst can't tail-drop (which would make quinn evict older queued
         // datagrams and shred an in-flight frame).
-        let gap = if n > PACING_MIN_FRAGS {
-            let batches = (n as u32).div_ceil(PACING_BATCH as u32).max(1);
-            pace_window / batches
-        } else {
-            Duration::ZERO
-        };
+        let (batch_len, gap) = pace_plan(n, pace_window);
+        // Pacing is smoothing, not a contract. A scene change makes one frame
+        // 6-18x normal size, and holding the sleeps for all of it is what backs
+        // the encoder queue up until frames are evicted — the freeze. Past
+        // twice the window we stop pacing and get the frame out: a burst costs
+        // some loss, a stall costs the picture.
+        let emit_start = Instant::now();
+        let deadline = emit_start + pace_window * 2;
+        let mut burst = false;
         for (i, frag) in frags.into_iter().enumerate() {
-            if !gap.is_zero() && i > 0 && i % PACING_BATCH == 0 {
-                std::thread::sleep(gap);
+            if !gap.is_zero() && !burst && i > 0 && i % batch_len == 0 {
+                if Instant::now() + gap <= deadline {
+                    std::thread::sleep(gap);
+                } else {
+                    burst = true;
+                }
             }
             bytes += frag.len() as u64;
             if let Err(e) = conn.send_datagram(Bytes::from(frag)) {
@@ -1594,6 +1706,19 @@ fn video_pump(
                 }
                 break;
             }
+        }
+        let emit_ms = emit_start.elapsed().as_millis() as u64;
+        counters.emit_ms_max.fetch_max(emit_ms, Ordering::Relaxed);
+        if burst {
+            counters
+                .pace_deadline_bursts
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                frame_id = frame.frame_id,
+                frags = n,
+                emit_ms,
+                "pacing deadline passed; burst the rest of the frame"
+            );
         }
         if failed {
             break;
@@ -1636,7 +1761,7 @@ async fn control_loop(
     streaming: Arc<AtomicBool>,
     adaptor: Arc<Mutex<BitrateAdaptor>>,
 ) {
-    let mut keyframes = RateLimiter::new(KEYFRAME_MIN_INTERVAL_MS);
+    let mut keyframes = RateLimiter::new(CLIENT_KEYFRAME_MIN_INTERVAL_MS);
 
     while let Some(msg) = rx.recv().await {
         let now = inner.now_ms();
@@ -1779,6 +1904,10 @@ async fn status_loop(
         let sent = counters.frames_sent.load(Ordering::Relaxed);
         let bytes = counters.bytes_sent.load(Ordering::Relaxed);
         let backpressured = counters.backpressured.load(Ordering::Relaxed);
+        let pace_deadline_bursts = counters.pace_deadline_bursts.load(Ordering::Relaxed);
+        // A gauge over this window only: take it and leave the counter at zero
+        // so the next window measures itself rather than inheriting a spike.
+        let emit_ms_max = counters.emit_ms_max.swap(0, Ordering::Relaxed);
         let win_sent = sent.saturating_sub(prev_sent);
         let win_backpressured = backpressured.saturating_sub(prev_backpressured);
         let delivery = WindowDelivery {
@@ -1808,7 +1937,17 @@ async fn status_loop(
         // reason. Gate it; the adaptor is driven by the real ConnStats.loss.
         let warm = intervals > OVERRUN_WARMUP_INTERVALS && win_sent >= OVERRUN_MIN_FRAMES;
         let overrun = overrun_signal(media.bitrate_kbps, transport.bandwidth_kbps);
-        let congestion = congestion_signal(transport.loss, pressure, overrun, warm);
+        // A keyframe the fragmenter refused outranks every measured signal:
+        // nothing of it reached the wire, and the next IDR would be the same
+        // size unless the bitrate comes down. Read-and-clear, then hand the
+        // adaptor a full congestion event.
+        let oversized_keyframe = counters.oversized_keyframe.swap(false, Ordering::Relaxed);
+        let congestion = if oversized_keyframe {
+            tracing::error!("a keyframe was too big to fragment; forcing a bitrate cut");
+            1.0
+        } else {
+            congestion_signal(transport.loss, pressure, overrun, warm)
+        };
         if let Some(next) = adaptor.lock().observe(now, congestion, transport.rtt_ms) {
             tracing::info!(
                 "adaptive bitrate → {next} kbps (loss {:.1}%, send pressure {:.1}%, \
@@ -1852,6 +1991,9 @@ async fn status_loop(
             s.bytes_sent = bytes;
             s.frames_coalesced = counters.coalesced.load(Ordering::Relaxed);
             s.frames_backpressured = backpressured;
+            s.pace_deadline_bursts = pace_deadline_bursts;
+            s.frames_unfragmentable = counters.frames_unfragmentable.load(Ordering::Relaxed);
+            s.emit_ms_max = emit_ms_max;
             s.input_injected = injected;
         });
         // Cumulative injected count beside the send rate: under full video load
@@ -2177,7 +2319,28 @@ mod tests {
                 .iter()
                 .map(|d| d.len())
                 .sum();
-            assert_eq!(wire_size(&f, mtu), actual, "len {len}");
+            assert_eq!(wire_size(&f, mtu, 0), actual, "len {len}");
+        }
+    }
+
+    #[test]
+    fn wire_size_counts_the_fec_parity_too() {
+        // Under-counting parity is what let quinn evict in-flight datagrams:
+        // the model must match what actually goes on the wire, byte for byte.
+        let mtu = 1_200;
+        for len in [1usize, 100, 1_186, 1_187, 5_000, 145_000] {
+            let f = EncodedFrame {
+                frame_id: 1,
+                keyframe: true,
+                timestamp_ms: 0,
+                data: vec![0u8; len],
+            };
+            let actual: usize = fragment_frame_fec(&f, mtu, FEC_BLOCK_SIZE)
+                .unwrap()
+                .iter()
+                .map(|d| d.len())
+                .sum();
+            assert_eq!(wire_size(&f, mtu, FEC_BLOCK_SIZE), actual, "len {len}");
         }
     }
 
@@ -2191,11 +2354,72 @@ mod tests {
             timestamp_ms: 0,
             data: vec![0u8; 50_000],
         };
-        assert!(wire_size(&f, 1_200) > f.data.len());
+        assert!(wire_size(&f, 1_200, 0) > f.data.len());
         assert!(
-            wire_size(&f, 1_200) > wire_size(&f, 1_400),
+            wire_size(&f, 1_200, 0) > wire_size(&f, 1_400, 0),
             "smaller MTU means more headers"
         );
+        assert!(
+            wire_size(&f, 1_200, FEC_BLOCK_SIZE) > wire_size(&f, 1_200, 0),
+            "parity is not free"
+        );
+    }
+
+    // -- pacing ------------------------------------------------------------
+
+    #[test]
+    fn small_frames_are_not_paced() {
+        let (batch, gap) = pace_plan(4, Duration::from_millis(10));
+        assert_eq!(gap, Duration::ZERO, "a 4-fragment frame just goes out");
+        assert_eq!(batch, 4);
+    }
+
+    #[test]
+    fn ordinary_frames_keep_the_old_plan() {
+        // The behaviour this replaces: one batch per PACING_BATCH fragments,
+        // the window split evenly between them. Nothing normal-sized changes.
+        let (batch, gap) = pace_plan(16, Duration::from_millis(10));
+        assert_eq!(batch, PACING_BATCH);
+        assert_eq!(gap, Duration::from_micros(2_500));
+    }
+
+    #[test]
+    fn a_scene_change_frame_is_paced_coarsely_not_impossibly() {
+        // 285 fragments is a real minimise-to-desktop frame. The old plan asked
+        // for 72 gaps of 138us inside a 10ms window; Windows rounds each up and
+        // the frame takes 35-200ms. Fewer, honourable gaps instead.
+        let window = Duration::from_millis(10);
+        let (batch, gap) = pace_plan(285, window);
+        assert!(gap >= MIN_PACE_SLEEP, "{gap:?} is a sleep Windows can serve");
+        let batches = 285usize.div_ceil(batch);
+        assert!(
+            gap * batches as u32 <= window,
+            "pacing {batches} batches of {gap:?} must fit the window"
+        );
+        assert!(batch * batches >= 285, "every fragment must be covered");
+    }
+
+    #[test]
+    fn pace_plan_gaps_are_always_sleepable_and_fit_the_window() {
+        for fps in [30u32, 60, 120, 240] {
+            // Exactly how video_pump derives its window.
+            let window = Duration::from_micros(1_000_000 / fps as u64) * 3 / 5;
+            for n in 1..=512usize {
+                let (batch, gap) = pace_plan(n, window);
+                assert!(batch >= 1, "n {n} fps {fps}: empty batch");
+                assert!(
+                    gap.is_zero() || gap >= MIN_PACE_SLEEP,
+                    "n {n} fps {fps}: {gap:?} is below the sleep floor"
+                );
+                let batches = n.div_ceil(batch);
+                assert!(batch * batches >= n, "n {n} fps {fps}: fragments lost");
+                // Sleeps happen *between* batches, so the bound is generous.
+                assert!(
+                    gap * batches as u32 <= window,
+                    "n {n} fps {fps}: {batches} x {gap:?} overruns {window:?}"
+                );
+            }
+        }
     }
 
     #[test]

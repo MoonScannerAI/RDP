@@ -23,10 +23,11 @@ use directdesk_shared::stats::{validate_stats, TransportRoute};
 use directdesk_shared::traits::{
     Encoder, InputInjector, MockInjector, NullEncoder, PixelFormat, RawFrame,
 };
-use directdesk_shared::video::fragment_frame;
+use directdesk_shared::video::{fragment_frame, fragment_frame_fec, FragHeader};
 
 use crate::config::{
-    SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C, STREAM_INPUT,
+    BurstInjection, SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C,
+    STREAM_INPUT,
 };
 use crate::event::{Route, SimEvent};
 use crate::frames::synth_payload;
@@ -309,11 +310,19 @@ impl SimHost {
         // stops holding, every frame fails the client's hash check — a loud
         // failure, not a silent one.
         let next_id = (self.frames_captured + 1) as u32;
+        // A `burst_injection` targeting this id stands in for the 6-18x
+        // scene-change spike the field bug report measured: one frame, much
+        // larger than its neighbours, otherwise indistinguishable to the
+        // encoder.
+        let frame_bytes = match &self.cfg.burst_injection {
+            Some(b) if b.frame_id == next_id => b.size_bytes,
+            _ => self.cfg.frame_bytes,
+        };
         let raw = RawFrame {
             width: 1_920,
             height: 1_080,
             format: PixelFormat::Bgra8,
-            data: synth_payload(next_id, self.cfg.frame_bytes),
+            data: synth_payload(next_id, frame_bytes),
             timestamp_ms: ctx.now_ms as u32,
         };
         self.frames_captured += 1;
@@ -331,7 +340,16 @@ impl SimHost {
         match self.route {
             Route::Datagram => {
                 let mtu = ctx.net.params().mtu;
-                let fragments = fragment_frame(&encoded, mtu)?;
+                let mut fragments = if self.cfg.fec_block != 0 {
+                    fragment_frame_fec(&encoded, mtu, self.cfg.fec_block)?
+                } else {
+                    fragment_frame(&encoded, mtu)?
+                };
+                if let Some(b) = &self.cfg.burst_injection {
+                    if b.frame_id == encoded.frame_id {
+                        withhold_burst_fragments(&mut fragments, b);
+                    }
+                }
                 for fragment in &fragments {
                     ctx.net.send_datagram(Endpoint::A, fragment.clone())?;
                 }
@@ -361,6 +379,26 @@ impl SimHost {
         }
         Ok(())
     }
+}
+
+/// Withhold `injection`'s fragments from `fragments` before they are sent:
+/// first the specific data indices (arbitrary, deterministic "background"
+/// loss), then the trailing `tail_drop_frags` of whatever remains (a burst of
+/// consecutive loss landing on the tail of the wire order — see
+/// [`BurstInjection`]'s docs for why the two are kept separate).
+///
+/// Order matters: the tail truncation is applied *after* the index-based
+/// removal, against the shortened list, so `tail_drop_frags` always removes
+/// exactly the last fragments of what actually goes out — matching what a
+/// real sender-side eviction or link-level burst would do to the datagrams
+/// still queued at that instant.
+fn withhold_burst_fragments(fragments: &mut Vec<Vec<u8>>, injection: &BurstInjection) {
+    fragments.retain(|f| {
+        let (h, _) = FragHeader::decode(f).expect("well-formed fragment");
+        h.parity || !injection.drop_data_indices.contains(&h.frag_index)
+    });
+    let keep = fragments.len().saturating_sub(injection.tail_drop_frags);
+    fragments.truncate(keep);
 }
 
 /// Strip the redundant length prefix off an already-framed message so it can

@@ -57,7 +57,8 @@ pub mod sim;
 
 pub use client::{PresentSlot, SimClient};
 pub use config::{
-    SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C, STREAM_INPUT,
+    BurstInjection, SimConfig, STREAM_CONTROL_C2H, STREAM_CONTROL_H2C, STREAM_FALLBACK_H2C,
+    STREAM_INPUT,
 };
 pub use event::{EventLog, MuxDelivery, Presented, Route, SimEvent};
 pub use frames::{fnv1a64, synth_body, synth_payload, verify_payload};

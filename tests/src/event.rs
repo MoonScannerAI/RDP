@@ -74,6 +74,18 @@ pub enum SimEvent {
         /// Id currently in the present slot.
         newest_presented: u32,
     },
+    /// A completed delta frame reached the client but was refused by the
+    /// keyframe gate (`SimConfig::gate_delta_after_gap`): its id did not
+    /// follow the last frame admitted to the decoder, or the gate was still
+    /// waiting out an earlier gap. Mirrors the client's `KeyframeGate` (B1) —
+    /// a freeze-frame instead of decoding against a reference that was never
+    /// received.
+    FrameGated {
+        /// Virtual millisecond.
+        at_ms: u64,
+        /// Id of the frame refused.
+        frame_id: u32,
+    },
     /// The client's reassembler demanded a keyframe and the request went out.
     KeyframeRequested {
         /// Virtual millisecond.
@@ -173,6 +185,7 @@ impl SimEvent {
             | SimEvent::FrameSent { at_ms, .. }
             | SimEvent::FramePresented { at_ms, .. }
             | SimEvent::FrameDiscardedStale { at_ms, .. }
+            | SimEvent::FrameGated { at_ms, .. }
             | SimEvent::KeyframeRequested { at_ms }
             | SimEvent::KeyframeHonored { at_ms }
             | SimEvent::InputSent { at_ms, .. }
@@ -300,6 +313,23 @@ impl EventLog {
             .collect()
     }
 
+    /// When a specific frame id was captured, if it ever was.
+    ///
+    /// Capture is due-checked once per tick, so the real instant can drift a
+    /// few milliseconds past the ideal `(id - 1) * frame_interval_ms` —
+    /// exact, this is the honest anchor for a scenario bound.
+    #[must_use]
+    pub fn captured_at(&self, frame_id: u32) -> Option<u64> {
+        self.events.iter().find_map(|e| match e {
+            SimEvent::FrameCaptured {
+                at_ms,
+                frame_id: id,
+                ..
+            } if *id == frame_id => Some(*at_ms),
+            _ => None,
+        })
+    }
+
     /// Ids of every frame the host captured, in capture order.
     #[must_use]
     pub fn captured_ids(&self) -> Vec<u32> {
@@ -328,6 +358,19 @@ impl EventLog {
                     frame_id,
                     newest_presented,
                 } => Some((*at_ms, *frame_id, *newest_presented)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Completed delta frames the keyframe gate refused to present, as
+    /// `(at_ms, frame_id)` — see [`SimEvent::FrameGated`].
+    #[must_use]
+    pub fn gated_frames(&self) -> Vec<(u64, u32)> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::FrameGated { at_ms, frame_id } => Some((*at_ms, *frame_id)),
                 _ => None,
             })
             .collect()
