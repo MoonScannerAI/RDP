@@ -262,6 +262,15 @@ pub fn wheel_delta(unit: egui::MouseWheelUnit, amount: f32) -> i16 {
     raw.clamp(-3840.0, 3840.0) as i16
 }
 
+/// Does this egui key + modifier state spell the release chord? Pure so the
+/// global (every-frame, every-view) detector in the UI and the tests agree.
+///
+/// Callers pass the PHYSICAL key where egui reports one: the logical key under
+/// a remapped layout may not be F12 even when the user pressed F12.
+pub fn is_release_chord(key: egui::Key, m: egui::Modifiers) -> bool {
+    m.ctrl && m.alt && m.shift && matches!(key, egui::Key::F12)
+}
+
 /// Map an egui logical/physical key to a US Set-1 hardware scan code and its
 /// extended flag — the wire format the host injects with `KEYEVENTF_SCANCODE`.
 /// Returns `None` for keys egui does not model (skipped). The nav cluster and
@@ -337,6 +346,43 @@ static HOOK_INSTALL_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// delivery from our own GPU-heavy foreground window (observed as `hook_calls`
 /// frozen at 0 while focused). Background capture still uses the hook.
 static WINDOW_FOREGROUND: AtomicBool = AtomicBool::new(false);
+
+/// Opt-in: keep swallowing+forwarding keys while DirectDesk is NOT the
+/// foreground window (`ClientConfig::capture_in_background`, or
+/// `--hold-capture`). Default OFF, deliberately: with it off, alt-tabbing to a
+/// local app types into that local app instead of shipping every keystroke to
+/// the host. Mirrored from the UI thread once per frame.
+static BACKGROUND_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// True while the session is actually live. Swallowing keys with nowhere to
+/// send them is pure loss, so background capture is additionally gated on this
+/// — during a reconnect or an outage local typing keeps working. Mirrored from
+/// the UI thread once per frame.
+static SESSION_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// The pure core of the hook's swallow predicate — every input is an explicit
+/// argument, so all 16 combinations are unit tested.
+///
+/// Exactly one combination swallows: capture on, window in the background,
+/// background capture opted in, and a live session to send the key to.
+fn swallow_decision(
+    capturing: bool,
+    foreground: bool,
+    background_capture: bool,
+    session_live: bool,
+) -> bool {
+    capturing && !foreground && background_capture && session_live
+}
+
+/// [`swallow_decision`] applied to the live statics.
+fn swallow_active() -> bool {
+    swallow_decision(
+        CAPTURING.load(Ordering::Relaxed),
+        WINDOW_FOREGROUND.load(Ordering::Relaxed),
+        BACKGROUND_CAPTURE.load(Ordering::Relaxed),
+        SESSION_LIVE.load(Ordering::Relaxed),
+    )
+}
 
 /// Process-wide enqueue count (keys placed on the outbound channel by the hook),
 /// readable without the capture handle so the net supervisor can log it beside
@@ -587,12 +633,11 @@ mod hook {
         // Counted before any filtering so "hook never called" and "hook called
         // but event ignored" are distinguishable in the logs.
         HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
-        // When our window is foreground, the egui `on_key_event` path owns
-        // capture; pass keys through so egui sees them and we never double-send.
-        if code == HC_ACTION as i32
-            && CAPTURING.load(Ordering::Relaxed)
-            && !WINDOW_FOREGROUND.load(Ordering::Relaxed)
-        {
+        // Every HC_ACTION reaches `handle_key`, even when we are foreground or
+        // not capturing: the chord tracker must see the whole event stream or
+        // its modifier state goes stale across focus changes. `handle_key`
+        // decides what (if anything) to swallow.
+        if code == HC_ACTION as i32 {
             // A panic here would unwind across an FFI boundary (UB / abort), so
             // it is contained. On panic we fall through to CallNextHookEx,
             // which is the fail-open, never-lock-the-keyboard behaviour.
@@ -615,24 +660,49 @@ mod hook {
     }
 
     /// Returns true if the key must be swallowed locally.
+    ///
+    /// Called for EVERY hook event so [`ChordState`] tracks modifiers without
+    /// gaps — a chord tracker fed only while capturing-and-backgrounded goes
+    /// stale the moment focus changes with a modifier held.
     fn handle_key(scan_code: u16, extended: bool, down: bool) -> bool {
         let mut state = HOOK_STATE.lock();
-        if state.tx.is_none() {
-            tracing::error!("keyboard hook fired with no input channel — key dropped");
+        let outcome = state.chord.on_key(scan_code, extended, down);
+
+        // While we are foreground the egui path ([`InputCapture::on_key_event`]
+        // plus the UI's global chord detector) owns capture; pass everything
+        // through so egui still sees it and we never double-send.
+        if WINDOW_FOREGROUND.load(Ordering::Relaxed) {
+            return false;
         }
-        match state.chord.on_key(scan_code, extended, down) {
+
+        match outcome {
             ChordOutcome::Release => {
-                // Stop forwarding immediately; the app tears the hook down on
-                // its next frame (Drop cannot run from inside the hook proc).
-                CAPTURING.store(false, Ordering::SeqCst);
-                RELEASE_REQUESTED.store(true, Ordering::SeqCst);
-                if let Some(tx) = state.tx.as_ref() {
-                    let _ = tx.try_send(InputMsg::ReleaseAll);
+                // The chord releases from the background even when background
+                // capture is off — it is the "stop, now" escape hatch. Stop
+                // forwarding immediately; the app tears the hook down on its
+                // next frame (Drop cannot run from inside the hook proc).
+                if CAPTURING.swap(false, Ordering::SeqCst) {
+                    RELEASE_REQUESTED.store(true, Ordering::SeqCst);
+                    if let Some(tx) = state.tx.as_ref() {
+                        let _ = tx.try_send(InputMsg::ReleaseAll);
+                    }
+                    true
+                } else {
+                    false
                 }
-                true
             }
-            ChordOutcome::Swallow => true,
+            // Chord residue (the trailing F12 key-up): only ours to eat if we
+            // were the one swallowing the key-down.
+            ChordOutcome::Swallow => swallow_active(),
             ChordOutcome::Forward => {
+                if !swallow_active() {
+                    // Not capturing in the background: the key belongs to
+                    // whatever local app has focus.
+                    return false;
+                }
+                if state.tx.is_none() {
+                    tracing::error!("keyboard hook fired with no input channel — key dropped");
+                }
                 // `validate_event` rejects 0 and >0xFF; filter here so we never
                 // put an invalid event on the wire.
                 if scan_code != 0 && scan_code <= 0xFF {
@@ -684,6 +754,17 @@ pub use hook::inject_test_key;
 // Facade used by the UI
 // ---------------------------------------------------------------------------
 
+/// Why capture stopped without the UI asking for it. Both latch the app's
+/// "the user is released" flag, so nothing re-arms behind their back — an
+/// install failure that re-armed every frame was an infinite retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureLoss {
+    /// The release chord fired inside the hook.
+    ChordRelease,
+    /// The hook thread could not install the hook.
+    InstallError,
+}
+
 /// Owns capture state for the app.
 ///
 /// The hook itself lives on its own thread (see `hook::HookThread`), so this
@@ -732,6 +813,20 @@ impl InputCapture {
         }
     }
 
+    /// Mirror whether the session is live. Background swallowing is gated on
+    /// it, so an outage or a reconnect hands the keyboard back to local apps
+    /// instead of eating keys that have nowhere to go.
+    pub fn set_session_live(&mut self, live: bool) {
+        SESSION_LIVE.store(live, Ordering::Relaxed);
+    }
+
+    /// Mirror the effective background-capture opt-in (config toggle, or
+    /// `--hold-capture`). Off means the hook passes background keys straight
+    /// through to whatever local app has focus.
+    pub fn set_background_capture(&mut self, on: bool) {
+        BACKGROUND_CAPTURE.store(on, Ordering::Relaxed);
+    }
+
     /// Focused-window keyboard capture (mirrors the mouse egui path). Maps the
     /// key to a scan code, synthesizes modifier scan codes from egui's modifier
     /// state, and forwards `InputEvent::Key`. Only used while the window is the
@@ -745,16 +840,9 @@ impl InputCapture {
     ) {
         let key = physical_key.unwrap_or(logical_key);
 
-        // Release chord parity (the hook path is inactive while focused).
-        if pressed
-            && modifiers.ctrl
-            && modifiers.alt
-            && modifiers.shift
-            && matches!(key, egui::Key::F12)
-        {
-            RELEASE_REQUESTED.store(true, Ordering::SeqCst);
-            return;
-        }
+        // The release chord is handled by the UI's global detector (every
+        // frame, every view) and filtered out of the forwarded event stream
+        // before it gets here — see `is_release_chord`.
 
         // Mirror modifier transitions to the host before the key so capitals
         // and Ctrl/Alt combos reproduce. A lone modifier release (no egui key
@@ -864,14 +952,6 @@ impl InputCapture {
         self.release_all();
     }
 
-    pub fn toggle_capture(&mut self) {
-        if self.is_capturing() {
-            self.stop_capture();
-        } else {
-            self.start_capture();
-        }
-    }
-
     /// Emit `ReleaseAll` and clear local pointer/coalescer state.
     pub fn release_all(&mut self) {
         self.moves.clear();
@@ -886,8 +966,8 @@ impl InputCapture {
     }
 
     /// Poll for asynchronous capture-loss: the release chord firing inside the
-    /// hook, or the hook thread failing to install. Returns true once per event.
-    pub fn poll_chord_release(&mut self) -> bool {
+    /// hook, or the hook thread failing to install. Reports each event once.
+    pub fn poll_capture_loss(&mut self) -> Option<CaptureLoss> {
         if RELEASE_REQUESTED.swap(false, Ordering::SeqCst) {
             tracing::info!("{RELEASE_CHORD} pressed — capture released");
             self.capture_requested = false;
@@ -897,17 +977,17 @@ impl InputCapture {
             // The hook already emitted ReleaseAll; just clear local state.
             self.moves.clear();
             self.buttons_held = 0;
-            return true;
+            return Some(CaptureLoss::ChordRelease);
         }
         if self.capture_requested {
             if let Some(err) = HOOK_INSTALL_ERROR.lock().take() {
                 tracing::error!("keyboard hook install failed: {err}");
                 self.last_error = Some(err);
                 self.capture_requested = false;
-                return true;
+                return Some(CaptureLoss::InstallError);
             }
         }
-        false
+        None
     }
 
     /// Queue a pointer position (coalesced, rate-capped).
@@ -1131,6 +1211,63 @@ mod tests {
         assert_eq!(press(&mut c, 0x1E, false), ChordOutcome::Forward); // 'A'
         assert_eq!(press(&mut c, 0x0F, false), ChordOutcome::Forward); // Tab
         assert_eq!(press(&mut c, 0x5B, true), ChordOutcome::Forward); // Left Win
+    }
+
+    // -- release chord (egui side) ----------------------------------------
+
+    fn mods(ctrl: bool, alt: bool, shift: bool) -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl,
+            alt,
+            shift,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn release_chord_needs_the_exact_combination() {
+        let cases: [(egui::Key, egui::Modifiers, bool, &str); 5] = [
+            (egui::Key::F12, mods(true, true, true), true, "the chord"),
+            (egui::Key::F12, mods(false, true, true), false, "no Ctrl"),
+            (egui::Key::F12, mods(true, false, true), false, "no Alt"),
+            (egui::Key::F12, mods(true, true, false), false, "no Shift"),
+            (egui::Key::F11, mods(true, true, true), false, "wrong key"),
+        ];
+        for (key, m, want, why) in cases {
+            assert_eq!(is_release_chord(key, m), want, "{why}");
+        }
+    }
+
+    // -- background swallow gate ------------------------------------------
+
+    #[test]
+    fn swallow_only_when_all_four_conditions_hold() {
+        // All 16 combinations; exactly one swallows.
+        let mut swallowed = 0;
+        for bits in 0u8..16 {
+            let capturing = bits & 1 != 0;
+            let foreground = bits & 2 != 0;
+            let background = bits & 4 != 0;
+            let live = bits & 8 != 0;
+            let got = swallow_decision(capturing, foreground, background, live);
+            let want = capturing && !foreground && background && live;
+            assert_eq!(
+                got, want,
+                "capturing={capturing} foreground={foreground} \
+                 background={background} live={live}"
+            );
+            swallowed += got as u32;
+        }
+        assert_eq!(swallowed, 1, "exactly one combination may swallow");
+        // The two regressions this gate exists for.
+        assert!(
+            !swallow_decision(true, false, false, true),
+            "default config: background keys stay local"
+        );
+        assert!(
+            !swallow_decision(true, false, true, false),
+            "session down: background keys stay local"
+        );
     }
 
     // -- coalescer --------------------------------------------------------

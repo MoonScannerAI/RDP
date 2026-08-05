@@ -30,7 +30,12 @@ DirectDeskClient — DirectDesk remote desktop client
   --loopback-demo      feed the renderer synthetic frames; no network, no decode
   --demo-fps <n>       loopback demo frame rate (default 60)
   --decoder-selftest   create the Media Foundation H.264 MFT, report, and exit
-  --capture-on-start   test aid: install the keyboard hook at startup
+  --capture-on-start   test aid: install the keyboard hook at startup (waits
+                       for the window to be focused first)
+  --hold-capture       test aid: install at startup and keep the hook armed
+                       across focus loss, minimize and reconnects; also forces
+                       'Background capture' on for this run, so keys keep going
+                       to the host while DirectDesk is in the background
   -h, --help           this text
 ";
 
@@ -374,6 +379,26 @@ mod tests {
         assert!(args(&["--udp-port", "notanumber"]).is_err());
         assert!(args(&["--udp-port", "99999"]).is_err(), "out of u16 range");
         assert!(args(&["--demo-fps", "0"]).is_err());
+    }
+
+    #[test]
+    fn parses_capture_flags() {
+        let a = args(&[]).unwrap();
+        assert!(!a.capture_on_start);
+        assert!(!a.hold_capture, "capture is opt-in");
+
+        let a = args(&["--capture-on-start"]).unwrap();
+        assert!(a.capture_on_start);
+        assert!(!a.hold_capture);
+
+        let a = args(&["--hold-capture"]).unwrap();
+        assert!(a.hold_capture);
+        // `--hold-capture` implies the startup install on its own; the UI does
+        // that mapping, so the parsed flag stays independent here.
+        assert!(!a.capture_on_start);
+
+        let a = args(&["--capture-on-start", "--hold-capture"]).unwrap();
+        assert!(a.capture_on_start && a.hold_capture);
     }
 
     #[test]

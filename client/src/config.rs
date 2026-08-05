@@ -23,6 +23,12 @@ pub struct ClientConfig {
     pub quality_mode: QualityMode,
     pub show_diagnostics: bool,
     pub start_fullscreen: bool,
+    /// Keep forwarding the keyboard to the host while DirectDesk is in the
+    /// background. Default **false**: with it off, alt-tabbing to a local app
+    /// types into that local app, so a password typed into a local window is
+    /// never shipped over the wire by accident. Turning it on is an explicit,
+    /// informed choice (the toolbar toggle spells out the consequence).
+    pub capture_in_background: bool,
 }
 
 impl Default for ClientConfig {
@@ -35,6 +41,7 @@ impl Default for ClientConfig {
             quality_mode: QualityMode::Balanced,
             show_diagnostics: false,
             start_fullscreen: false,
+            capture_in_background: false,
         }
     }
 }
@@ -132,6 +139,9 @@ mod tests {
         let back: ClientConfig = serde_json::from_str(r#"{"host_address":"pc.lan"}"#).unwrap();
         assert_eq!(back.host_address, "pc.lan");
         assert_eq!(back.udp_port, DEFAULT_UDP_PORT);
+        // A config written before background capture existed must not silently
+        // opt the user into shipping their local keystrokes to the host.
+        assert!(!back.capture_in_background);
     }
 
     #[test]

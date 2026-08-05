@@ -19,7 +19,9 @@ use directdesk_shared::stats::{validate_stats, ConnStats, TransportRoute};
 
 use crate::config::ClientConfig;
 use crate::connect::ConnectSupervisor;
-use crate::input_capture::{wheel_delta, InputCapture, RELEASE_CHORD};
+use crate::input_capture::{
+    is_release_chord, wheel_delta, CaptureLoss, InputCapture, RELEASE_CHORD,
+};
 use crate::pipeline::Pipeline;
 use crate::renderer::{FrameSlot, Presenter, VideoView};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
@@ -99,6 +101,11 @@ pub struct ClientApp {
     capture_on_start: bool,
     /// `--hold-capture` test mode: keep capture engaged through focus loss.
     hold_capture: bool,
+    /// The user asked for the keyboard back (release chord, toolbar, or a hook
+    /// that would not install). Latches the auto re-arm off until they ask for
+    /// capture again — without it, every release was undone on the next frame.
+    /// Deliberately not persisted: each launch starts willing to capture.
+    user_released: bool,
 }
 
 impl ClientApp {
@@ -148,6 +155,7 @@ impl ClientApp {
             // works on its own without also passing `--capture-on-start`.
             capture_on_start: init.capture_on_start || init.hold_capture,
             hold_capture: init.hold_capture,
+            user_released: false,
         }
     }
 
@@ -198,11 +206,13 @@ impl ClientApp {
             if !state.is_live() {
                 self.presenter.reset();
                 self.slot.clear();
-                // In `--hold-capture` test mode, keep the hook installed across
+                // With background capture on, keep the hook installed across
                 // connection churn (connecting, WAN stalls, reconnects) so the
-                // capture path stays live regardless of link state. Normal mode
-                // still releases keys the moment the session is not live.
-                if !self.hold_capture {
+                // capture path is live again the moment the session is. Nothing
+                // is swallowed meanwhile — the hook gates that on the session
+                // being live — so local typing works right through an outage.
+                // Without it, releasing here is what hands the keyboard back.
+                if !self.effective_background_capture() {
                     self.input.stop_capture();
                 }
             }
@@ -262,11 +272,12 @@ impl ClientApp {
             ControlMsg::Bye { reason } => {
                 self.state = ConnectionState::Failed(format!("Host disconnected: {reason}"));
                 self.route = None;
-                // `--hold-capture` keeps the hook across a host `Bye` so a
+                // Background capture keeps the hook across a host `Bye` so a
                 // transient disconnect/reconnect doesn't silently kill capture
                 // for the rest of the session (observed: a mid-stream `Bye` tore
-                // the hook down and it never re-armed). Normal mode releases.
-                if !self.hold_capture {
+                // the hook down and it never re-armed). Swallowing still stops
+                // with the session. Otherwise we release outright.
+                if !self.effective_background_capture() {
                     self.input.stop_capture();
                 }
                 self.presenter.reset();
@@ -275,11 +286,67 @@ impl ClientApp {
         }
     }
 
+    /// Whether keys should keep reaching the host while DirectDesk is in the
+    /// background: the persisted opt-in, or `--hold-capture` forcing it on for
+    /// the run.
+    fn effective_background_capture(&self) -> bool {
+        self.config.capture_in_background || self.hold_capture
+    }
+
+    /// Runs first every frame: latch any capture loss the hook reported
+    /// asynchronously, then service the release chord *globally* — in every
+    /// view and every connection state, not just over a live video frame.
+    fn reconcile_capture(&mut self, ctx: &egui::Context) {
+        match self.input.poll_capture_loss() {
+            Some(CaptureLoss::ChordRelease) => {
+                self.user_released = true;
+                self.notice = Some(released_notice());
+            }
+            Some(CaptureLoss::InstallError) => {
+                // Latch here too: without it the auto re-arm retried a failing
+                // install every single frame.
+                self.user_released = true;
+                let err = self.input.last_error().unwrap_or("unknown error");
+                self.notice = Some(format!("Input capture unavailable: {err}"));
+            }
+            None => {}
+        }
+
+        let mut chord = false;
+        ctx.input(|i| {
+            for event in &i.events {
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    // The physical key is what the user actually pressed; a
+                    // remapped layout can report something else as `key`.
+                    chord |= is_release_chord(physical_key.unwrap_or(*key), *modifiers);
+                }
+            }
+        });
+        if !chord {
+            return;
+        }
+        // The chord toggles: release if we hold the keyboard, otherwise take it
+        // back (which also clears the latch).
+        if self.input.is_capturing() {
+            self.input.stop_capture();
+            self.user_released = true;
+            self.notice = Some(released_notice());
+        } else {
+            self.input.start_capture();
+            self.user_released = false;
+            self.notice = Some("Input captured".into());
+        }
+    }
+
     /// Capture must never survive losing focus, minimizing, or closing.
     fn enforce_capture_invariants(&mut self, ctx: &egui::Context) {
-        if self.input.poll_chord_release() {
-            self.notice = Some(format!("Input released ({RELEASE_CHORD})"));
-        }
         if !self.input.is_capturing() {
             return;
         }
@@ -290,11 +357,11 @@ impl ClientApp {
                 i.viewport().close_requested(),
             )
         });
-        // In `--hold-capture` test mode we deliberately keep the hook installed
-        // across focus/minimize changes (a machine where another app steals
-        // foreground would otherwise never let capture stay on). A window close
-        // still releases, so we never leave keys stuck on exit.
-        if closing || (!self.hold_capture && (!focused || minimized)) {
+        // With background capture on we deliberately keep the hook installed
+        // across focus/minimize changes — that is the whole point of the
+        // setting, and the hook decides per key whether to swallow. A window
+        // close still releases, so we never leave keys stuck on exit.
+        if closing || (!self.effective_background_capture() && (!focused || minimized)) {
             tracing::info!(focused, minimized, closing, "releasing capture");
             self.input.stop_capture();
             self.notice = Some("Input released (window lost focus)".into());
@@ -361,7 +428,18 @@ impl ClientApp {
                 .on_hover_text(hover)
                 .clicked()
             {
-                self.input.toggle_capture();
+                // Explicit, so a release actually sticks: the latch is what
+                // stops the auto re-arm undoing it on the next frame.
+                if capturing {
+                    self.input.stop_capture();
+                    self.user_released = true;
+                } else {
+                    self.input.start_capture();
+                    self.user_released = false;
+                }
+            }
+            if self.user_released {
+                ui.weak("released — keys stay local");
             }
 
             if ui
@@ -376,6 +454,23 @@ impl ClientApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
             ui.toggle_value(&mut self.show_diagnostics, "Diagnostics");
+
+            // Security-relevant opt-in, so it says plainly what it does. Off
+            // (the default) means switching to a local app gives that app the
+            // keyboard instead of shipping every keystroke over the wire.
+            const BACKGROUND_HOVER: &str =
+                "Keep sending keys to the host while DirectDesk is in the background.\n\
+                 Off: your keyboard stays local when you switch apps.";
+            if self.hold_capture {
+                ui.add_enabled(
+                    false,
+                    egui::Button::new("Background capture").selected(true),
+                )
+                .on_disabled_hover_text(format!("{BACKGROUND_HOVER}\nForced on by --hold-capture."));
+            } else {
+                ui.toggle_value(&mut self.config.capture_in_background, "Background capture")
+                    .on_hover_text(BACKGROUND_HOVER);
+            }
 
             if self.mode == SourceMode::LoopbackDemo {
                 ui.separator();
@@ -648,6 +743,12 @@ impl ClientApp {
                 ..
             } = event
             {
+                // The release chord is ours, not the host's — swallow both the
+                // press and the release so no half of it lands on the remote
+                // machine (`reconcile_capture` already acted on it).
+                if is_release_chord(physical_key.unwrap_or(*key), *modifiers) {
+                    continue;
+                }
                 self.input
                     .on_key_event(*physical_key, *key, *pressed, *modifiers);
             }
@@ -736,6 +837,10 @@ impl eframe::App for ClientApp {
         // theme during startup, and a remote screen belongs on a dark surround.
         ctx.set_theme(egui::ThemePreference::Dark);
 
+        // First: consume any asynchronous capture loss and service the release
+        // chord, so the latch below reflects this frame's input.
+        self.reconcile_capture(ctx);
+
         // Wait for focus: the window is not focused on the first frame, and
         // `enforce_capture_invariants` would (correctly) drop capture again.
         // `--hold-capture` installs without waiting for focus (the whole point
@@ -750,23 +855,32 @@ impl eframe::App for ClientApp {
             self.input.start_capture();
         }
 
-        // Backstop for `--hold-capture`: if capture fell off after the initial
-        // install (a teardown we missed, or Windows silently dropping the
-        // low-level hook), re-arm it. `is_capturing()` flips true immediately,
-        // so this fires once per real teardown rather than every frame.
-        if self.hold_capture && !self.capture_on_start && !self.input.is_capturing() {
-            tracing::warn!("hold-capture: re-arming keyboard hook after teardown");
-            self.input.start_capture();
-        }
-
-        // Capture follows focus (the normal, non-`--hold-capture` behaviour):
-        // acquire while DirectDesk is the focused, non-minimized window;
-        // `enforce_capture_invariants` releases it the instant focus is lost, so
-        // keystrokes typed into other local apps are never swallowed/forwarded.
-        if !self.hold_capture && !self.capture_on_start {
-            let active = ctx.input(|i| i.focused && !i.viewport().minimized.unwrap_or(false));
-            if active && !self.input.is_capturing() {
-                self.input.start_capture();
+        // Auto re-arm — the single place capture is acquired without the user
+        // asking. `user_released` gates it: a chord release, a toolbar release
+        // or a failed install all latch it, and before that latch existed this
+        // block re-installed the hook on the very next frame, which is exactly
+        // why "Ctrl+Alt+Shift+F12 does nothing" was reported from the field.
+        if !self.user_released && !self.capture_on_start {
+            if self.effective_background_capture() {
+                // Capture is meant to survive focus changes here, so the only
+                // job is a backstop: if it fell off (a teardown we missed, or
+                // Windows silently dropping the low-level hook), re-arm.
+                // `is_capturing()` flips true immediately, so this fires once
+                // per real teardown rather than every frame.
+                if !self.input.is_capturing() {
+                    tracing::warn!("hold-capture: re-arming keyboard hook after teardown");
+                    self.input.start_capture();
+                }
+            } else {
+                // Capture follows focus (the default): acquire while DirectDesk
+                // is the focused, non-minimized window;
+                // `enforce_capture_invariants` releases it the instant focus is
+                // lost, so keystrokes typed into other local apps are never
+                // swallowed/forwarded.
+                let active = ctx.input(|i| i.focused && !i.viewport().minimized.unwrap_or(false));
+                if active && !self.input.is_capturing() {
+                    self.input.start_capture();
+                }
             }
         }
 
@@ -784,6 +898,12 @@ impl eframe::App for ClientApp {
         // it and the low-level hook passes through; when not, the hook forwards.
         self.input
             .set_window_foreground(ctx.input(|i| i.focused));
+        // Mirrored per frame rather than at the transition sites, because
+        // `self.state` is assigned from several places (drain, Bye, connect,
+        // disconnect) and the hook must never read a stale gate.
+        self.input.set_session_live(self.state.is_live());
+        let background = self.effective_background_capture();
+        self.input.set_background_capture(background);
         self.drain_session();
         self.enforce_capture_invariants(ctx);
         self.presenter.update(ctx, &self.slot);
@@ -834,6 +954,12 @@ impl Drop for ClientApp {
         self.pipeline.shutdown();
         self.persist();
     }
+}
+
+/// The one wording for "we gave the keyboard back", used by every release path
+/// so the way out is always spelled out.
+fn released_notice() -> String {
+    format!("Input released ({RELEASE_CHORD}) — click Capture input or press the chord to resume")
 }
 
 pub fn quality_label(mode: QualityMode) -> &'static str {
