@@ -17,6 +17,14 @@ pub enum SvcRequest {
     RemoveFirewallRules,
     /// Ask the service to restart the host agent in the interactive session.
     RestartHostRequested,
+    /// Start a transient SYSTEM-integrity input worker that can click the UAC
+    /// consent dialog (which the medium-integrity host cannot reach through
+    /// UIPI). Still zero-parameter: the *service* mints the data-pipe name and a
+    /// one-time capability token and returns them in [`SvcResponse::UacInjectorReady`].
+    /// Gated behind the service's `uac_clickthrough` master switch.
+    StartUacInjector,
+    /// Stop any running SYSTEM injector worker immediately.
+    StopUacInjector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +34,11 @@ pub enum SvcResponse {
     Ok,
     Denied { reason: String },
     Failed { reason: String },
+    /// A SYSTEM injector worker is up. The host connects to `pipe_name` and
+    /// presents `cap_token` as the first frame; the token is single-use and was
+    /// minted by the service, never supplied by the caller. This is response
+    /// (egress) data only — the request that triggered it carried no parameters.
+    UacInjectorReady { pipe_name: String, cap_token: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,5 +61,33 @@ mod tests {
         assert!(bytes.len() < MAX_IPC_MSG);
         let back: SvcRequest = decode_strict(&bytes).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn every_request_variant_roundtrips_within_cap() {
+        for req in [
+            SvcRequest::Ping,
+            SvcRequest::GetStatus,
+            SvcRequest::EnsureFirewallRules,
+            SvcRequest::RemoveFirewallRules,
+            SvcRequest::RestartHostRequested,
+            SvcRequest::StartUacInjector,
+            SvcRequest::StopUacInjector,
+        ] {
+            let bytes = postcard::to_stdvec(&req).unwrap();
+            assert!(bytes.len() < MAX_IPC_MSG);
+            assert_eq!(decode_strict::<SvcRequest>(&bytes).unwrap(), req);
+        }
+    }
+
+    #[test]
+    fn uac_injector_ready_roundtrips() {
+        let resp = SvcResponse::UacInjectorReady {
+            pipe_name: r"\\.\pipe\DirectDeskUac-1-abcdef".into(),
+            cap_token: "0123456789abcdef0123456789abcdef".into(),
+        };
+        let bytes = postcard::to_stdvec(&resp).unwrap();
+        assert!(bytes.len() < MAX_IPC_MSG);
+        assert_eq!(decode_strict::<SvcResponse>(&bytes).unwrap(), resp);
     }
 }

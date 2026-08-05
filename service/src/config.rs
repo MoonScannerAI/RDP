@@ -18,6 +18,12 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub autostart_host: bool,
 
+    /// Master switch for the SYSTEM UAC-injector worker. When `false` (the
+    /// default), `StartUacInjector` is denied outright and no SYSTEM worker is
+    /// ever spawned. A missing field or a parse failure lands on `false`.
+    #[serde(default)]
+    pub uac_clickthrough: bool,
+
     /// Keep Windows UAC's secure desktop DISABLED
     /// (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\PromptOnSecureDesktop
     /// = 0`) so a remote operator is never frozen out when a UAC prompt
@@ -52,7 +58,7 @@ pub fn parse(text: &str) -> ServiceConfig {
 pub fn to_json(cfg: &ServiceConfig) -> String {
     // unwrap: a struct of bool primitives cannot fail to serialize.
     serde_json::to_string_pretty(cfg).unwrap_or_else(|_| {
-        "{\n  \"autostart_host\": false,\n  \
+        "{\n  \"autostart_host\": false,\n  \"uac_clickthrough\": false,\n  \
          \"disable_uac_secure_desktop\": false\n}"
             .into()
     })
@@ -101,7 +107,23 @@ mod tests {
     #[test]
     fn default_is_disabled() {
         assert!(!ServiceConfig::default().autostart_host);
+        assert!(!ServiceConfig::default().uac_clickthrough);
         assert!(!ServiceConfig::default().disable_uac_secure_desktop);
+    }
+
+    #[test]
+    fn uac_clickthrough_defaults_false_and_roundtrips() {
+        // Missing field (existing config files predate this switch) → false.
+        assert!(!parse(r#"{"autostart_host": true}"#).uac_clickthrough);
+        assert!(!parse("{}").uac_clickthrough);
+        // Explicit true parses, and survives a write/read cycle.
+        assert!(parse(r#"{"uac_clickthrough": true}"#).uac_clickthrough);
+        let cfg = ServiceConfig {
+            autostart_host: false,
+            uac_clickthrough: true,
+            ..Default::default()
+        };
+        assert_eq!(parse(&to_json(&cfg)), cfg);
     }
 
     #[test]
@@ -144,6 +166,7 @@ mod tests {
     fn roundtrips_through_written_json() {
         let cfg = ServiceConfig {
             autostart_host: true,
+            uac_clickthrough: false,
             ..Default::default()
         };
         assert_eq!(parse(&to_json(&cfg)), cfg);

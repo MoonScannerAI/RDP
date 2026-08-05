@@ -7,9 +7,12 @@
 //! Everything the dispatcher can touch is behind a trait so the decision logic
 //! is unit-testable without a service, a firewall, or an interactive session.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use directdesk_shared::svc_ipc::{SvcRequest, SvcResponse, SvcStatus};
+
+pub use crate::uac_injector::UacInjectorOps;
 
 /// Windows Firewall operations the service is willing to perform.
 pub trait FirewallOps: Send + Sync {
@@ -40,12 +43,23 @@ pub struct Backend {
     pub firewall: Arc<dyn FirewallOps>,
     pub supervisor: Arc<dyn SupervisorOps>,
     pub autostart: Arc<dyn AutostartQuery>,
+    pub uac: Arc<dyn UacInjectorOps>,
     /// Reported verbatim in [`SvcStatus::service_version`].
     pub service_version: String,
+    /// Full path of the installed DirectDesk host binary (the sibling
+    /// `DirectDeskHost.exe`). The two UAC-injector verbs are honoured only when
+    /// the connected pipe client's image path matches this — see
+    /// [`crate::pipe`]'s caller-identity check. Every other verb ignores it.
+    pub expected_host_exe: PathBuf,
 }
 
 /// Map a fixed request variant onto a response. Pure decision logic.
-pub fn dispatch(req: SvcRequest, backend: &Backend) -> SvcResponse {
+///
+/// `caller_is_trusted_host` is the result of authenticating the connected pipe
+/// client's image path against [`Backend::expected_host_exe`]. It gates ONLY the
+/// two UAC-injector verbs (the local-UAC-bypass surface): every other verb is
+/// parameter-free, already ACL-restricted to same-user callers, and ignores it.
+pub fn dispatch(req: SvcRequest, backend: &Backend, caller_is_trusted_host: bool) -> SvcResponse {
     // Requests carry no caller data, so logging the variant is complete and
     // cannot leak anything.
     tracing::info!(request = ?req, "ipc request");
@@ -74,6 +88,47 @@ pub fn dispatch(req: SvcRequest, backend: &Backend) -> SvcResponse {
             Ok(()) => SvcResponse::Ok,
             Err(e) => SvcResponse::Failed { reason: reason(&e) },
         },
+
+        // The master switch is checked *here*, before the injector is ever
+        // touched, so a disabled feature can never spawn a SYSTEM worker.
+        SvcRequest::StartUacInjector => {
+            if !caller_is_trusted_host {
+                // Caller-identity gate: only the installed host binary may drive
+                // the SYSTEM click-through. Reject before the injector (and the
+                // one-time capability token) is ever touched.
+                SvcResponse::Denied {
+                    reason: "caller is not the DirectDesk host".into(),
+                }
+            } else if !backend.uac.enabled() {
+                SvcResponse::Denied {
+                    reason: "UAC click-through is disabled (uac_clickthrough=false)".to_string(),
+                }
+            } else {
+                match backend.uac.start() {
+                    Ok(ready) => SvcResponse::UacInjectorReady {
+                        pipe_name: ready.pipe_name,
+                        cap_token: ready.cap_token,
+                    },
+                    Err(e) => SvcResponse::Failed { reason: reason(&e) },
+                }
+            }
+        }
+
+        // Stopping is always safe and idempotent, even when the switch is off —
+        // but it still drives the SYSTEM worker, so it too is gated on the
+        // caller being the genuine host.
+        SvcRequest::StopUacInjector => {
+            if !caller_is_trusted_host {
+                SvcResponse::Denied {
+                    reason: "caller is not the DirectDesk host".into(),
+                }
+            } else {
+                match backend.uac.stop() {
+                    Ok(()) => SvcResponse::Ok,
+                    Err(e) => SvcResponse::Failed { reason: reason(&e) },
+                }
+            }
+        }
     };
 
     tracing::info!(response = ?std::mem::discriminant(&response), "ipc response");
@@ -95,6 +150,7 @@ fn reason(e: &anyhow::Error) -> String {
 #[cfg(test)]
 pub mod mock {
     use super::*;
+    use crate::uac_injector::UacInjectorReady;
     use parking_lot::Mutex;
 
     #[derive(Default)]
@@ -154,24 +210,63 @@ pub mod mock {
         }
     }
 
+    /// Records start/stop calls and honours an `enabled` flag. The dispatcher
+    /// gates on `enabled()` *before* calling `start`, so a disabled mock should
+    /// never see a `start` call.
+    #[derive(Default)]
+    pub struct MockUacInjector {
+        pub enabled: Mutex<bool>,
+        pub starts: Mutex<u32>,
+        pub stops: Mutex<u32>,
+        pub fail_with: Mutex<Option<String>>,
+    }
+
+    impl UacInjectorOps for MockUacInjector {
+        fn enabled(&self) -> bool {
+            *self.enabled.lock()
+        }
+        fn start(&self) -> anyhow::Result<UacInjectorReady> {
+            *self.starts.lock() += 1;
+            if let Some(msg) = self.fail_with.lock().clone() {
+                return Err(anyhow::anyhow!(msg));
+            }
+            Ok(UacInjectorReady {
+                pipe_name: r"\\.\pipe\DirectDeskUac-1-deadbeefdeadbeef".to_string(),
+                cap_token: "00112233445566778899aabbccddeeff".to_string(),
+            })
+        }
+        fn stop(&self) -> anyhow::Result<()> {
+            *self.stops.lock() += 1;
+            match self.fail_with.lock().clone() {
+                Some(msg) => Err(anyhow::anyhow!(msg)),
+                None => Ok(()),
+            }
+        }
+    }
+
     pub struct Harness {
         pub firewall: Arc<MockFirewall>,
         pub supervisor: Arc<MockSupervisor>,
+        pub uac: Arc<MockUacInjector>,
         pub backend: Backend,
     }
 
     pub fn harness() -> Harness {
         let firewall = Arc::new(MockFirewall::default());
         let supervisor = Arc::new(MockSupervisor::default());
+        let uac = Arc::new(MockUacInjector::default());
         let backend = Backend {
             firewall: firewall.clone(),
             supervisor: supervisor.clone(),
             autostart: Arc::new(MockAutostart(false)),
+            uac: uac.clone(),
             service_version: "9.9.9-test".to_string(),
+            expected_host_exe: PathBuf::from(r"C:\Program Files\DirectDesk\DirectDeskHost.exe"),
         };
         Harness {
             firewall,
             supervisor,
+            uac,
             backend,
         }
     }
@@ -185,7 +280,10 @@ mod tests {
     #[test]
     fn ping_returns_pong() {
         let h = harness();
-        assert_eq!(dispatch(SvcRequest::Ping, &h.backend), SvcResponse::Pong);
+        assert_eq!(
+            dispatch(SvcRequest::Ping, &h.backend, true),
+            SvcResponse::Pong
+        );
     }
 
     #[test]
@@ -193,7 +291,7 @@ mod tests {
         let h = harness();
         *h.supervisor.running.lock() = true;
         *h.firewall.present.lock() = true;
-        let resp = dispatch(SvcRequest::GetStatus, &h.backend);
+        let resp = dispatch(SvcRequest::GetStatus, &h.backend, true);
         match resp {
             SvcResponse::Status(s) => {
                 assert_eq!(s.service_version, "9.9.9-test");
@@ -210,14 +308,14 @@ mod tests {
         let h = harness();
         assert!(!h.firewall.rules_present());
         assert_eq!(
-            dispatch(SvcRequest::EnsureFirewallRules, &h.backend),
+            dispatch(SvcRequest::EnsureFirewallRules, &h.backend, true),
             SvcResponse::Ok
         );
         assert!(h.firewall.rules_present());
         assert_eq!(*h.firewall.ensure_calls.lock(), 1);
 
         assert_eq!(
-            dispatch(SvcRequest::RemoveFirewallRules, &h.backend),
+            dispatch(SvcRequest::RemoveFirewallRules, &h.backend, true),
             SvcResponse::Ok
         );
         assert!(!h.firewall.rules_present());
@@ -228,11 +326,11 @@ mod tests {
     fn firewall_failure_becomes_failed_response() {
         let h = harness();
         *h.firewall.fail_with.lock() = Some("access is denied".into());
-        match dispatch(SvcRequest::EnsureFirewallRules, &h.backend) {
+        match dispatch(SvcRequest::EnsureFirewallRules, &h.backend, true) {
             SvcResponse::Failed { reason } => assert!(reason.contains("access is denied")),
             other => panic!("expected Failed, got {other:?}"),
         }
-        match dispatch(SvcRequest::RemoveFirewallRules, &h.backend) {
+        match dispatch(SvcRequest::RemoveFirewallRules, &h.backend, true) {
             SvcResponse::Failed { reason } => assert!(reason.contains("access is denied")),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -242,7 +340,7 @@ mod tests {
     fn restart_host_nudges_supervisor() {
         let h = harness();
         assert_eq!(
-            dispatch(SvcRequest::RestartHostRequested, &h.backend),
+            dispatch(SvcRequest::RestartHostRequested, &h.backend, true),
             SvcResponse::Ok
         );
         assert_eq!(*h.supervisor.restarts.lock(), 1);
@@ -252,7 +350,7 @@ mod tests {
     fn restart_failure_becomes_failed_response() {
         let h = harness();
         *h.supervisor.fail_with.lock() = Some("no interactive session".into());
-        match dispatch(SvcRequest::RestartHostRequested, &h.backend) {
+        match dispatch(SvcRequest::RestartHostRequested, &h.backend, true) {
             SvcResponse::Failed { reason } => assert!(reason.contains("no interactive session")),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -267,9 +365,99 @@ mod tests {
             SvcRequest::EnsureFirewallRules,
             SvcRequest::RemoveFirewallRules,
             SvcRequest::RestartHostRequested,
+            SvcRequest::StartUacInjector,
+            SvcRequest::StopUacInjector,
         ] {
-            let _ = dispatch(req, &h.backend);
+            // Trusted and untrusted callers both must be handled without panic.
+            let _ = dispatch(req, &h.backend, true);
+            let _ = dispatch(req, &h.backend, false);
         }
+    }
+
+    #[test]
+    fn start_uac_injector_is_denied_when_master_switch_is_off() {
+        let h = harness();
+        // Default harness has the switch off.
+        assert!(!*h.uac.enabled.lock());
+        // A trusted caller still hits the master-switch denial.
+        match dispatch(SvcRequest::StartUacInjector, &h.backend, true) {
+            SvcResponse::Denied { reason } => {
+                assert!(reason.contains("uac_clickthrough=false"), "got {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        // The injector must not have been touched.
+        assert_eq!(*h.uac.starts.lock(), 0);
+    }
+
+    #[test]
+    fn start_uac_injector_is_denied_for_an_untrusted_caller_even_when_enabled() {
+        let h = harness();
+        // Feature is ON, but the caller is not the genuine host binary.
+        *h.uac.enabled.lock() = true;
+        match dispatch(SvcRequest::StartUacInjector, &h.backend, false) {
+            SvcResponse::Denied { reason } => {
+                assert!(reason.contains("not the DirectDesk host"), "got {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        // The caller-identity gate runs BEFORE the injector, so start() is never
+        // reached: no SYSTEM worker is spawned for an untrusted caller.
+        assert_eq!(*h.uac.starts.lock(), 0);
+    }
+
+    #[test]
+    fn start_uac_injector_launches_and_returns_ready_when_enabled() {
+        let h = harness();
+        *h.uac.enabled.lock() = true;
+        // Trusted caller + enabled → Ready.
+        match dispatch(SvcRequest::StartUacInjector, &h.backend, true) {
+            SvcResponse::UacInjectorReady {
+                pipe_name,
+                cap_token,
+            } => {
+                assert!(pipe_name.starts_with(r"\\.\pipe\DirectDeskUac-"));
+                assert_eq!(cap_token.len(), 32);
+            }
+            other => panic!("expected UacInjectorReady, got {other:?}"),
+        }
+        assert_eq!(*h.uac.starts.lock(), 1);
+    }
+
+    #[test]
+    fn start_uac_injector_failure_becomes_failed_response() {
+        let h = harness();
+        *h.uac.enabled.lock() = true;
+        *h.uac.fail_with.lock() = Some("no interactive session".into());
+        match dispatch(SvcRequest::StartUacInjector, &h.backend, true) {
+            SvcResponse::Failed { reason } => assert!(reason.contains("no interactive session")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_uac_injector_calls_stop_once_and_is_ok_even_when_disabled() {
+        let h = harness();
+        // Switch is off, but Stop is still honoured (idempotent teardown) for the
+        // trusted host.
+        assert_eq!(
+            dispatch(SvcRequest::StopUacInjector, &h.backend, true),
+            SvcResponse::Ok
+        );
+        assert_eq!(*h.uac.stops.lock(), 1);
+    }
+
+    #[test]
+    fn stop_uac_injector_is_denied_for_an_untrusted_caller() {
+        let h = harness();
+        match dispatch(SvcRequest::StopUacInjector, &h.backend, false) {
+            SvcResponse::Denied { reason } => {
+                assert!(reason.contains("not the DirectDesk host"), "got {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        // stop() must not have been driven by an untrusted caller.
+        assert_eq!(*h.uac.stops.lock(), 0);
     }
 
     #[test]

@@ -16,13 +16,14 @@
 //! The payload itself carries no parameters at all (see [`crate::dispatch`]),
 //! so nothing a client sends is ever interpreted as a path or a command.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use directdesk_shared::protocol::{decode_strict, parse_frame_len};
 use directdesk_shared::svc_ipc::{SvcRequest, SvcResponse, MAX_IPC_MSG};
 use windows::Win32::Foundation::{
-    LocalFree, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL,
+    LocalFree, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, MAX_PATH,
     WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
@@ -33,10 +34,13 @@ use windows::Win32::Storage::FileSystem::{
     ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
 };
-use windows::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, WaitForMultipleObjects, INFINITE, PROCESS_NAME_FORMAT,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use crate::dispatch::{dispatch, Backend};
@@ -98,6 +102,93 @@ pub fn decode_request(frame: &[u8]) -> anyhow::Result<SvcRequest> {
         );
     }
     Ok(decode_strict::<SvcRequest>(body)?)
+}
+
+// ---------------------------------------------------------------------------
+// Caller identity (the two UAC verbs are gated on this)
+// ---------------------------------------------------------------------------
+//
+// The pipe DACL already limits who can *connect* (SYSTEM, Administrators, and
+// INTERACTIVE users), but that still admits *any* same-session process — so a
+// malicious same-user program could otherwise ask the service to drive the
+// SYSTEM UAC click-through and bypass UAC locally. For the two UAC verbs only,
+// we additionally authenticate the caller by IMAGE PATH: the connected client
+// must be the installed host binary (the sibling `DirectDeskHost.exe`). The host
+// may be launched by the service or by the user's HKCU Run entry, so we do NOT
+// pin a specific PID — image identity is the trust anchor.
+
+/// Case-insensitive, slash-normalized form of a Windows path, for comparing two
+/// image paths when neither can be canonicalized. Pure and unit-tested.
+fn normalize_image_path(p: &str) -> String {
+    p.trim().replace('/', "\\").to_ascii_lowercase()
+}
+
+/// Do two image paths refer to the same file? Prefer `canonicalize` (which
+/// resolves `..`, short 8.3 names, and symlinks) and fall back to a normalized
+/// case-insensitive string compare when the files cannot be opened. Pure.
+fn image_paths_equal(actual: &str, expected: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (
+        std::fs::canonicalize(actual),
+        std::fs::canonicalize(expected),
+    ) {
+        return a == b;
+    }
+    normalize_image_path(actual) == normalize_image_path(&expected.to_string_lossy())
+}
+
+/// Resolve the connected pipe client's full executable image path, or `None` on
+/// any failure. Never panics.
+fn client_image_path(pipe: &OwnedHandle) -> Option<String> {
+    let mut pid: u32 = 0;
+    // SAFETY: `pipe` is our connected server handle; `pid` is written by the call.
+    unsafe { GetNamedPipeClientProcessId(pipe.raw(), &mut pid) }.ok()?;
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: LIMITED_INFORMATION is enough for the image path and is grantable
+    // across integrity levels; the handle is closed by OwnedHandle.
+    let proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    // SAFETY: valid handle, exclusively owned by the wrapper.
+    let proc = unsafe { OwnedHandle::new(proc) };
+
+    let mut buf = [0u16; MAX_PATH as usize];
+    let mut len = buf.len() as u32;
+    // SAFETY: buf/len are valid for the call; len is updated to the written size.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            proc.raw(),
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// Is the connected pipe client the genuine installed host binary? Any failure
+/// (cannot resolve the PID, open the process, read the image, or a mismatch) is
+/// treated as **not trusted** — never a panic, never a default-allow.
+fn caller_is_trusted_host(pipe: &OwnedHandle, expected_host_exe: &Path) -> bool {
+    match client_image_path(pipe) {
+        Some(actual) => {
+            let trusted = image_paths_equal(&actual, expected_host_exe);
+            if !trusted {
+                tracing::warn!(
+                    caller = %actual,
+                    expected = %expected_host_exe.display(),
+                    "pipe caller is not the DirectDesk host; UAC verbs will be denied"
+                );
+            }
+            trusted
+        }
+        None => {
+            tracing::warn!("could not resolve pipe caller image; treating as untrusted");
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +420,12 @@ fn serve_one(pipe: &OwnedHandle, backend: &Backend, stop: &StopSignal) -> anyhow
     let mut buf = vec![0u8; MAX_FRAME];
     let response = match read_message(pipe, stop, &mut buf) {
         Ok(n) => match decode_request(&buf[..n]) {
-            Ok(req) => dispatch(req, backend),
+            Ok(req) => {
+                // Authenticate the caller by image path. Only the two UAC verbs
+                // consult this; every other verb ignores it (unchanged behavior).
+                let trusted = caller_is_trusted_host(pipe, &backend.expected_host_exe);
+                dispatch(req, backend, trusted)
+            }
             Err(e) => {
                 tracing::warn!("rejecting malformed request: {e}");
                 SvcResponse::Failed {
@@ -548,6 +644,8 @@ mod tests {
             SvcRequest::EnsureFirewallRules,
             SvcRequest::RemoveFirewallRules,
             SvcRequest::RestartHostRequested,
+            SvcRequest::StartUacInjector,
+            SvcRequest::StopUacInjector,
         ] {
             let frame = encode_frame(&req).unwrap();
             assert!(frame.len() <= MAX_FRAME);
@@ -803,5 +901,71 @@ mod tests {
     #[test]
     fn start_rejects_zero_instances() {
         assert!(start(&test_pipe_name("zero"), harness().backend, 0).is_err());
+    }
+
+    // ---------- caller identity ----------
+
+    #[test]
+    fn normalize_image_path_lowercases_and_unifies_slashes() {
+        assert_eq!(
+            normalize_image_path(r"C:\Program Files\DirectDesk\DirectDeskHost.exe"),
+            r"c:\program files\directdesk\directdeskhost.exe"
+        );
+        // Forward slashes and surrounding whitespace are normalized too.
+        assert_eq!(
+            normalize_image_path("  C:/X/Host.EXE  "),
+            r"c:\x\host.exe"
+        );
+    }
+
+    #[test]
+    fn image_paths_equal_matches_case_insensitively_via_the_string_fallback() {
+        // Use paths that do not exist so the compare falls back to the string
+        // form (canonicalize fails for both, exercising the fallback branch).
+        let expected = std::path::PathBuf::from(r"C:\NoSuchDir_ZZZ\DirectDeskHost.exe");
+        assert!(image_paths_equal(
+            r"c:\nosuchdir_zzz\directdeskhost.exe",
+            &expected
+        ));
+        assert!(image_paths_equal(
+            r"C:/NoSuchDir_ZZZ/DirectDeskHost.exe",
+            &expected
+        ));
+        assert!(!image_paths_equal(
+            r"C:\NoSuchDir_ZZZ\evil.exe",
+            &expected
+        ));
+    }
+
+    #[test]
+    fn uac_verbs_are_denied_to_an_untrusted_caller_over_a_real_pipe() {
+        // End-to-end: the feature is ON, but the connecting client is the test
+        // process (not DirectDeskHost.exe), so the caller-identity gate must
+        // deny both UAC verbs before the injector is ever driven.
+        let name = test_pipe_name("uacauth");
+        let h = harness();
+        *h.uac.enabled.lock() = true;
+        let server = start(&name, h.backend.clone(), 2).unwrap();
+        let one = |req| TestClient::connect(&name).unwrap().request(req).unwrap();
+
+        match one(SvcRequest::StartUacInjector) {
+            SvcResponse::Denied { reason } => {
+                assert!(reason.contains("not the DirectDesk host"), "got {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        match one(SvcRequest::StopUacInjector) {
+            SvcResponse::Denied { reason } => {
+                assert!(reason.contains("not the DirectDesk host"), "got {reason}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        // Neither the SYSTEM worker start nor stop was reached.
+        assert_eq!(*h.uac.starts.lock(), 0);
+        assert_eq!(*h.uac.stops.lock(), 0);
+
+        // A non-UAC verb from the same untrusted caller still works unchanged.
+        assert_eq!(one(SvcRequest::Ping), SvcResponse::Pong);
+        drop(server);
     }
 }

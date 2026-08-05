@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 /// Name of the host agent binary that the supervisor launches.
 pub const HOST_EXE_NAME: &str = "DirectDeskHost.exe";
 
+/// Name of the transient SYSTEM-integrity UAC injector worker. Like the host
+/// agent, it is always resolved as a sibling of the *service* executable — never
+/// from config, the registry, or an IPC message.
+pub const UAC_INJECTOR_EXE_NAME: &str = "DirectDeskUacInjector.exe";
+
 /// Directory containing the running service executable
 /// (in a real install: `C:\Program Files\DirectDesk`).
 pub fn service_exe_dir() -> anyhow::Result<PathBuf> {
@@ -22,6 +27,12 @@ pub fn service_exe_dir() -> anyhow::Result<PathBuf> {
 /// Absolute path to the host agent, resolved as a sibling of the service exe.
 pub fn host_exe_path() -> anyhow::Result<PathBuf> {
     Ok(service_exe_dir()?.join(HOST_EXE_NAME))
+}
+
+/// Absolute path to the UAC injector worker, resolved as a sibling of the
+/// service exe (same trust rule as [`host_exe_path`]).
+pub fn uac_injector_exe_path() -> anyhow::Result<PathBuf> {
+    Ok(service_exe_dir()?.join(UAC_INJECTOR_EXE_NAME))
 }
 
 /// `%ProgramData%\DirectDesk` — machine-wide, non-secret service state.
@@ -52,6 +63,14 @@ mod tests {
         let host = host_exe_path().unwrap();
         assert_eq!(host.parent().unwrap(), dir.as_path());
         assert_eq!(host.file_name().unwrap(), HOST_EXE_NAME);
+    }
+
+    #[test]
+    fn uac_injector_is_sibling_of_service_exe() {
+        let dir = service_exe_dir().unwrap();
+        let worker = uac_injector_exe_path().unwrap();
+        assert_eq!(worker.parent().unwrap(), dir.as_path());
+        assert_eq!(worker.file_name().unwrap(), UAC_INJECTOR_EXE_NAME);
     }
 
     #[test]

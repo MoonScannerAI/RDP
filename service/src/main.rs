@@ -31,6 +31,7 @@ mod pipe;
 mod secure_desktop;
 mod supervisor;
 mod svc;
+mod uac_injector;
 mod winutil;
 
 use std::ffi::OsStr;

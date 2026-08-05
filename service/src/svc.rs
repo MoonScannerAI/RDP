@@ -142,6 +142,13 @@ fn start_components() -> anyhow::Result<(
         "loaded service configuration"
     );
 
+    let uac_injector_exe = crate::paths::uac_injector_exe_path()?;
+    tracing::info!(
+        uac_injector_exe = %uac_injector_exe.display(),
+        uac_clickthrough = config.uac_clickthrough,
+        "UAC injector configuration"
+    );
+
     // Opt-in only: no thread, no registry write, unless the operator asked
     // for it in service.json. See ServiceConfig::disable_uac_secure_desktop
     // for the security tradeoff this switch makes.
@@ -157,10 +164,18 @@ fn start_components() -> anyhow::Result<(
 
     let supervisor = Supervisor::start(host_exe.clone(), config.autostart_host)?;
     let backend = Backend {
-        firewall: Arc::new(WindowsFirewall::new(host_exe)),
+        firewall: Arc::new(WindowsFirewall::new(host_exe.clone())),
         supervisor: supervisor.shared(),
         autostart: Arc::new(RegistryAutostart),
+        uac: Arc::new(crate::uac_injector::UacInjector::new(
+            config.uac_clickthrough,
+            uac_injector_exe,
+        )),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
+        // The two UAC-injector verbs are honoured only when the pipe client's
+        // image path is this installed host binary (the sibling
+        // DirectDeskHost.exe), authenticated in the pipe server.
+        expected_host_exe: host_exe,
     };
 
     let pipe_server = crate::pipe::start(PIPE_NAME, backend, crate::pipe::DEFAULT_INSTANCES)?;
