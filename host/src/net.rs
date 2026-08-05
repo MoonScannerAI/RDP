@@ -741,6 +741,10 @@ pub struct NetConfig {
     pub bitrate_cap_kbps: Option<u32>,
     pub pipeline: PipelineConfig,
     pub quic: QuicParams,
+    /// Blank the host desktop to solid black for the duration of each remote
+    /// session and restore the previous wallpaper/color when it ends. See
+    /// [`crate::config::HostConfig::blank_wallpaper_during_session`].
+    pub blank_wallpaper_during_session: bool,
 }
 
 impl NetConfig {
@@ -753,6 +757,7 @@ impl NetConfig {
             bitrate_cap_kbps: cfg.bitrate_cap_kbps,
             pipeline: cfg.pipeline(),
             quic: QuicParams::default(),
+            blank_wallpaper_during_session: cfg.blank_wallpaper_during_session,
         }
     }
 }
@@ -1432,6 +1437,12 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
     };
     // Nothing below may return without this guard being dropped.
     let _release = ReleaseGuard(pipeline.clone());
+    // Bandwidth saver: blank the desktop to black for the life of this
+    // session and restore it on every exit path (this function's `String`
+    // return covers all of them — success, error, timeout, disconnect). A
+    // no-op guard when the config flag is off. Scoped to the session rather
+    // than the pipeline because the pipeline outlives a single client.
+    let _wallpaper = crate::wallpaper::WallpaperGuard::new(inner.cfg.blank_wallpaper_during_session);
 
     let driver_cfg = DriverConfig {
         heartbeat_ms: 2_000,

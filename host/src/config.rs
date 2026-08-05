@@ -60,6 +60,14 @@ pub struct HostConfig {
     /// Start with the window hidden in the tray. `--minimized` also sets this
     /// for one run without persisting it.
     pub start_minimized: bool,
+    /// RDP-style bandwidth saver: blank the host's desktop to solid black
+    /// while a remote session is active, and restore the exact previous
+    /// wallpaper/background color when it ends. A detailed photo wallpaper
+    /// makes every keyframe large and every mouse/window move over it
+    /// expensive to encode; a flat black desktop makes keyframes tiny and
+    /// deltas near-zero. Default `true` — most users would rather have the
+    /// bandwidth than see their wallpaper during a remote session.
+    pub blank_wallpaper_during_session: bool,
 }
 
 impl Default for HostConfig {
@@ -76,6 +84,7 @@ impl Default for HostConfig {
             gop_seconds: 4,
             idle_repeat_ms: 250,
             start_minimized: false,
+            blank_wallpaper_during_session: true,
         }
     }
 }
@@ -335,6 +344,31 @@ mod tests {
         }
         .sanitized();
         assert_eq!(clamped.idle_repeat_ms, 5_000);
+    }
+
+    #[test]
+    fn blank_wallpaper_defaults_on_and_roundtrips_through_json() {
+        // The user explicitly wants this on by default: a fresh install (or
+        // an in-memory default) must blank the wallpaper during a session.
+        let c = HostConfig::default();
+        assert!(c.blank_wallpaper_during_session);
+
+        let c = HostConfig {
+            blank_wallpaper_during_session: false,
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&c).unwrap();
+        let back: HostConfig = serde_json::from_str(&text).unwrap();
+        assert!(!back.blank_wallpaper_during_session);
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn blank_wallpaper_missing_key_defaults_true() {
+        // An older config file predating this option must still get the
+        // bandwidth saving, not silently lose it.
+        let back: HostConfig = serde_json::from_str(r#"{"udp_port":47990}"#).unwrap();
+        assert!(back.blank_wallpaper_during_session);
     }
 
     #[test]

@@ -27,5 +27,6 @@ pub mod net;
 pub mod session;
 pub mod testsupport;
 pub mod ui;
+pub mod wallpaper;
 
 pub use directdesk_shared as shared;
