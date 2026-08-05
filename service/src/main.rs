@@ -28,6 +28,7 @@ mod dispatch;
 mod firewall;
 mod paths;
 mod pipe;
+mod secure_desktop;
 mod supervisor;
 mod svc;
 mod winutil;

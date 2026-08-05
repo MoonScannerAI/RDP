@@ -17,6 +17,23 @@ pub struct ServiceConfig {
     /// and any parse failure lands here too (see [`parse`]).
     #[serde(default)]
     pub autostart_host: bool,
+
+    /// Keep Windows UAC's secure desktop DISABLED
+    /// (`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\PromptOnSecureDesktop
+    /// = 0`) so a remote operator is never frozen out when a UAC prompt
+    /// appears — the secure desktop renders on a desktop a remote input/video
+    /// pipeline cannot reach.
+    ///
+    /// SECURITY TRADEOFF: the secure desktop exists to stop other software on
+    /// the machine from spoofing or driving the UAC consent prompt. Disabling
+    /// it weakens that anti-spoofing protection machine-wide, not just for
+    /// DirectDesk. This is opt-in and defaults to `false`; enable it only on
+    /// unattended remote-access hosts where you accept that tradeoff.
+    ///
+    /// A missing field or a parse failure lands on `false`, same as the other
+    /// switches in this file.
+    #[serde(default)]
+    pub disable_uac_secure_desktop: bool,
 }
 
 /// Parse config text. Anything unparseable falls back to the safe default
@@ -33,8 +50,12 @@ pub fn parse(text: &str) -> ServiceConfig {
 
 /// Serialize the config exactly as it is written to disk.
 pub fn to_json(cfg: &ServiceConfig) -> String {
-    // unwrap: a two-field struct of primitives cannot fail to serialize.
-    serde_json::to_string_pretty(cfg).unwrap_or_else(|_| "{\n  \"autostart_host\": false\n}".into())
+    // unwrap: a struct of bool primitives cannot fail to serialize.
+    serde_json::to_string_pretty(cfg).unwrap_or_else(|_| {
+        "{\n  \"autostart_host\": false,\n  \
+         \"disable_uac_secure_desktop\": false\n}"
+            .into()
+    })
 }
 
 /// Read the config, creating a default file if none exists.
@@ -80,6 +101,23 @@ mod tests {
     #[test]
     fn default_is_disabled() {
         assert!(!ServiceConfig::default().autostart_host);
+        assert!(!ServiceConfig::default().disable_uac_secure_desktop);
+    }
+
+    #[test]
+    fn disable_uac_secure_desktop_defaults_false_and_roundtrips() {
+        // Default is false.
+        assert!(!ServiceConfig::default().disable_uac_secure_desktop);
+        // Missing field (existing config files predate this switch) → false.
+        assert!(!parse(r#"{"autostart_host": true}"#).disable_uac_secure_desktop);
+        assert!(!parse("{}").disable_uac_secure_desktop);
+        // Explicit true parses, and survives a write/read cycle (JSON round-trip).
+        assert!(parse(r#"{"disable_uac_secure_desktop": true}"#).disable_uac_secure_desktop);
+        let cfg = ServiceConfig {
+            disable_uac_secure_desktop: true,
+            ..Default::default()
+        };
+        assert_eq!(parse(&to_json(&cfg)), cfg);
     }
 
     #[test]
@@ -106,6 +144,7 @@ mod tests {
     fn roundtrips_through_written_json() {
         let cfg = ServiceConfig {
             autostart_host: true,
+            ..Default::default()
         };
         assert_eq!(parse(&to_json(&cfg)), cfg);
     }

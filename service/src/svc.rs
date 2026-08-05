@@ -74,7 +74,7 @@ fn run_service() -> anyhow::Result<()> {
     ))?;
 
     let started = start_components();
-    let (mut pipe_server, mut supervisor) = match started {
+    let (mut pipe_server, mut supervisor, mut secure_desktop) = match started {
         Ok(parts) => parts,
         Err(e) => {
             tracing::error!("startup failed: {e:#}");
@@ -110,9 +110,12 @@ fn run_service() -> anyhow::Result<()> {
         1,
     ))?;
 
-    // Drain both subsystems before reporting Stopped.
+    // Drain every subsystem before reporting Stopped.
     pipe_server.shutdown();
     supervisor.shutdown();
+    if let Some(reasserter) = secure_desktop.as_mut() {
+        reasserter.shutdown();
+    }
 
     status_handle.set_service_status(status(
         ServiceState::Stopped,
@@ -123,8 +126,14 @@ fn run_service() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the backend and start the pipe server and the supervisor.
-fn start_components() -> anyhow::Result<(crate::pipe::PipeServer, Supervisor)> {
+/// Build the backend and start the pipe server, the supervisor, and (when
+/// enabled) the secure-desktop reasserter.
+#[allow(clippy::type_complexity)]
+fn start_components() -> anyhow::Result<(
+    crate::pipe::PipeServer,
+    Supervisor,
+    Option<crate::secure_desktop::Reasserter>,
+)> {
     let host_exe = crate::paths::host_exe_path()?;
     let config = crate::config::load_or_create(&crate::paths::config_path());
     tracing::info!(
@@ -132,6 +141,19 @@ fn start_components() -> anyhow::Result<(crate::pipe::PipeServer, Supervisor)> {
         autostart_host = config.autostart_host,
         "loaded service configuration"
     );
+
+    // Opt-in only: no thread, no registry write, unless the operator asked
+    // for it in service.json. See ServiceConfig::disable_uac_secure_desktop
+    // for the security tradeoff this switch makes.
+    let secure_desktop = if config.disable_uac_secure_desktop {
+        tracing::warn!(
+            "disable_uac_secure_desktop=true: keeping UAC's secure desktop OFF \
+             (weakens UAC anti-spoofing protection machine-wide; opt-in tradeoff)"
+        );
+        Some(crate::secure_desktop::Reasserter::start()?)
+    } else {
+        None
+    };
 
     let supervisor = Supervisor::start(host_exe.clone(), config.autostart_host)?;
     let backend = Backend {
@@ -142,7 +164,7 @@ fn start_components() -> anyhow::Result<(crate::pipe::PipeServer, Supervisor)> {
     };
 
     let pipe_server = crate::pipe::start(PIPE_NAME, backend, crate::pipe::DEFAULT_INSTANCES)?;
-    Ok((pipe_server, supervisor))
+    Ok((pipe_server, supervisor, secure_desktop))
 }
 
 /// Reports whether the console user has a DirectDesk entry under HKCU\...\Run.
