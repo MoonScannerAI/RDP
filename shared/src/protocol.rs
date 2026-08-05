@@ -133,6 +133,17 @@ pub enum ControlMsg {
     RouteReport(TransportRoute),
     /// Host is on the secure desktop (UAC/lock) — capture unavailable.
     SecureDesktopActive(bool),
+    /// Host → client: a UAC/elevation consent prompt is on screen that the
+    /// normal-integrity host cannot click through UIPI. Offers the operator a
+    /// one-shot opt-in to have a SYSTEM worker perform the click. `title` is the
+    /// consent window caption for the operator to eyeball what they're approving.
+    ElevationPrompt { title: String },
+    /// Client → host: operator opts in to respond to the *current* prompt. The
+    /// host arms the SYSTEM injector for one elevation (or a short TTL) only.
+    ArmElevation { one_shot: bool, ttl_secs: u32 },
+    /// Host → client: elevation handling ended (prompt gone / TTL expired /
+    /// stopped). The client clears any "arm?" affordance.
+    ElevationEnded,
     /// Graceful disconnect with a human-readable reason.
     Bye {
         reason: String,

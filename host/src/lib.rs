@@ -20,13 +20,17 @@
 pub mod capture;
 pub mod config;
 pub mod convert;
+pub mod elevation;
 pub mod input_inject;
 pub mod mf_encoder;
 pub mod mfinit;
 pub mod net;
 pub mod session;
 pub mod testsupport;
+pub mod uac_client;
+pub mod uac_proto;
 pub mod ui;
 pub mod wallpaper;
+pub mod winpipe;
 
 pub use directdesk_shared as shared;

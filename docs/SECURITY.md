@@ -145,6 +145,74 @@ is designed narrowly on purpose:
   firewall_rules_present, autostart_enabled }` — read-only diagnostic
   information, nothing sensitive.
 
+## Remote UAC click-through
+
+With `PromptOnSecureDesktop=0`, the Windows UAC consent dialog (`consent.exe`,
+System integrity) is drawn on the ordinary interactive desktop. The medium-
+integrity host can *see* it but cannot *click* it — UIPI blocks a lower-integrity
+process from posting input to a higher-integrity window. So that a paired remote
+operator can approve an elevation prompt, the service can spawn a transient
+SYSTEM-integrity worker (`DirectDeskUacInjector.exe`) that injects the click on
+the host's behalf. This is a deliberately dangerous capability, so it is fenced
+in on every side:
+
+- **Opt-in, two switches, default off.** Nothing here runs unless the
+  `uac_clickthrough` master switch is enabled *and* the operator triggers a
+  click-through for a specific prompt. When the switch is off the dispatcher
+  denies the request before the injector is ever reached.
+- **Caller-identity gate.** The two IPC verbs that drive the worker
+  (`StartUacInjector` / `StopUacInjector`) are honoured **only when the pipe
+  client is the installed host binary**. The pipe's DACL already restricts
+  connections to SYSTEM, Administrators, and interactive users, but that still
+  admits *any* same-user process; without this gate a local program could obtain
+  the one-time capability token and drive the SYSTEM worker — a local UAC bypass.
+  The service resolves the client's PID
+  (`GetNamedPipeClientProcessId`), reads its full image path
+  (`QueryFullProcessImageNameW`), and requires it to match the sibling
+  `DirectDeskHost.exe`; every failure is treated as untrusted. Identity is by
+  **image path**, not PID, because the host may be started either by the service
+  or by the user's HKCU `Run` entry. All other verbs are parameter-free and
+  ignore this gate.
+- **Transient and self-expiring.** The worker is short-lived: it exits (releasing
+  any held input first) on client disconnect, ~30 s of input idle, or the consent
+  window being gone for ~5 s. At most one worker runs at a time.
+- **Consent-window-clamped.** Before every injection the worker requires the
+  foreground window's *full image path* to be the real
+  `%SystemRoot%\System32\consent.exe` (or the System32 credential broker) — not
+  merely a process named `consent.exe` from some other directory — and clamps the
+  mouse coordinates into that window's rectangle. It also re-verifies the same
+  consent process still owns the foreground immediately before injecting.
+- **Mouse-only.** The worker injects **mouse** events exclusively; keyboard
+  events are dropped. Approving UAC is a click on "Yes". Remote **entry of
+  credentials** into an over-the-shoulder / password elevation prompt is
+  explicitly **unsupported** — there is no path by which the worker types into a
+  secure prompt.
+- **Capability token.** The host authenticates to the worker's own pipe with a
+  128-bit one-time token the service minted, compared in constant time.
+
+**Residual risks — be honest about these.** Even with all of the above, enabling
+this feature genuinely widens the trust boundary:
+
+- **A UAC prompt can be approved without physical presence.** That is the whole
+  point of the feature, but it means the "someone is physically at the machine"
+  assumption behind UAC no longer holds. Anyone who can drive the genuine host —
+  i.e. **a paired remote operator** — can approve an elevation. Only enable it if
+  you trust your paired clients with elevation on this machine.
+- **An attacker who can run the genuine host *and* is a paired client inherits
+  this.** The caller-identity gate stops an *arbitrary* local process, but it
+  cannot distinguish the real host driven by a legitimate operator from the real
+  host driven by an attacker who has both launched the installed binary and holds
+  a paired client identity. Such an attacker already has substantial access; this
+  feature hands them a click on "Yes".
+- **It depends on `PromptOnSecureDesktop=0`.** The click-through only works
+  because the consent dialog is on the interactive desktop rather than the secure
+  desktop. That is a weakening of the default UAC posture and is a prerequisite,
+  not something DirectDesk sets silently on your behalf.
+
+If remote approval of elevation prompts is not something you want for a given
+machine, leave `uac_clickthrough` off (the default) and the entire path above is
+unreachable.
+
 ## Secret storage: DPAPI
 
 Paired identity material (the long-term Ed25519 keys and any derived

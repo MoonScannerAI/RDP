@@ -17,6 +17,12 @@ name = "capture_harness"
 path = "src/bin/capture_harness.rs"
 required-features = ["harness"]
 
+# Transient SYSTEM-integrity worker the service spawns on the console desktop to
+# click the UAC consent dialog the medium-integrity host cannot reach via UIPI.
+[[bin]]
+name = "DirectDeskUacInjector"
+path = "src/bin/uac_injector.rs"
+
 [features]
 # The host UI needs eframe/egui unconditionally now, so they are plain
 # dependencies. `harness` only gates the extra de-risk binary.
@@ -35,6 +41,7 @@ quinn = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+subtle = { workspace = true }
 
 eframe = { workspace = true }
 egui = { workspace = true }
@@ -51,8 +58,13 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    "Win32_System_IO",
     "Win32_System_Ole",
+    "Win32_System_Pipes",
     "Win32_System_Variant",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",

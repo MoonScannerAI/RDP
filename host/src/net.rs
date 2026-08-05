@@ -87,11 +87,12 @@ use directdesk_shared::crypto::auth::{
 use directdesk_shared::crypto::pairing::{PairingCode, PairingHost, PAIRING_TTL_MS};
 use directdesk_shared::crypto::storage::SecretStore;
 use directdesk_shared::crypto::{fingerprint_short, HostIdentity};
-use directdesk_shared::input::validate_event;
+use directdesk_shared::input::{validate_event, InputEvent};
 use directdesk_shared::protocol::{
     AuthMsg, Channel, Codec, ControlMsg, Hello, InputMsg, QualityMode, MAX_AUTH_MSG,
     PROTOCOL_VERSION,
 };
+use directdesk_shared::svc_ipc::SvcResponse;
 use directdesk_shared::stats::{ConnStats, TransportRoute};
 use directdesk_shared::transport::quic::{self, QuicParams, SessionStreams};
 use directdesk_shared::transport::session::{
@@ -100,7 +101,9 @@ use directdesk_shared::transport::session::{
 use directdesk_shared::video::{fragment_frame_fec, EncodedFrame};
 use directdesk_shared::{Error, Result};
 
-use crate::session::{HostSession, SessionConfig as PipelineConfig, SessionState};
+use crate::elevation::detect_consent_prompt;
+use crate::session::{HostSession, SessionConfig as PipelineConfig, SessionDescription, SessionState};
+use crate::uac_client::{ElevEffect, ElevationMachine, SvcControlClient, UacDataClient};
 
 /// Wall-clock budget for everything from `accept_streams` to `AuthOk`.
 pub const HANDSHAKE_TIMEOUT_MS: u64 = 15_000;
@@ -741,6 +744,11 @@ pub struct NetConfig {
     pub bitrate_cap_kbps: Option<u32>,
     pub pipeline: PipelineConfig,
     pub quic: QuicParams,
+    /// Operator opt-in for the SYSTEM UAC click-through. When `false` the host
+    /// never offers elevation and never spawns the injector worker.
+    pub uac_clickthrough: bool,
+    /// Ceiling (seconds) on how long a single elevation arming stays valid.
+    pub uac_arm_ttl_secs: u32,
     /// Blank the host desktop to solid black for the duration of each remote
     /// session and restore the previous wallpaper/color when it ends. See
     /// [`crate::config::HostConfig::blank_wallpaper_during_session`].
@@ -757,6 +765,8 @@ impl NetConfig {
             bitrate_cap_kbps: cfg.bitrate_cap_kbps,
             pipeline: cfg.pipeline(),
             quic: QuicParams::default(),
+            uac_clickthrough: cfg.uac_clickthrough,
+            uac_arm_ttl_secs: cfg.uac_arm_ttl_secs,
             blank_wallpaper_during_session: cfg.blank_wallpaper_during_session,
         }
     }
@@ -1488,6 +1498,20 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
         tracing::error!("could not spawn the video sender thread");
     }
 
+    // Elevation click-through: the control loop forwards `ArmElevation` here;
+    // `elevation_loop` owns the state machine, the detector poll, and the SYSTEM
+    // worker's lifecycle. It is NOT in `tasks` (which are hard-aborted): it is
+    // stopped cooperatively via `stop` and awaited so it can tear the worker and
+    // the input route down cleanly before the next client connects.
+    let (arm_tx, arm_rx) = mpsc::unbounded_channel::<(bool, u32)>();
+    let elevation = tokio::spawn(elevation_loop(
+        inner.clone(),
+        session.clone(),
+        pipeline.clone(),
+        arm_rx,
+        stop.clone(),
+    ));
+
     let tasks = vec![
         tokio::spawn(input_loop(receivers.input, pipeline.clone())),
         tokio::spawn(control_loop(
@@ -1497,6 +1521,7 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
             pipeline.clone(),
             streaming.clone(),
             adaptor.clone(),
+            arm_tx,
         )),
         tokio::spawn(status_loop(
             inner.clone(),
@@ -1519,6 +1544,9 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
     for t in tasks {
         t.abort();
     }
+    // Await (do not abort) the elevation loop so it tears down any live SYSTEM
+    // worker and clears the input route before the next client connects.
+    let _ = elevation.await;
     if let Some(v) = video {
         let _ = v.join();
     }
@@ -1764,6 +1792,7 @@ async fn input_loop(mut rx: mpsc::Receiver<InputMsg>, pipeline: Arc<HostSession>
 }
 
 /// Session control from the client.
+#[allow(clippy::too_many_arguments)]
 async fn control_loop(
     inner: Arc<Inner>,
     mut rx: mpsc::Receiver<ControlMsg>,
@@ -1771,6 +1800,7 @@ async fn control_loop(
     pipeline: Arc<HostSession>,
     streaming: Arc<AtomicBool>,
     adaptor: Arc<Mutex<BitrateAdaptor>>,
+    arm_tx: mpsc::UnboundedSender<(bool, u32)>,
 ) {
     let mut keyframes = RateLimiter::new(CLIENT_KEYFRAME_MIN_INTERVAL_MS);
 
@@ -1845,6 +1875,16 @@ async fn control_loop(
                     s.transport.fps_decode = peer.fps_decode;
                     s.transport.fps_present = peer.fps_present;
                 });
+            }
+            ControlMsg::ArmElevation { one_shot, ttl_secs } => {
+                if !inner.cfg.uac_clickthrough {
+                    tracing::warn!("client armed elevation but uac_clickthrough is off; ignoring");
+                } else {
+                    tracing::info!("client armed elevation (one_shot={one_shot}, ttl={ttl_secs}s)");
+                    // Hand it to the elevation loop; if that task is gone the
+                    // session is ending anyway.
+                    let _ = arm_tx.send((one_shot, ttl_secs));
+                }
             }
             other => tracing::debug!("ignoring control message from client: {other:?}"),
         }
@@ -2037,6 +2077,178 @@ async fn event_loop(
             }
             SessionEvent::Stats(_) => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UAC click-through orchestration
+// ---------------------------------------------------------------------------
+
+/// How often the elevation loop polls for a consent prompt.
+const ELEVATION_POLL_MS: u64 = 200;
+
+/// A live SYSTEM-worker route: the forwarder thread draining the input route
+/// sink into the worker's data pipe.
+struct ActiveRoute {
+    forwarder: std::thread::JoinHandle<()>,
+}
+
+/// Detect a consent prompt, offer the client the click-through, and — once the
+/// operator arms — route input to a transient SYSTEM worker for the duration of
+/// the elevation. All Windows/pipe work is done off the runtime via
+/// `spawn_blocking`; the decision logic is the pure [`ElevationMachine`].
+async fn elevation_loop(
+    inner: Arc<Inner>,
+    session: Arc<QuicSession>,
+    pipeline: Arc<HostSession>,
+    mut arm_rx: mpsc::UnboundedReceiver<(bool, u32)>,
+    stop: Arc<AtomicBool>,
+) {
+    if !inner.cfg.uac_clickthrough {
+        // Opt-out: never detect, never offer, never spawn a SYSTEM worker.
+        return;
+    }
+    tracing::info!("UAC click-through enabled; watching for consent prompts");
+
+    let mut machine = ElevationMachine::new();
+    let mut active: Option<ActiveRoute> = None;
+    let mut ticker = tokio::time::interval(Duration::from_millis(ELEVATION_POLL_MS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if stop.load(Ordering::SeqCst) || session.is_closed() {
+                    break;
+                }
+                let prompt = detect_consent_prompt();
+                let effect = machine.observe(prompt.is_some(), Instant::now());
+                match effect {
+                    ElevEffect::None => {}
+                    ElevEffect::Notify => {
+                        let title = prompt.map(|p| p.title).unwrap_or_default();
+                        tracing::info!("consent prompt detected; offering click-through");
+                        let _ = session.send_control(ControlMsg::ElevationPrompt { title });
+                    }
+                    ElevEffect::BeginRoute => {
+                        let desc = pipeline.describe();
+                        let pl = pipeline.clone();
+                        match tokio::task::spawn_blocking(move || start_route(pl, desc)).await {
+                            Ok(Ok(route)) => {
+                                active = Some(route);
+                                tracing::info!("SYSTEM injector routing input for elevation");
+                            }
+                            Ok(Err(e)) => {
+                                tracing::error!("could not start SYSTEM injector: {e}");
+                                let _ = machine.cancel();
+                                let _ = session.send_control(ControlMsg::ElevationEnded);
+                            }
+                            Err(e) => {
+                                tracing::error!("start-route task failed: {e}");
+                                let _ = machine.cancel();
+                                let _ = session.send_control(ControlMsg::ElevationEnded);
+                            }
+                        }
+                    }
+                    ElevEffect::EndRoute => {
+                        if let Some(route) = active.take() {
+                            let pl = pipeline.clone();
+                            let _ = tokio::task::spawn_blocking(move || end_route(pl, route)).await;
+                        } else {
+                            pipeline.end_elevation_route();
+                        }
+                        tracing::info!("elevation ended; input back on the local injector");
+                        let _ = session.send_control(ControlMsg::ElevationEnded);
+                    }
+                    ElevEffect::Cleared => {
+                        let _ = session.send_control(ControlMsg::ElevationEnded);
+                    }
+                }
+            }
+            armed = arm_rx.recv() => {
+                match armed {
+                    Some((one_shot, ttl_secs)) => {
+                        // The host's config TTL is the ceiling; the client cannot
+                        // ask for longer than the operator configured.
+                        let ttl_secs = ttl_secs
+                            .clamp(crate::config::MIN_UAC_ARM_TTL_SECS, inner.cfg.uac_arm_ttl_secs);
+                        let accepted = machine.arm(one_shot, Duration::from_secs(ttl_secs as u64), Instant::now());
+                        if accepted {
+                            tracing::info!("elevation armed (one_shot={one_shot}, ttl={ttl_secs}s)");
+                        } else {
+                            tracing::warn!("arm ignored: no consent prompt currently on screen");
+                            let _ = session.send_control(ControlMsg::ElevationEnded);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Cleanup: tear down any live worker and clear the input route.
+    if let Some(route) = active.take() {
+        let pl = pipeline.clone();
+        let _ = tokio::task::spawn_blocking(move || end_route(pl, route)).await;
+        let _ = session.send_control(ControlMsg::ElevationEnded);
+    }
+    tracing::debug!("elevation loop finished");
+}
+
+/// Start the SYSTEM worker, connect its data pipe, flip the session's input
+/// route to it, and spawn the forwarder that drains the route into the pipe.
+/// Blocking: runs on a `spawn_blocking` thread.
+fn start_route(pipeline: Arc<HostSession>, desc: SessionDescription) -> Result<ActiveRoute> {
+    let resp = SvcControlClient::start_uac_injector()?;
+    let (pipe_name, cap_token) = match resp {
+        SvcResponse::UacInjectorReady {
+            pipe_name,
+            cap_token,
+        } => (pipe_name, cap_token),
+        SvcResponse::Denied { reason } => {
+            return Err(Error::Other(format!("service denied UAC injector: {reason}")));
+        }
+        other => {
+            return Err(Error::Other(format!(
+                "unexpected service response to StartUacInjector: {other:?}"
+            )));
+        }
+    };
+
+    let client = UacDataClient::connect(&pipe_name, &cap_token)?;
+    client.send_geometry(desc.width, desc.height, desc.monitor_origin)?;
+
+    // The input thread owns the Sender; when the route ends it drops it, which
+    // disconnects this Receiver and unblocks the forwarder below.
+    let (tx, rx) = crossbeam_channel::unbounded::<InputEvent>();
+    pipeline.begin_elevation_route(tx);
+
+    let forwarder = std::thread::Builder::new()
+        .name("dd-uac-fwd".into())
+        .spawn(move || {
+            for ev in rx.iter() {
+                if let Err(e) = client.send_input(InputMsg::Event(ev)) {
+                    tracing::warn!("UAC forward failed; stopping forwarder: {e}");
+                    break;
+                }
+            }
+            // Dropping `client` here closes the pipe, so the worker sees the
+            // disconnect and self-exits (after releasing all held input).
+            tracing::debug!("UAC forwarder finished");
+        })
+        .map_err(|e| Error::Other(format!("spawn UAC forwarder: {e}")))?;
+
+    Ok(ActiveRoute { forwarder })
+}
+
+/// Leave the route: clear the session's elevation route (which drops the input
+/// thread's Sender and unblocks the forwarder), join the forwarder, then ask the
+/// service to stop the worker. Blocking.
+fn end_route(pipeline: Arc<HostSession>, route: ActiveRoute) {
+    pipeline.end_elevation_route();
+    let _ = route.forwarder.join();
+    if let Err(e) = SvcControlClient::stop_uac_injector() {
+        tracing::debug!("stop_uac_injector: {e}");
     }
 }
 

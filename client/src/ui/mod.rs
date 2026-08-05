@@ -26,6 +26,26 @@ use crate::pipeline::Pipeline;
 use crate::renderer::{FrameSlot, Presenter, VideoView};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
 
+/// An outstanding UAC prompt on the remote host, awaiting an operator
+/// decision. Shown as a banner over the session view; auto-dismisses so a
+/// stale prompt (host recovered on its own, or the operator stepped away)
+/// doesn't linger forever.
+struct ElevationBanner {
+    title: String,
+    shown_at: Instant,
+}
+
+/// How long an elevation banner stays up without a response before it
+/// auto-dismisses. Purely a local UI timeout — it does not tell the host
+/// anything; if the operator wants to arm elevation after this they'd need
+/// a fresh `ElevationPrompt` from the host.
+const ELEVATION_BANNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Default TTL sent with `ArmElevation` when the operator clicks "Allow
+/// once": long enough to cover clicking through a slow UAC dialog, short
+/// enough that a stray arm doesn't stay live for an unrelated later prompt.
+const DEFAULT_ELEVATION_TTL_SECS: u32 = 20;
+
 /// How the frame source was created, for honest labelling in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceMode {
@@ -92,6 +112,8 @@ pub struct ClientApp {
     show_diagnostics: bool,
     fullscreen: bool,
     notice: Option<String>,
+    /// Set while the host has an active UAC prompt the operator can approve.
+    elevation: Option<ElevationBanner>,
     /// Cached once per frame: `MouseWheel` events carry no position.
     pointer: Option<egui::Pos2>,
     /// Periodic counter dump, so a headless run is still verifiable.
@@ -149,6 +171,7 @@ impl ClientApp {
             show_diagnostics,
             fullscreen,
             notice: None,
+            elevation: None,
             pointer: None,
             metrics_logged_at: Instant::now(),
             // `--hold-capture` implies the one-shot install too, so the flag
@@ -269,9 +292,21 @@ impl ClientApp {
                     "Host is on the secure desktop (UAC/lock) — capture paused.".to_string()
                 });
             }
+            ControlMsg::ElevationPrompt { title } => {
+                // A fresh prompt supersedes whatever banner (if any) was
+                // already showing.
+                self.elevation = Some(ElevationBanner {
+                    title,
+                    shown_at: Instant::now(),
+                });
+            }
+            ControlMsg::ElevationEnded => {
+                self.elevation = None;
+            }
             ControlMsg::Bye { reason } => {
                 self.state = ConnectionState::Failed(format!("Host disconnected: {reason}"));
                 self.route = None;
+                self.elevation = None;
                 // Background capture keeps the hook across a host `Bye` so a
                 // transient disconnect/reconnect doesn't silently kill capture
                 // for the rest of the session (observed: a mid-stream `Bye` tore
@@ -701,6 +736,7 @@ impl ClientApp {
         self.presenter.reset();
         self.slot.clear();
         self.route = None;
+        self.elevation = None;
         self.state = ConnectionState::Disconnected;
     }
 
@@ -790,6 +826,57 @@ impl ClientApp {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Draws the "host wants elevation" banner as a floating, non-modal
+    /// overlay above the session view. It never blocks input to the stream
+    /// underneath — it's a strip anchored to the top of the window, not a
+    /// window/dialog of its own.
+    fn elevation_banner(&mut self, ctx: &egui::Context) {
+        let Some(elevation) = &self.elevation else {
+            return;
+        };
+        let title = elevation.title.clone();
+
+        let mut allow = false;
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new("elevation_banner"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(90, 62, 10))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 170, 60)))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 210, 120),
+                                format!(
+                                    "\u{26a0} The remote PC is asking for Administrator \
+                                     approval: \"{title}\". Respond on your behalf?"
+                                ),
+                            );
+                            if ui.button("Allow once").clicked() {
+                                allow = true;
+                            }
+                            if ui.button("Ignore").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+            });
+
+        if allow {
+            self.session.send_control(ControlMsg::ArmElevation {
+                one_shot: true,
+                ttl_secs: DEFAULT_ELEVATION_TTL_SECS,
+            });
+            self.elevation = None;
+        } else if dismiss {
+            self.elevation = None;
         }
     }
 
@@ -905,6 +992,11 @@ impl eframe::App for ClientApp {
         let background = self.effective_background_capture();
         self.input.set_background_capture(background);
         self.drain_session();
+        if let Some(elevation) = &self.elevation {
+            if elevation.shown_at.elapsed() >= ELEVATION_BANNER_TIMEOUT {
+                self.elevation = None;
+            }
+        }
         self.enforce_capture_invariants(ctx);
         self.presenter.update(ctx, &self.slot);
         self.log_metrics(ctx);
@@ -943,6 +1035,7 @@ impl eframe::App for ClientApp {
             });
 
         self.diagnostics_window(&ctx);
+        self.elevation_banner(&ctx);
     }
 }
 

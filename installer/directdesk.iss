@@ -32,6 +32,11 @@
 #define MyAppExeHost "DirectDeskHost.exe"
 #define MyAppExeClient "DirectDeskClient.exe"
 #define MyAppExeService "DirectDeskService.exe"
+; SYSTEM-integrity UAC click-through worker. The service spawns it (as a
+; sibling of DirectDeskService.exe) only while the operator has opted in to
+; respond to a UAC prompt remotely; it is never auto-started. See
+; docs/TROUBLESHOOTING.md.
+#define MyAppExeUacInjector "DirectDeskUacInjector.exe"
 ; Directory (relative to this .iss file) containing the built release exes.
 #define ReleaseDir "..\target\release"
 
@@ -73,6 +78,9 @@ Name: "autostart"; Description: "Start DirectDesk automatically with Windows (in
 Source: "{#ReleaseDir}\{#MyAppExeHost}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ReleaseDir}\{#MyAppExeClient}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ReleaseDir}\{#MyAppExeService}"; DestDir: "{app}"; Flags: ignoreversion
+; Must sit beside the service exe: the service derives the worker path as its
+; own sibling and never reads it from config/registry/IPC.
+Source: "{#ReleaseDir}\{#MyAppExeUacInjector}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\DirectDesk Host"; Filename: "{app}\{#MyAppExeHost}"

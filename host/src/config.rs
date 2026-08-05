@@ -60,6 +60,14 @@ pub struct HostConfig {
     /// Start with the window hidden in the tray. `--minimized` also sets this
     /// for one run without persisting it.
     pub start_minimized: bool,
+    /// Opt-in: allow the operator to route input to a transient SYSTEM-integrity
+    /// worker so a client can click through a UAC/elevation consent dialog that
+    /// the medium-integrity host cannot reach via UIPI. Default `false` — this
+    /// is a privileged, security-sensitive path and must be turned on explicitly.
+    pub uac_clickthrough: bool,
+    /// How long (seconds) a single elevation arming stays valid before it
+    /// self-expires and the SYSTEM worker is torn down. Kept short on purpose.
+    pub uac_arm_ttl_secs: u32,
     /// RDP-style bandwidth saver: blank the host's desktop to solid black
     /// while a remote session is active, and restore the exact previous
     /// wallpaper/background color when it ends. A detailed photo wallpaper
@@ -69,6 +77,10 @@ pub struct HostConfig {
     /// bandwidth than see their wallpaper during a remote session.
     pub blank_wallpaper_during_session: bool,
 }
+
+/// Lower/upper bounds for [`HostConfig::uac_arm_ttl_secs`].
+pub const MIN_UAC_ARM_TTL_SECS: u32 = 5;
+pub const MAX_UAC_ARM_TTL_SECS: u32 = 120;
 
 impl Default for HostConfig {
     fn default() -> Self {
@@ -84,6 +96,8 @@ impl Default for HostConfig {
             gop_seconds: 4,
             idle_repeat_ms: 250,
             start_minimized: false,
+            uac_clickthrough: false,
+            uac_arm_ttl_secs: 20,
             blank_wallpaper_during_session: true,
         }
     }
@@ -219,6 +233,9 @@ impl HostConfig {
             .bitrate_cap_kbps
             .map(|c| c.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS));
         self.display_name = sanitize_name(&self.display_name).unwrap_or_else(default_display_name);
+        self.uac_arm_ttl_secs = self
+            .uac_arm_ttl_secs
+            .clamp(MIN_UAC_ARM_TTL_SECS, MAX_UAC_ARM_TTL_SECS);
         self
     }
 
@@ -314,6 +331,54 @@ mod tests {
         assert!(validate_name(&long).is_ok());
         assert!(validate_name(&sanitize_name("héllo wörld").unwrap()).is_ok());
         assert!(validate_name(&default_display_name()).is_ok());
+    }
+
+    #[test]
+    fn uac_clickthrough_defaults_off() {
+        let c = HostConfig::default();
+        assert!(
+            !c.uac_clickthrough,
+            "the SYSTEM click-through path must be opt-in"
+        );
+        assert_eq!(c.uac_arm_ttl_secs, 20);
+    }
+
+    #[test]
+    fn uac_fields_roundtrip_through_json() {
+        let c = HostConfig {
+            uac_clickthrough: true,
+            uac_arm_ttl_secs: 30,
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&c).unwrap();
+        let back: HostConfig = serde_json::from_str(&text).unwrap();
+        assert!(back.uac_clickthrough);
+        assert_eq!(back.uac_arm_ttl_secs, 30);
+        assert_eq!(c, back);
+    }
+
+    #[test]
+    fn uac_missing_keys_fall_back_to_safe_defaults() {
+        // An older config file without the UAC keys must default to OFF.
+        let back: HostConfig = serde_json::from_str(r#"{"udp_port":47990}"#).unwrap();
+        assert!(!back.uac_clickthrough);
+        assert_eq!(back.uac_arm_ttl_secs, 20);
+    }
+
+    #[test]
+    fn uac_arm_ttl_is_clamped() {
+        let lo = HostConfig {
+            uac_arm_ttl_secs: 0,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(lo.uac_arm_ttl_secs, MIN_UAC_ARM_TTL_SECS);
+        let hi = HostConfig {
+            uac_arm_ttl_secs: 9_999,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(hi.uac_arm_ttl_secs, MAX_UAC_ARM_TTL_SECS);
     }
 
     #[test]

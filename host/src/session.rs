@@ -142,6 +142,12 @@ struct Shared {
     stop: AtomicBool,
     keyframe_req: AtomicBool,
     bitrate_req: AtomicU32,
+    /// While `true`, client input is routed to the SYSTEM UAC worker instead of
+    /// the local injector. Observability only — the actual switch is serialized
+    /// on the input thread via [`InputCtl::ElevationRoute`], so local injection
+    /// and worker forwarding can never both fire for one event (no double
+    /// injection, no mouse fighting).
+    elevation_active: AtomicBool,
 }
 
 impl Shared {
@@ -158,6 +164,11 @@ impl Shared {
 enum InputCtl {
     Geometry { w: u32, h: u32, origin: (i32, i32) },
     ReleaseAll,
+    /// Enter (`Some`) or leave (`None`) the exclusive elevation route. While a
+    /// sink is installed, input events are forwarded to it and NOT injected
+    /// locally. Entering and leaving both release everything held locally first,
+    /// so no key/button is left stuck on either side of the handoff.
+    ElevationRoute(Option<Sender<InputEvent>>),
     Stop,
 }
 
@@ -183,6 +194,7 @@ impl HostSession {
             stop: AtomicBool::new(false),
             keyframe_req: AtomicBool::new(true), // first frame should be an IDR
             bitrate_req: AtomicU32::new(0),
+            elevation_active: AtomicBool::new(false),
         });
 
         let (frames_tx, frames_rx) = bounded::<EncodedFrame>(cfg.frame_queue_depth.max(1));
@@ -250,6 +262,31 @@ impl HostSession {
     /// Release every key/button currently held on behalf of the client.
     pub fn release_all_input(&self) {
         let _ = self.input_ctl.send(InputCtl::ReleaseAll);
+    }
+
+    /// Begin routing client input to the SYSTEM UAC worker via `sink` instead of
+    /// the local injector. The input thread releases everything it holds locally
+    /// before the switch, so no local key/button is left down while the remote
+    /// worker takes over. Exclusive: while routing, the local injector is never
+    /// called for input events.
+    pub fn begin_elevation_route(&self, sink: Sender<InputEvent>) {
+        self.shared.elevation_active.store(true, Ordering::SeqCst);
+        let _ = self.input_ctl.send(InputCtl::ElevationRoute(Some(sink)));
+    }
+
+    /// Stop routing to the worker and resume local injection. Releases anything
+    /// held locally again (belt and braces) and forces a keyframe, matching the
+    /// resume-from-pause pattern, since the desktop under a just-dismissed
+    /// consent dialog may look different.
+    pub fn end_elevation_route(&self) {
+        self.shared.elevation_active.store(false, Ordering::SeqCst);
+        let _ = self.input_ctl.send(InputCtl::ElevationRoute(None));
+        self.request_keyframe();
+    }
+
+    /// Whether input is currently routed to the SYSTEM worker.
+    pub fn elevation_active(&self) -> bool {
+        self.shared.elevation_active.load(Ordering::SeqCst)
     }
 
     pub fn stats(&self) -> ConnStats {
@@ -687,6 +724,9 @@ fn input_thread(
 ) {
     raise_input_thread_priority();
     let mut injector = WinInjector::new(desc.width, desc.height, desc.monitor_origin);
+    // When `Some`, input is routed here (to the SYSTEM UAC worker) and NOT
+    // injected locally. Owned by this thread so the choice is made in one place.
+    let mut route: Option<Sender<InputEvent>> = None;
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             break;
@@ -694,11 +734,22 @@ fn input_thread(
         crossbeam_channel::select! {
             recv(events) -> msg => match msg {
                 Ok(ev) => {
-                    match injector.inject(&ev) {
-                        Ok(()) => {
-                            shared.counters.input_injected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(sink) = &route {
+                        // Exclusive: forward to the worker, never inject locally.
+                        if sink.send(ev).is_err() {
+                            // The worker side is gone; stop routing and fall back
+                            // to local injection for subsequent events.
+                            tracing::warn!("elevation route sink closed; reverting to local injection");
+                            route = None;
+                            let _ = injector.release_all();
                         }
-                        Err(e) => tracing::warn!("input injection failed: {e}"),
+                    } else {
+                        match injector.inject(&ev) {
+                            Ok(()) => {
+                                shared.counters.input_injected.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => tracing::warn!("input injection failed: {e}"),
+                        }
                     }
                 }
                 Err(_) => break,
@@ -709,6 +760,14 @@ fn input_thread(
                     if let Err(e) = injector.release_all() {
                         tracing::warn!("release_all failed: {e}");
                     }
+                }
+                Ok(InputCtl::ElevationRoute(sink)) => {
+                    // Release everything held locally before *and* after the
+                    // handoff so no key/button is stuck on either side.
+                    if let Err(e) = injector.release_all() {
+                        tracing::warn!("release_all before route switch failed: {e}");
+                    }
+                    route = sink;
                 }
                 Ok(InputCtl::Stop) => break,
                 Err(_) => break,

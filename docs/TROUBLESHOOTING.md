@@ -114,11 +114,54 @@ showing a stale or black frame with no explanation — watch for
 `ControlMsg::SecureDesktopActive(true)` in the logs / the client UI's
 status indicator. What this means practically:
 
-- You cannot approve a UAC prompt on the host remotely through DirectDesk.
-  Either have the prompt avoided in advance (disable UAC prompting for
-  specific trusted tasks, or run the action already-elevated), or use the
-  out-of-band hardware KVM fallback (PiKVM/TinyPilot — see
-  [NETWORK_SETUP.md](NETWORK_SETUP.md)) to click through it.
+- By default you cannot approve a UAC prompt on the host remotely through
+  DirectDesk. Either have the prompt avoided in advance (disable UAC
+  prompting for specific trusted tasks, or run the action already-elevated),
+  or use the out-of-band hardware KVM fallback (PiKVM/TinyPilot — see
+  [NETWORK_SETUP.md](NETWORK_SETUP.md)) to click through it — **or** opt into
+  the remote UAC click-through described below.
+
+### Opt-in: approving UAC prompts remotely
+
+DirectDesk can let a connected operator approve a UAC prompt remotely, but it
+is **off by default** and takes two deliberate steps because it deliberately
+weakens two Windows protections:
+
+1. **Move the prompt off the secure desktop.** UAC normally draws on the
+   isolated secure desktop, which no user-mode capture can see. Disable that
+   on the *host* (elevated PowerShell):
+
+   ```powershell
+   Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'PromptOnSecureDesktop' -Value 0 -Type DWord
+   ```
+
+   Revert with `-Value 1`. This does **not** disable UAC — the prompt still
+   appears and must still be approved; it only moves it onto the normal
+   desktop so it can be streamed. Tradeoff: other software on that machine can
+   now see/automate the UAC dialog. Only do this on a machine you trust.
+
+2. **Enable the click-through path.** Even visible, the prompt cannot be
+   clicked by the medium-integrity host — the UAC dialog (`consent.exe`) runs
+   at System integrity and Windows UIPI blocks lower-integrity input. So the
+   click is performed by a short-lived **SYSTEM-integrity worker** that the
+   `DirectDeskService` spawns on demand. This requires the service to be
+   installed (the "Start DirectDesk automatically with Windows" installer
+   task) and the master switch `uac_clickthrough: true` in the service config,
+   plus `uac_clickthrough: true` in the host config.
+
+   With both on, when a UAC prompt appears the client shows a one-shot
+   "Administrator approval requested — Allow once?" banner. Approving arms a
+   single elevation (a short TTL, default 20 s): the SYSTEM worker is
+   launched, verifies on every injection that the foreground window really is
+   the consent dialog (and clamps input to its rectangle), forwards your click,
+   then self-exits. It cannot be used to click anything other than the UAC
+   prompt, and it is never running unless you have just armed it.
+
+   Security notes: the worker's control path is the service's ACL'd pipe; its
+   input channel is a per-elevation pipe locked to your user SID and gated by a
+   one-time capability token minted by the service. See
+   [SECURITY.md](SECURITY.md). If you don't need remote elevation, leave both
+   switches off and the worker binary is never launched.
 - If the host machine **locks** (idle timeout or Win+L), the same
   limitation applies to the actual Windows lock screen credential entry —
   DirectDesk running as a service *could* in principle unlock a session in
