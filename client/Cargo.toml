@@ -40,4 +40,16 @@ windows = { workspace = true, features = [
     "Win32_Media_MediaFoundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    # WASAPI playback (src/audio_render.rs): IMMDeviceEnumerator, IMMDevice,
+    # IAudioClient, IAudioRenderClient, WAVEFORMATEX, eRender/eConsole and the
+    # AUDCLNT_* constants all live here.
+    "Win32_Media_Audio",
+    # Both of these exist for exactly one call: `IMMDevice::Activate`, which is
+    # `#[cfg(all(feature = "Win32_System_Com_StructuredStorage", feature =
+    # "Win32_System_Variant"))]` in the bindings because its pActivationParams
+    # argument is a PROPVARIANT. With either one missing the method does not
+    # exist at all (the vtable slot degrades to `usize`), so there is no way to
+    # reach an IAudioClient. Neither feature is used for anything else.
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
 ] }

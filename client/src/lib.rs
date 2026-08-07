@@ -7,6 +7,8 @@
 //! Module map:
 //!
 //! * [`decoder`]      — Media Foundation H.264 → RGBA8, decodes every frame.
+//! * [`audio_decoder`]— Media Foundation AAC-LC → interleaved 16-bit PCM.
+//! * [`audio_render`] — WASAPI shared-mode playback; padding *is* the latency.
 //! * [`renderer`]     — latest-wins frame slot + letterboxed egui presentation.
 //! * [`input_capture`]— low-level keyboard hook, release chord, pointer mapping.
 //! * [`session`]      — the channel seam between UI and transport.
@@ -16,6 +18,8 @@
 //! * [`ui`]           — the eframe application shell.
 //! * [`config`]       — `%APPDATA%\DirectDesk\client.json` (no secrets).
 
+pub mod audio_decoder;
+pub mod audio_render;
 pub mod config;
 pub mod connect;
 pub mod decoder;
