@@ -253,7 +253,7 @@ That policy is covered by unit tests in `client/src/tiles.rs` instead.
 |---|---|---|---|
 | DXGI dirty rects are a true superset of what changed, on real hardware | `host/src/bin/capture_harness.rs --dirty` on the Ohio host | NOT RUN | |
 | Cross-version against `DirectDesk-bins.zip` (old client ↔ new host, and the reverse), real QUIC, incl. pairing + reconnect | rollout step 0 | **FAIL — but pre-existing, not caused by tiles.** See below | 2026-08-07 |
-| Cross-version against a **binary built from `a5a928f`** — the commit the Ohio host is believed to be running | rollout step 0, rebuilt baseline | NOT RUN — this is the pairing that actually gates the deploy | |
+| Cross-version against a **binary built from `a5a928f`** — the commit the Ohio host is believed to be running. Real exes, real QUIC, pairing + reconnect, fresh secret stores per scenario | rollout step 0, rebuilt baseline | **PASS — all four pairings** | 2026-08-07 |
 ### Congestion coupling (netsim matrix, `tests/tests/tiles_netsim.rs`)
 
 Tiles ride streams and video rides datagrams, so they never share a send buffer —
@@ -320,7 +320,39 @@ and `shared/src/transport/reassembly.rs` are unchanged since it, and the only
 protocol edit is additive (one `features` bit constant plus tests). So **HEAD is
 wire-compatible with `a5a928f`**, which is what the staged rollout depends on.
 
-Before deploying, confirm what Ohio is actually running and re-run step 0 against
-a binary built from that commit. If Ohio turns out to predate `a5a928f`, the host
-and client must be upgraded **together** — upgrading the host alone would strand
-it, and it is reached through this very protocol.
+**Rollout step 0 against a rebuilt `a5a928f` baseline: PASS, all four pairings**
+(2026-08-07). Real binaries over real QUIC, each with a pairing run and a
+reconnect on the stored identity, isolated secret stores per scenario:
+
+| pairing | auth | video | duration | errors |
+|---|---|---|---|---|
+| old client → **new host** (the deploy scenario) | pair + reconnect | 2213 & 4390 frames | 97 s / 82 s | 0 |
+| **new client** → old host | pair + reconnect | 2326 & 1937 | 42 s / 38 s | 0 |
+| new ↔ new | pair + reconnect | 1621 & 2013 | 30 s / 40 s | 0 |
+| old ↔ old (control — proves the harness) | pair + reconnect | 1735 & 2353 | 30 s / 40 s | 0 |
+
+Zero `trailing bytes`, `Hit the end of buffer`, serialization errors or panics
+across all 16 logs. The old client also handles the **H.264 High profile** switch
+from `449aa23` (host emits `profile_idc = 100`, old client reports
+`H.264 stream change → 2560x1600`, ~57 fps) — a risk that had nothing to do with
+tiles. The host's own negotiation logging confirms the tile stream is inert:
+`client_features=0x100000000 negotiated=0x0` for the old client, and even for a
+new client `0x100000008 → 0x0` while the host default is off. No `open_uni` in
+any host log.
+
+**Verdict: deploying the new host to an Ohio box running `a5a928f` does not
+require touching the client.**
+
+Caveats worth keeping: this was loopback (no real WAN loss/reordering/MTU) on one
+machine, so both ends shared an Intel QSV encoder; heartbeats are proven only
+indirectly (Ping/Pong are never logged, but a renumbered discriminant would fail
+`decode_strict` and an unmatched Pong raises an explicit error, and 30-97 s
+sessions exchanged ~15-40 of them silently); and it tested a locally built
+`a5a928f`, not Ohio's actual binary. **If Ohio predates `a5a928f`, host and client
+must be upgraded together** — see the renumbering above.
+
+**Structural gap this exposed:** no test in this repo drives the real `.exe`s.
+`host/tests/loopback.rs` and `client/tests/e2e_loopback.rs` link both sides into
+one binary from one source version, so they cannot catch a cross-version break by
+construction. That is why this had to be done by hand, and why it should be
+repeated by hand before each host deploy.
