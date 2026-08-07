@@ -2413,4 +2413,291 @@ mod tests {
         assert!(s.contains("CPU BT.709"), "{s}");
         assert!(s.contains("CPU NV12"), "{s}");
     }
+
+    // -- the stats window ----------------------------------------------------
+    //
+    // `maybe_report` is the media thread's only publisher: everything the UI
+    // shows and everything the bitrate adaptor steers on comes out of it. It is
+    // also the only place the per-window accumulators are cleared, so a publish
+    // and a reset are one indivisible step — the tests below pin both halves
+    // together on purpose.
+
+    /// A `Shared` with nothing running behind it.
+    ///
+    /// Lives here rather than in `testsupport` because `Shared` is private to
+    /// this module, which is also why these tests are possible at all without
+    /// widening any visibility.
+    fn quiet_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            stats: Mutex::new(ConnStats::default()),
+            state: Mutex::new(SessionState::Starting),
+            desc: Mutex::new(None),
+            counters: Counters::default(),
+            stop: AtomicBool::new(false),
+            keyframe_req: AtomicBool::new(false),
+            tiles_reset_req: AtomicBool::new(false),
+            tile_budget_kbps: AtomicU32::new(0),
+            bitrate_req: AtomicU32::new(0),
+            fps_req: AtomicU32::new(0),
+            fps_now: AtomicU32::new(60),
+            elevation_active: AtomicBool::new(false),
+        })
+    }
+
+    /// A window start `ms` in the past, so the reporting interval can be driven
+    /// without sleeping through it. `Instant` has no public constructor, so
+    /// walking `now` backwards is the only way to place one.
+    fn started_ms_ago(ms: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_millis(ms))
+            .expect("the monotonic clock is further along than the test window")
+    }
+
+    #[test]
+    fn maybe_report_publishes_the_window_then_clears_every_accumulator() {
+        // Publish and reset are one step. If the reset were ever lost, every
+        // rate would climb without bound as counts from old windows kept being
+        // divided by one window's worth of seconds — which the adaptor reads as
+        // "the link keeps getting faster" and answers by raising the bitrate.
+        let shared = quiet_shared();
+        shared.counters.dropped.store(7, Ordering::Relaxed);
+        shared.counters.keyframes.store(3, Ordering::Relaxed);
+
+        // A two-second window with 60 captures in it: the answer is ~30, not
+        // 60. That gap is the point of the number — these are per-second rates,
+        // not per-window totals.
+        let mut win_start = started_ms_ago(2_000);
+        let mut captured = 60u32;
+        let mut encoded = 50u32;
+        let mut bytes = 500_000u64; // 4 Mbit over the window => ~2000 kbps
+        let mut pipeline_ms = 400.0f32; // 50 frames x 8 ms each
+
+        let before = Instant::now();
+        maybe_report(
+            &shared,
+            &mut win_start,
+            &mut captured,
+            &mut encoded,
+            &mut bytes,
+            &mut pipeline_ms,
+        );
+        let s = *shared.stats.lock();
+
+        // The divisor is the *measured* elapsed time, which can only be longer
+        // than the 2 000 ms the window was placed at, so every rate bound below
+        // is one-sided: jitter can make these smaller, never larger.
+        assert!(
+            s.fps_capture > 27.0 && s.fps_capture <= 30.0,
+            "{}",
+            s.fps_capture
+        );
+        assert!(
+            s.fps_encode > 22.0 && s.fps_encode <= 25.0,
+            "{}",
+            s.fps_encode
+        );
+        // Both rates share one divisor, so their ratio is exact whatever the
+        // clock did between the two lines that compute them.
+        assert!((s.fps_capture / s.fps_encode - 1.2).abs() < 1e-5);
+        assert!(
+            (1_700..=2_000).contains(&s.bitrate_kbps),
+            "{}",
+            s.bitrate_kbps
+        );
+        // Not a rate — a mean over the frames encoded — so it is exact.
+        assert_eq!(s.pipeline_ms, 8.0);
+        assert_eq!(s.frames_dropped, 7);
+        assert_eq!(s.keyframes_requested, 3);
+
+        // ...and the next window starts empty, at the moment of the publish.
+        assert_eq!(captured, 0);
+        assert_eq!(encoded, 0);
+        assert_eq!(bytes, 0);
+        assert_eq!(pipeline_ms, 0.0);
+        assert!(win_start >= before, "the window start must have advanced");
+        assert!(win_start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn maybe_report_stays_silent_until_its_interval_has_elapsed() {
+        // The gate is a literal `Duration::from_millis(500)` at the top of
+        // `maybe_report` (there is no named constant for it). It has to be a
+        // *complete* no-op below that: publishing early would divide a handful
+        // of frames by a near-zero window, and resetting early would throw away
+        // counts that were never reported at all.
+        let shared = quiet_shared();
+        shared.stats.lock().fps_capture = 123.0;
+
+        // 100 ms in — 400 ms of margin, so a loaded machine cannot walk this
+        // over the gate and make the test flaky.
+        let mut win_start = started_ms_ago(100);
+        let placed = win_start;
+        let mut captured = 5u32;
+        let mut encoded = 4u32;
+        let mut bytes = 1_000u64;
+        let mut pipeline_ms = 32.0f32;
+
+        maybe_report(
+            &shared,
+            &mut win_start,
+            &mut captured,
+            &mut encoded,
+            &mut bytes,
+            &mut pipeline_ms,
+        );
+
+        assert_eq!(shared.stats.lock().fps_capture, 123.0, "published early");
+        assert_eq!((captured, encoded, bytes), (5, 4, 1_000));
+        assert_eq!(pipeline_ms, 32.0);
+        assert_eq!(win_start, placed, "the window must not restart early");
+
+        // Past the interval it does fire — so the assertions above pin a gate,
+        // not a permanently closed door.
+        win_start = started_ms_ago(600);
+        maybe_report(
+            &shared,
+            &mut win_start,
+            &mut captured,
+            &mut encoded,
+            &mut bytes,
+            &mut pipeline_ms,
+        );
+        assert_ne!(shared.stats.lock().fps_capture, 123.0);
+        assert_eq!((captured, encoded, bytes), (0, 0, 0));
+    }
+
+    #[test]
+    fn pipeline_ms_is_a_mean_weighted_by_the_frames_each_iteration_emitted() {
+        // The media loop accumulates `win_pipeline_ms += elapsed * emitted`,
+        // and this divides by the same window's encoded count. An iteration
+        // that drained two frames out of the hardware encoder's pipeline
+        // therefore contributes its latency twice — the mean is over *frames*,
+        // not over loop iterations:
+        //     5 ms x 2 frames + 9 ms x 1 frame = 19 ms of weight over 3 frames.
+        //
+        // NOTE, for whoever moves this code: `elapsed` is sampled BEFORE the
+        // encoder drain loop (`let elapsed = tick.elapsed()...` sits above
+        // `while let Some(ef) = ready.take()`), so this statistic is
+        // capture -> submit latency and deliberately excludes drain and queue
+        // hand-off time. Sampling it after the drain would silently change what
+        // the number means without failing anything.
+        let shared = quiet_shared();
+        let mut win_start = started_ms_ago(600);
+        let mut captured = 2u32;
+        let mut encoded = 0u32;
+        let mut bytes = 0u64;
+        let mut pipeline_ms = 0.0f32;
+
+        pipeline_ms += 5.0 * 2.0; // iteration 1: 5 ms, two frames out
+        encoded += 2;
+        pipeline_ms += 9.0 * 1.0; // iteration 2: 9 ms, one frame out
+        encoded += 1;
+
+        maybe_report(
+            &shared,
+            &mut win_start,
+            &mut captured,
+            &mut encoded,
+            &mut bytes,
+            &mut pipeline_ms,
+        );
+        assert!((shared.stats.lock().pipeline_ms - 19.0 / 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pipeline_ms_reports_zero_rather_than_dividing_by_no_frames() {
+        // A window where capture ran but the encoder emitted nothing: the
+        // secure desktop, or an encoder failing every submit. `x / 0` in f32 is
+        // NaN or infinity, and `validate_stats` rejects a non-finite
+        // `pipeline_ms` outright — so the client would discard the entire
+        // snapshot, including the fps and bitrate figures that were fine.
+        let shared = quiet_shared();
+        let mut win_start = started_ms_ago(600);
+        let mut captured = 12u32;
+        let mut encoded = 0u32;
+        let mut bytes = 0u64;
+        // Non-zero on purpose. The media loop cannot actually produce this (the
+        // weight only grows when a frame is emitted), so this pins the guard
+        // itself rather than the arithmetic that happens to feed it.
+        let mut pipeline_ms = 123.0f32;
+
+        maybe_report(
+            &shared,
+            &mut win_start,
+            &mut captured,
+            &mut encoded,
+            &mut bytes,
+            &mut pipeline_ms,
+        );
+        let s = *shared.stats.lock();
+
+        assert_eq!(s.pipeline_ms, 0.0);
+        assert_eq!(s.fps_encode, 0.0);
+        assert!(s.fps_capture > 0.0, "capture still ran");
+        assert!(directdesk_shared::stats::validate_stats(&s), "{s:?}");
+        assert_eq!(pipeline_ms, 0.0, "the stale weight is still cleared");
+    }
+
+    #[test]
+    fn dropped_and_keyframe_counts_are_session_totals_not_window_deltas() {
+        // A deliberate asymmetry inside one published struct, worth stating
+        // where someone restructuring this will see it: `fps_*`, `bitrate_kbps`
+        // and `pipeline_ms` describe the window that just closed, while
+        // `frames_dropped` and `keyframes_requested` are read straight off the
+        // lifetime atomics and are never reset. Anything that wants a *rate*
+        // out of them has to difference two snapshots itself.
+        let shared = quiet_shared();
+        shared.counters.dropped.store(4, Ordering::Relaxed);
+        shared.counters.keyframes.store(2, Ordering::Relaxed);
+
+        let (mut c, mut e, mut b, mut p) = (1u32, 1u32, 1u64, 1.0f32);
+        let mut win = started_ms_ago(600);
+        maybe_report(&shared, &mut win, &mut c, &mut e, &mut b, &mut p);
+        assert_eq!(shared.stats.lock().frames_dropped, 4);
+
+        shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        let (mut c, mut e, mut b, mut p) = (1u32, 1u32, 1u64, 1.0f32);
+        let mut win = started_ms_ago(600);
+        maybe_report(&shared, &mut win, &mut c, &mut e, &mut b, &mut p);
+        assert_eq!(shared.stats.lock().frames_dropped, 5, "totals, not deltas");
+        assert_eq!(shared.stats.lock().keyframes_requested, 2);
+        // Publishing must not consume them either — the counters back the
+        // session summary as well as this snapshot.
+        assert_eq!(shared.counters.dropped.load(Ordering::Relaxed), 5);
+    }
+
+    // -- the two default configurations must stay one configuration ----------
+
+    #[test]
+    fn the_host_config_default_and_the_pipeline_default_do_not_drift() {
+        // Two hand-maintained copies of the same defaults exist: `HostConfig`
+        // (what `host.json` round-trips) and `SessionConfig` (what the pipeline
+        // is actually built from, and what every test and selftest exercises).
+        // Nothing but this assertion ties them together, and the failure mode
+        // is silent — the shipped default quietly stops being the tested one.
+        //
+        // Not hypothetical: `host/src/bin/capture_harness.rs` has already
+        // drifted off both, hardcoding fps 60 / 15 000 kbps into an
+        // `EncoderConfig` and a 33 ms idle repeat that `HostConfig::sanitized`
+        // exists specifically to heal away.
+        //
+        // Compared through `sanitized()` because that is the only shape a
+        // running host ever holds — a default that needed healing would not be
+        // a default.
+        let h = crate::config::HostConfig::default().sanitized().pipeline();
+        let d = SessionConfig::default();
+        assert_eq!(h.target_fps, d.target_fps);
+        assert_eq!(h.bitrate_kbps, d.bitrate_kbps);
+        assert_eq!(h.gop_seconds, d.gop_seconds);
+        assert_eq!(h.idle_repeat_ms, d.idle_repeat_ms);
+        assert_eq!(h.force_cpu_convert, d.force_cpu_convert);
+        assert_eq!(h.frame_queue_depth, d.frame_queue_depth);
+        assert_eq!(h.static_settle_ms, d.static_settle_ms);
+        assert_eq!(h.static_refine_quality, d.static_refine_quality);
+        assert_eq!(h.lossless_tiles_enabled, d.lossless_tiles_enabled);
+        assert_eq!(h.lossless_tile_settle_ms, d.lossless_tile_settle_ms);
+        assert_eq!(h.lossless_tile_deflate_level, d.lossless_tile_deflate_level);
+        assert_eq!(h.lossless_tile_lease_ms, d.lossless_tile_lease_ms);
+        assert_eq!(h.lossless_tiles_per_pass, d.lossless_tiles_per_pass);
+    }
 }
