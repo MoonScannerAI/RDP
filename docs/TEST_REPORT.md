@@ -365,3 +365,119 @@ must be upgraded together** — see the renumbering above.
 one binary from one source version, so they cannot catch a cross-version break by
 construction. That is why this had to be done by hand, and why it should be
 repeated by hand before each host deploy.
+
+## System audio (host → client)
+
+WASAPI loopback capture → Media Foundation AAC-LC → QUIC datagram, one AAC
+access unit per packet, sharing the video path's flags byte for demux. Client
+side: a network-domain jitter buffer with adaptive depth and clock-drift
+correction, an MF AAC-LC decoder, and a WASAPI shared-mode render endpoint
+with its own device-domain drift corrector. Negotiated as a `Hello` feature
+bit (`features::SYSTEM_AUDIO`); off by default on the host
+(`system_audio_enabled: false`).
+
+**Status: implemented and committed** on 2026-08-07, across eight commits from
+the audio datagram format through to this section.
+
+The gate has since run: `powershell -NoProfile -File tools\check.ps1` on
+2026-08-07 reported **OVERALL: PASS** — `cargo fmt --check`, `cargo clippy
+--workspace --all-features -- -D warnings`, and `cargo test --workspace` all
+green. `directdesk-shared` lib: 347 passed, 1 ignored (a pre-existing
+public-STUN test, unrelated to audio). `directdesk-host` lib: 347 passed.
+`directdesk-service`: 93 passed. `host/tests/audio_interop.rs`: 4 passed, 0
+failed. The pre-existing `host/tests/loopback.rs`, `host/tests/tiles_interop.rs`,
+`client/tests/interop.rs`, and `client/tests/e2e_loopback.rs` all continued to
+pass — no regression from adding audio.
+
+The rows below are updated to PASS where the test named in that row is covered
+by that run. Rows still marked NOT RUN are exactly the ones the gate did not
+and could not exercise: real WASAPI capture/playback against actual hardware,
+the real WAN link, multi-hour real-time drift, and measured (as opposed to
+predicted) A/V skew — see "Not yet verified" below. Do not read "the gate
+passed" as "audio is audible" — nobody has yet heard anything play back on
+real hardware.
+
+### Wire format and demux (`shared/src/audio/mod.rs`)
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| Audio packet header encode/decode round-trips; byte layout pinned | `audio::tests::audio_header_layout_is_pinned`, `packet_roundtrips` | PASS | 2026-08-07 |
+| Decoder rejects short/malformed datagrams, reserved flag bits, missing `FLAG_AUDIO`, unknown format codes, oversized payloads | `audio::tests::decode_rejects_*` (5 tests) | PASS | 2026-08-07 |
+| Audio/video datagram demux has no false positives in either direction, incl. against generated video traffic across frame sizes/MTU/FEC block size | `audio::tests::a_real_audio_packet_is_rejected_by_the_video_decoder`, `is_audio_datagram_never_claims_a_real_video_fragment` (proptest) | PASS | 2026-08-07 |
+
+### Jitter buffer (`shared/src/audio/jitter.rs`)
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| In-order delivery, reorder repair, loss declared only after the reorder wait (or immediately on a full window) | `jitter::tests::packets_arriving_in_order_are_delivered_in_order_with_no_loss`, `a_single_swapped_pair_is_repaired_without_declaring_loss`, `a_missing_packet_is_declared_lost_once_the_reorder_wait_expires`, `a_full_window_declares_loss_immediately_without_waiting` | PASS | 2026-08-07 |
+| Sequence numbers wrap through `u32::MAX`, including reordering across the wrap | `jitter::tests::sequence_numbers_wrap_through_u32_max_without_stalling`, `reordering_across_the_wrap_is_repaired_and_pre_wrap_stragglers_are_late` | PASS | 2026-08-07 |
+| Discontinuity clears the window, forces a decoder flush, and re-seeds the drift corrector | `jitter::tests::discontinuity_clears_the_window_and_signals_a_decoder_flush`, `discontinuity_overrides_a_backwards_sequence_jump`, `discontinuity_reseeds_the_drift_corrector` | PASS | 2026-08-07 |
+| Prebuffer withholds delivery until the target depth, without demanding more than the window can hold | `jitter::tests::delivery_waits_for_the_prebuffer_then_runs_freely`, `prebuffer_never_demands_more_than_the_window_can_hold` | PASS | 2026-08-07 |
+| Depth controller raises on underrun (rate-limited) and decays only after a full clean window, clamped to its configured range | `jitter::tests::depth_controller_raises_on_underrun_and_stops_at_the_ceiling`, `depth_controller_raises_at_most_once_per_interval`, `depth_controller_decays_at_most_once_per_clean_window_and_stops_at_the_floor`, `depth_controller_respects_both_clamps_from_any_seed` | PASS | 2026-08-07 |
+| Drift corrector idle inside its deadband, drops/inserts a frame outside it, fires at most once per window, and converges from both directions | `jitter::tests::drift_corrector_is_idle_inside_the_deadband`, `drift_corrector_drops_a_frame_when_the_buffer_runs_deep`, `drift_corrector_inserts_silence_when_the_buffer_runs_shallow`, `drift_corrector_fires_at_most_once_per_window`, `drift_corrector_converges_from_both_directions_and_then_goes_idle` | PASS | 2026-08-07 |
+| Long synthetic-clock runs: a 2-hour session at 50 ppm drift stays bounded **with** correction; the same session overflows **without** it | `jitter::tests::a_two_hour_run_at_fifty_ppm_stays_bounded_with_drift_correction`, `an_hour_at_minus_fifty_ppm_stays_bounded_with_drift_correction`, `without_drift_correction_a_fifty_ppm_session_overflows_eventually` | PASS | 2026-08-07 |
+| Property tests: random arrival order never delivers out of order or twice; the window never exceeds its configured bound | `jitter::tests::random_arrival_orders_never_deliver_out_of_order_or_twice`, `the_window_is_bounded_under_any_arrival_pattern` (proptest) | PASS | 2026-08-07 |
+
+### Host capture and encode (`host/src/audio_capture.rs`, `host/src/audio_encoder.rs`)
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| `classify_mix_format` accepts the four supported (rate, channels) combinations and refuses everything else (5.1, 96 kHz, 24-bit, malformed extensible headers) by hand-built `WAVEFORMATEX`/`WAVEFORMATEXTENSIBLE` fixtures — no real device needed | `audio_capture::tests::classifies_*`, `refuses_*` (headless) | PASS | 2026-08-07 |
+| f32→i16 conversion clamps out-of-range samples, survives NaN/infinity, rounds rather than truncates | `audio_capture::tests::f32_to_i16_*` | PASS | 2026-08-07 |
+| `AudioSpecificConfig` bytes pinned for all 4 formats and independently re-derived bit-for-bit | `audio_encoder::tests::asc_*`, `asc_decodes_back_to_its_fields`, `asc_distinguishes_all_four_formats` | PASS | 2026-08-07 |
+| AAC output-type selection picks the lowest documented offer at/above target, falls back to the highest offer rather than refusing, ignores offers with no declared bitrate | `audio_encoder::tests::output_type_*` | PASS | 2026-08-07 |
+| Real WASAPI loopback capture and real MF AAC-LC encode against actual audio hardware | none — needs a real machine with a playback device | NOT RUN | — |
+
+### Client decode and render (`client/src/audio_decoder.rs`, `client/src/audio_render.rs`)
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| `AudioSpecificConfig` and `HEAACWAVEINFO` tail bytes pinned and independently re-derived (must agree byte-for-byte with the host's encoder-side pins) | `audio_decoder::tests::audio_specific_config_matches_the_pinned_bytes`, `heaac_tail_layout_is_pinned`, `user_data_is_the_tail_then_the_config` | PASS | 2026-08-07 |
+| `NullAudioDecoder` / `RecordingSink` test doubles enforce the same whole-frame and admission rules as the real MFT/WASAPI paths | `audio_decoder::tests::null_audio_decoder_*`, `audio_render::tests::recording_sink_*`, `writable_frames_never_exceeds_the_space_or_the_offer` | PASS | 2026-08-07 |
+| Real MF AAC-LC decode and real WASAPI shared-mode render against actual audio hardware | `audio_decoder::self_test`, `audio_render::self_test` (self-test binaries, need a real device) | NOT RUN | — |
+
+### Host send path and playback loop, end to end with test doubles (`host/src/net/audio.rs`, `client/src/pipeline.rs`)
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| Capture-format → wire-format mapping is total and injective across the 4 supported formats | `net::audio::tests::every_capture_format_maps_to_a_wire_format`, `the_mapping_is_injective` | PASS | 2026-08-07 |
+| Access-unit timestamps derived from the sample clock, not wall clock; strictly increasing; correct at both 48 kHz and 44.1 kHz; wrap cleanly rather than panic | `net::audio::tests::capture_ms_*`, `access_units_advance_one_aac_frame_at_a_time` | PASS | 2026-08-07 |
+| Audio yields its entire backpressure reserve to video — never takes the last of the datagram send buffer even when its own packet would fit | `net::audio::tests::audio_yields_the_whole_reserve_to_video`, `the_room_check_cannot_overflow_into_permission` | PASS | 2026-08-07 |
+| Headless playback loop: an access unit flows jitter buffer → AAC decoder → PCM sink end to end with `NullAudioDecoder`/`RecordingSink` | `pipeline::tests::an_access_unit_flows_from_the_jitter_buffer_through_the_decoder_into_the_sink` (and neighboring cases in the same module) | PASS | 2026-08-07 |
+| Feature negotiation: client requests `SYSTEM_AUDIO` by default (cost-free ask); host offers it only when both configured and requested; shipped host default keeps the intersection empty | `client::net::tests` (StreamCaps/offer cases around `SYSTEM_AUDIO`), `host::net` `NetConfig::system_audio_enabled` wiring | PASS | 2026-08-07 |
+
+### Real end-to-end over a live QUIC session, test tone in / recording sink out (`host/tests/audio_interop.rs`)
+
+Real `DirectDeskHost` ↔ real `DirectDeskClient`, real MF AAC-LC encode on the
+host, real transport sharing the video datagram path, real jitter buffer —
+capture source is a synthetic tone (`TestTone`), not a real WASAPI loopback
+endpoint. 4 scenarios, 0 failed.
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| Both ends enabled: audio negotiates and streams decodable AAC access units over a live session | `audio_interop.rs::both_ends_enabled_deliver_decodable_audio` | PASS — 4/4 scenarios in the file | 2026-08-07 |
+| Audio costs video nothing: zero incomplete/stale/rejected frames in the window audio is streaming | same run, `--nocapture`: `frames_dropped_incomplete: 0`, `frames_dropped_stale: 0`, `fragments_rejected: 0` while 238 audio datagrams (of 845 total) flowed | PASS | 2026-08-07 |
+| The audio-yields-to-video precheck does not starve audio | same run: `audio_backpressured=0` while 449 audio packets were sent | PASS | 2026-08-07 |
+| `AudioSpecificConfig` agrees three ways — pinned constant, two independent derivations (host encoder, client decoder), and the live encoder's own runtime log | same run: encoder log reports `asc="11 90"` for 48 kHz stereo, matching the pinned/derived value | PASS | 2026-08-07 |
+
+### Not yet verified — needs real hardware, a real link, or both
+
+| Feature | How tested | Result | Date |
+|---|---|---|---|
+| End-to-end: real host captures real system audio, real client plays it audibly | two machines, real audio hardware on both | NOT RUN | — |
+| A 5.1 or 96 kHz playback endpoint on a real host: session runs with no audio, rest of the session (video/input) unaffected | real hardware with a non-standard default endpoint | NOT RUN | — |
+| Redundancy mode (`system_audio_redundancy`) measurably reduces audible loss on a lossy real or netsim link | netsim or real lossy link | NOT RUN | — |
+| Secure desktop / lock screen mutes audio within one status interval, unmutes on return | interactive session with a real UAC prompt or lock screen | NOT RUN | — |
+| A/V sync skew (predicted ~95 ms) measured on the real Philippines↔Ohio link | real WAN session with a timestamped source | NOT RUN | — |
+| Clock-drift correction observed on a real multi-hour session (as opposed to the synthetic-clock unit tests above) | real multi-hour session, both ends | NOT RUN | — |
+
+### Staged rollout (mirrors the tiles rollout above)
+
+Not started. The code is committed and the gate is green, but nothing has been
+deployed to the remote host. Recorded here so the plan is on paper before step 1
+happens, the same way the tiles rollout was.
+
+| Step | What it means | Result | Date |
+|---|---|---|---|
+| Step 1: ship the code inert | Deploy with `system_audio_enabled: false`. The host never offers `features::SYSTEM_AUDIO` (`host/src/net.rs`), so the negotiated intersection with any client — old or new — is empty, no audio thread spawns, and no audio datagram is ever sent; the deployed build's on-wire behavior for video/control is unchanged. This is the same property the tiles rollout's step 1 established for `lossless_tiles_enabled: false`. | NOT RUN | — |
+| Step 2: flip the flag on the remote host | Set `system_audio_enabled: true` on the Ohio host and confirm audio negotiates and streams over the real link, the way tiles' step-2-equivalent activation was confirmed on 2026-08-07. | NOT RUN | — |

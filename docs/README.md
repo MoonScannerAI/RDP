@@ -87,6 +87,20 @@ See [SECURITY.md](SECURITY.md) for the full threat model and
   keyboard/mouse capture and stops sending input — a hard, unconditional
   escape hatch.
 
+## Audio
+
+System audio, host → client only: WASAPI loopback capture on the host,
+encoded as AAC-LC via Media Foundation, carried over the same QUIC datagram
+path as video. It is negotiated as a `Hello` feature bit and is **off by
+default** on the host (an operator has to enable it) — a build with this
+feature behaves exactly like one without it until then. There is no
+microphone capture and no client → host audio path. Audio is not
+synchronized to video and lags it by roughly 95 ms — fine for notification
+sounds and music, noticeable on lip movement. See
+[LIMITATIONS.md](LIMITATIONS.md) for the full breakdown: format restrictions,
+the codec tradeoff, loss handling, and why the lag is a scope decision
+rather than a bug.
+
 ## What's real in this build vs. what's a stub
 
 This is an honest project. Read [LIMITATIONS.md](LIMITATIONS.md) before
@@ -97,7 +111,9 @@ relying on this for anything important. In short, as of this MVP:
 - There is no relay server. If direct connectivity fails (e.g. both ends
   behind strict NAT/CGNAT with no port forwarding), the connection fails.
   It does not silently degrade to a working-but-unlabeled path.
-- No audio, no file transfer, clipboard is text-only, single monitor only.
+- System audio (host → client) exists but is off by default and not
+  synchronized to video — see Audio above. No microphone / audio return
+  path, no file transfer, clipboard is text-only, single monitor only.
 - The executables are **not code-signed**. Windows SmartScreen will warn on
   first run. This is expected; see [SECURITY.md](SECURITY.md).
 - Built and exercised on a LAN/dev machine; the primary real-world WAN path
