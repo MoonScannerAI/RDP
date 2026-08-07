@@ -25,6 +25,26 @@ pub const MAX_AUTH_MSG: usize = 4 * 1024;
 pub const DEFAULT_UDP_PORT: u16 = 47990;
 pub const DEFAULT_TCP_PORT: u16 = 47991;
 
+/// Lowest frame rate a *stored or wire* value may express. Deliberately 1, and
+/// deliberately **not** the UI's user-facing floor of [`UI_MIN_TARGET_FPS`]:
+/// this bound exists only to keep a hand-edited `0` — in a config file, or in a
+/// peer's `ControlMsg::StartStream { preferred_fps }` — from reaching a divisor.
+/// The floor a person can actually pick is a separate, product-level question;
+/// see [`UI_MIN_TARGET_FPS`].
+pub const MIN_TARGET_FPS: u32 = 1;
+/// Highest frame rate the encoder is ever asked for. Both tiers share this
+/// ceiling; only the floor is split.
+pub const MAX_TARGET_FPS: u32 = 240;
+/// Lowest frame rate a *person* may choose in a settings panel.
+///
+/// The gap between this and [`MIN_TARGET_FPS`] is intentional and must not be
+/// collapsed into a single constant: `MIN_TARGET_FPS` is a sanitizer's floor
+/// that only has to keep arithmetic safe, whereas this is a judgement about
+/// what is worth offering a user. Widgets and pickers clamp to this; config
+/// sanitizing and wire-side validation clamp to `MIN_TARGET_FPS`, so a file or
+/// peer that already says `3` keeps working while the UI never offers it.
+pub const UI_MIN_TARGET_FPS: u32 = 10;
+
 /// ALPN for the QUIC/TLS handshake.
 pub const ALPN: &[u8] = b"directdesk/1";
 
@@ -194,13 +214,42 @@ pub enum QualityMode {
     LowBandwidth,
 }
 
+impl QualityMode {
+    /// The one user-facing wording for each mode.
+    ///
+    /// Host and client both render this, so the two ends of a session can never
+    /// show the operator two different names for the same setting — a mismatch
+    /// that reads as two unrelated features. Editing a string here changes both
+    /// UIs at once, which is the whole point of it living on the shared type.
+    pub const fn label(self) -> &'static str {
+        match self {
+            QualityMode::TextDesktop => "Text / desktop",
+            QualityMode::Balanced => "Balanced",
+            QualityMode::Motion => "Motion",
+            QualityMode::LowBandwidth => "Low bandwidth",
+        }
+    }
+}
+
 /// Serialize a control-plane message with the length prefix.
 pub fn encode_framed<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
+    encode_framed_capped(msg, MAX_CONTROL_MSG)
+}
+
+/// Serialize any message as `u32-le length || postcard body`, capped at
+/// `limit`.
+///
+/// The cap is checked *before* the prefix is written, so an oversize message is
+/// an error rather than a frame a peer would reject after reading it. Callers
+/// that are not on the control plane (the local UAC pipe, the service IPC pipe)
+/// pass their own, smaller cap; [`encode_framed`] is this function with
+/// [`MAX_CONTROL_MSG`].
+pub fn encode_framed_capped<T: Serialize>(msg: &T, limit: usize) -> Result<Vec<u8>> {
     let body = postcard::to_stdvec(msg)?;
-    if body.len() > MAX_CONTROL_MSG {
+    if body.len() > limit {
         return Err(Error::Oversized {
             got: body.len(),
-            limit: MAX_CONTROL_MSG,
+            limit,
         });
     }
     let mut out = Vec::with_capacity(4 + body.len());
@@ -229,6 +278,50 @@ pub fn decode_strict<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
         return Err(Error::Invalid(format!("{} trailing bytes", rest.len())));
     }
     Ok(value)
+}
+
+/// Decode one complete, already-buffered frame (`u32-le length || postcard
+/// body`, prefix included) under an explicit `limit`.
+///
+/// Rejects, in this order:
+/// * a frame shorter than the 4-byte length prefix,
+/// * a zero-length body (via [`parse_frame_len`]),
+/// * a declared length over `limit`, checked before anything is read,
+/// * a prefix that disagrees with the actual body length,
+/// * unknown enum variants and out-of-range values (postcard is strict),
+/// * trailing bytes after the message (via [`decode_strict`]).
+///
+/// **This must remain the only implementation of that list.** The local UAC
+/// control pipe and the service IPC pipe deliberately reuse the control plane's
+/// framing so that a single strict decoder guards all three paths. That is not
+/// tidiness: the UAC pipe drives SYSTEM-integrity input injection and the
+/// service pipe drives the install/elevation verbs, so a second copy of this
+/// function that drifted — a missing length-disagreement check, a forgiving
+/// trailing-byte rule — would be a local privilege-escalation surface that the
+/// network path's own tests could never observe. `limit` is the only knob a
+/// caller is meant to vary.
+///
+/// Use it for whole frames held in memory (a message-mode pipe read). A
+/// streaming transport that reads the prefix and then exactly that many bytes
+/// should keep using [`parse_frame_len`] + [`decode_strict`] directly; the two
+/// enforce the same rules, and the length-disagreement check is vacuous there.
+pub fn decode_framed<T: serde::de::DeserializeOwned>(frame: &[u8], limit: usize) -> Result<T> {
+    if frame.len() < 4 {
+        return Err(Error::Invalid(format!(
+            "short frame: {} bytes",
+            frame.len()
+        )));
+    }
+    let prefix: [u8; 4] = frame[..4].try_into().expect("checked length");
+    let declared = parse_frame_len(prefix, limit)?;
+    let body = &frame[4..];
+    if body.len() != declared {
+        return Err(Error::Invalid(format!(
+            "frame length mismatch: prefix says {declared}, body is {}",
+            body.len()
+        )));
+    }
+    decode_strict::<T>(body)
 }
 
 /// Validate a Hello — version must match exactly for MVP.
