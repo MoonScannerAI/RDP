@@ -57,11 +57,23 @@ features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Media",
+    # WASAPI system-audio loopback (`audio_capture`): the MMDeviceEnumerator
+    # CLSID, IMMDeviceEnumerator::GetDefaultAudioEndpoint, IMMDevice, IAudioClient,
+    # IAudioCaptureClient, IAudioRenderClient, WAVEFORMATEX/WAVEFORMATEXTENSIBLE
+    # and the AUDCLNT_* flag and error constants all live here.
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
+    # `IMMDevice::Activate` — the one call that turns an endpoint into an
+    # IAudioClient — takes a `*const PROPVARIANT`, so its binding is generated
+    # under `all(Win32_System_Com_StructuredStorage, Win32_System_Variant)`. Without
+    # this feature the method is not merely unusable, it is compiled out of the
+    # interface entirely and `audio_capture` cannot open a device at all.
+    # (`Win32_System_Variant` is already below, for mf_encoder's ICodecAPI VARIANTs.)
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_IO",
     "Win32_System_Ole",
     "Win32_System_Pipes",

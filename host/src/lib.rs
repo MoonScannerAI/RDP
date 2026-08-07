@@ -17,6 +17,8 @@
 //!
 //! Everything implements the contracts in `directdesk_shared::traits`.
 
+pub mod audio_capture;
+pub mod audio_encoder;
 pub mod capture;
 pub mod config;
 pub mod convert;
