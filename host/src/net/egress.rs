@@ -70,6 +70,31 @@ pub fn wire_size(frame: &EncodedFrame, mtu: usize, fec_block: u8) -> usize {
     data + parity * (FRAG_HEADER_LEN + chunk)
 }
 
+/// Upper bound on [`wire_size`] over *every* frame the fragmenter would accept
+/// at `mtu`: [`MAX_FRAGS_PER_FRAME`] full data fragments plus their parity.
+///
+/// This exists so a second producer on the datagram path can reserve enough
+/// room for the frame the video pump is *currently* paying out without knowing
+/// anything about that frame. See [`super::audio`]: its send loop passes this
+/// function's result straight in as the `reserve` argument of its `has_room`
+/// precheck, recomputed per packet from the connection's current MTU (there is
+/// no constant — path-MTU discovery can move the answer mid-session). The
+/// reason it has to be an upper bound rather than the actual frame's size is
+/// that the two threads never meet.
+///
+/// Note the bound comes from the fragment *count* limit, not from
+/// `MAX_FRAME_BYTES`: 512 fragments at a 1200-byte MTU is 607 KB of payload,
+/// well under the 2 MiB frame ceiling, so the fragment cap is what binds first
+/// at every MTU the fragmenter will serve.
+pub fn max_frame_wire_size(mtu: usize) -> usize {
+    use directdesk_shared::video::{FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME};
+    let chunk = mtu.saturating_sub(FRAG_HEADER_LEN).max(1);
+    let frags = MAX_FRAGS_PER_FRAME as usize;
+    let data = frags * (chunk + FRAG_HEADER_LEN);
+    let parity = frags.div_ceil(FEC_BLOCK_SIZE as usize);
+    data + parity * (FRAG_HEADER_LEN + chunk)
+}
+
 /// Shortest sleep Windows can actually honour, even with the 1 ms timer
 /// resolution the video sender holds. Asking for less does not pace the burst,
 /// it just rounds every gap up — which is how a 285-fragment scene-change frame
@@ -224,8 +249,23 @@ pub(super) fn video_pump(
         }
 
         // The precheck above covers the data fragments *and* their parity, so
-        // what follows fits whole: nothing this frame sends can displace the
-        // datagrams already queued for the previous one.
+        // what follows fits whole at the instant it was measured.
+        //
+        // That used to be the end of the story — "nothing this frame sends can
+        // displace the datagrams already queued for the previous one" — and it
+        // stopped being true the moment a second producer appeared on this
+        // path. The check above and the last `send_datagram` below are
+        // separated by the pacing sleeps, which at 15 fps run to ~133 ms, so
+        // any other thread sending in that window spends headroom this frame
+        // has already counted, and quinn's eviction then shreds the frame in
+        // flight rather than refusing the newcomer.
+        //
+        // The invariant is now one-sided and enforced on the *other* side:
+        // `net::audio` prechecks with `max_frame_wire_size` held back on top of
+        // its own packet, so audio can never take the room this frame reserved.
+        // Video reserves nothing in return and does not need to — one worst-case
+        // frame of slack covers whatever audio could have queued meanwhile.
+        // Any future third producer on the datagram path owes the same reserve.
         let frags = match fragment_frame_fec(&frame, mtu, FEC_BLOCK_SIZE) {
             Ok(f) => f,
             Err(e) => {
@@ -504,6 +544,50 @@ mod tests {
         assert!(
             wire_size(&f, 1_200, FEC_BLOCK_SIZE) > wire_size(&f, 1_200, 0),
             "parity is not free"
+        );
+    }
+
+    #[test]
+    fn max_frame_wire_size_bounds_every_frame_the_fragmenter_accepts() {
+        // The audio sender holds this many bytes back on every send so it
+        // cannot consume headroom the video pump's precheck already counted.
+        // If it ever under-estimates, enabling audio silently starts shredding
+        // keyframes on constrained links — the exact failure it exists to
+        // prevent — so it is checked against what fragmenting really produces,
+        // across the MTUs quinn can hand us and frames up to the point where
+        // the fragment-count limit refuses them.
+        for mtu in [576usize, 1_200, 1_400, 1_500, 9_000] {
+            let bound = max_frame_wire_size(mtu);
+            for len in [1usize, 1_000, 50_000, 145_000, 600_000, 2 * 1024 * 1024] {
+                let f = EncodedFrame {
+                    frame_id: 1,
+                    keyframe: true,
+                    timestamp_ms: 0,
+                    data: vec![0u8; len],
+                };
+                // Only frames the fragmenter would actually emit matter: one it
+                // refuses is never offered to the connection at all.
+                if fragment_frame_fec(&f, mtu, FEC_BLOCK_SIZE).is_ok() {
+                    assert!(
+                        wire_size(&f, mtu, FEC_BLOCK_SIZE) <= bound,
+                        "mtu {mtu} len {len}: {} exceeds the reserve {bound}",
+                        wire_size(&f, mtu, FEC_BLOCK_SIZE)
+                    );
+                }
+            }
+        }
+
+        // And it must leave the audio sender somewhere to stand: a reserve at
+        // or above the whole datagram send buffer would mean audio never sends
+        // a single packet, which would look exactly like a broken feature.
+        let reserve = max_frame_wire_size(1_200);
+        assert_eq!(
+            reserve, 676_800,
+            "the documented reserve at a 1200-byte MTU"
+        );
+        assert!(
+            reserve < directdesk_shared::transport::quic::DEFAULT_DATAGRAM_SEND_BUFFER / 2,
+            "a {reserve}-byte reserve would starve audio outright"
         );
     }
 

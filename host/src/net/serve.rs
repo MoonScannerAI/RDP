@@ -48,9 +48,13 @@ use super::adaptation::{
     clamp_to_cap, effective_cap, effective_fps, overrun_signal, window_congestion, RateLimiter,
     StatusWindow, TileThrottle, WindowDelivery, STATUS_INTERVAL_MS,
 };
+use super::audio::{audio_pump, AudioTxConfig};
 use super::egress::{tile_pump, video_pump};
 use super::elevation::elevation_loop;
-use super::{Inner, NetEvent, TileCounters, VideoCounters, CLOSE_CODE_REJECTED, HOST_ROUTE};
+use super::{
+    AudioCounters, AudioStatus, Inner, NetEvent, TileCounters, VideoCounters, CLOSE_CODE_REJECTED,
+    HOST_ROUTE,
+};
 
 /// Floor on how often a *client's* `RequestKeyframe` is honoured. The client
 /// only asks when its own decoder is stuck (a frame-id gap), and it rate-limits
@@ -162,6 +166,45 @@ pub(super) async fn run_session(
         tracing::error!("could not spawn the video sender thread");
     }
 
+    // System audio, only when BOTH ends asked for it — `negotiated_features` is
+    // already the intersection, so this is a single bit test. It matters more
+    // here than it does for tiles: audio shares the media *datagram* path with
+    // video rather than getting a stream of its own, so a client that predates
+    // the feature would hand an audio datagram to its video reassembler.
+    //
+    // A dedicated OS thread rather than a tokio task, and joined rather than
+    // aborted, for the same reasons `dd-video-tx` is: it owns thread-affine COM
+    // objects (a WASAPI endpoint and an MFT) whose teardown must happen on the
+    // thread that created them, and an aborted task would leave the capture
+    // endpoint and the silent keep-alive render stream open behind it.
+    let audio_counters = Arc::new(AudioCounters::default());
+    // Published by `status_loop` from the same value it sends the client as
+    // `ControlMsg::SecureDesktopActive`, so the picture freezing and the audio
+    // muting are the same fact rather than two that can disagree.
+    let secure_desktop = Arc::new(AtomicBool::new(false));
+    let audio = if negotiated_features & directdesk_shared::protocol::features::SYSTEM_AUDIO != 0 {
+        let conn = conn.clone();
+        let stop = stop.clone();
+        let counters = audio_counters.clone();
+        let muted = secure_desktop.clone();
+        let cfg = AudioTxConfig {
+            source: inner.cfg.system_audio_source,
+            kbps: inner.cfg.system_audio_kbps,
+            redundancy: inner.cfg.system_audio_redundancy,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("dd-audio-tx".into())
+            .spawn(move || audio_pump(conn, cfg, muted, stop, counters))
+            .ok();
+        if spawned.is_none() {
+            // A warning, not an error: this costs sound and nothing else.
+            tracing::warn!("could not spawn the audio sender thread; session continues silent");
+        }
+        spawned
+    } else {
+        None
+    };
+
     // Elevation click-through: the control loop forwards `ArmElevation` here;
     // `elevation_loop` owns the state machine, the detector poll, and the SYSTEM
     // worker's lifecycle. It is NOT in `tasks` (which are hard-aborted): it is
@@ -199,6 +242,8 @@ pub(super) async fn run_session(
             counters.clone(),
             streaming.clone(),
             tile_counters.clone(),
+            audio_counters.clone(),
+            secure_desktop.clone(),
         )),
         tokio::spawn(event_loop(
             inner.clone(),
@@ -229,6 +274,14 @@ pub(super) async fn run_session(
     if let Some(v) = video {
         let _ = v.join();
     }
+    // Joined, not detached: the audio thread owns a WASAPI capture endpoint, a
+    // silent keep-alive *render* stream on the default device, an AAC MFT and a
+    // COM apartment. Letting it outlive the session would leave the host's audio
+    // engine held open for a client that has already gone — and the next client
+    // would then race a second capture onto the same endpoint.
+    if let Some(a) = audio {
+        let _ = a.join();
+    }
     // Explicit, not just the guard: input must be released before the next
     // client can possibly connect.
     pipeline.release_all_input();
@@ -246,6 +299,14 @@ pub(super) async fn run_session(
         s.transport = ConnStats::default();
         s.delivery = WindowDelivery::default();
         s.quality_mode = None;
+        // The session's audio totals are kept (they are the record of what the
+        // client actually got), but the live state is not: with the thread
+        // joined there is nothing to be muted or streaming any more.
+        s.audio_packets_sent = audio_counters.packets_sent.load(Ordering::Relaxed);
+        s.audio_bytes_sent = audio_counters.bytes_sent.load(Ordering::Relaxed);
+        s.audio_backpressured = audio_counters.backpressured.load(Ordering::Relaxed);
+        s.audio_silent_suppressed = audio_counters.silent_suppressed.load(Ordering::Relaxed);
+        s.audio_status = AudioStatus::Disabled;
     });
     reason
 }
@@ -396,7 +457,60 @@ fn apply_bitrate(inner: &Arc<Inner>, pipeline: &Arc<HostSession>, kbps: u32) {
     inner.status_mut(|s| s.target_kbps = capped);
 }
 
+/// The encoder-vs-link overrun for one status window.
+///
+/// # The denominator is bytes CARRIED, and it must stay that way
+///
+/// `transport.bandwidth_kbps` is built in
+/// [`directdesk_shared::transport::session`]'s `delta_stats` from quinn's own
+/// `rx_bytes + tx_bytes` across the window: bytes that were actually **moved**.
+/// That is the only figure available here with the property [`overrun_signal`]
+/// depends on — it *falls when the link stalls*.
+///
+/// The tempting alternative is `WindowDelivery::throughput_kbps()`, on the
+/// reasoning that the numerator is video so the denominator should be video
+/// too. It is wrong, and wrong in the one direction that matters: it disables
+/// the signal silently. `WindowDelivery::bytes` comes from
+/// `VideoCounters::bytes_sent`, which [`super::egress`]'s `video_pump`
+/// accumulates from `frag.len()` **before** each `send_datagram` call and
+/// commits once the frame's last fragment has been *offered*. Those are bytes
+/// offered, not bytes carried — and offering is precisely what keeps
+/// succeeding after the link has stalled, because `send_datagram` never blocks
+/// and never refuses: quinn takes the datagram, returns `Ok(())`, and then
+/// discards it with no error, no packet loss and no room consumed. A
+/// denominator built from it therefore tracks the encoder no matter how little
+/// reaches the wire, which is exactly the failure [`overrun_signal`]'s own docs
+/// say this signal exists to detect.
+///
+/// It is also *larger* than the numerator by construction — about 11% at a
+/// 1200-byte MTU, from one 12-byte fragment header per fragment plus a
+/// full-width XOR parity fragment per FEC block, none of which the encoder's
+/// bitrate counts. Against [`overrun_signal`]'s 15% slack that means the ratio
+/// cannot reach the threshold until more than a fifth of frames are already
+/// being dropped outright — by which point `backpressure_ratio` has long since
+/// reported the same congestion, and the diagnostic contributes nothing at all.
+/// The tests below pin both halves of that.
+///
+/// # The known residual, deliberately NOT fixed here
+///
+/// `bandwidth_kbps` is every byte on the connection, so audio, refinement tiles
+/// and even ACKs inflate it and deflate the signal. Against a 12 Mbps video
+/// stream a 96 kbps audio track is ~1% and invisible; against
+/// `QualityMode::LowBandwidth` with an adaptor that has already cut the encoder
+/// toward its floor it is 13-43%, enough to hold the ratio inside the slack on
+/// exactly the slow links where this is the only congestion evidence there is.
+///
+/// The fix for that is to **subtract** the window's known non-video bytes (the
+/// `AudioCounters::bytes_sent` and `TileCounters::bytes_sent` deltas, both
+/// already measured over this same window) from the transport figure, which
+/// keeps it a measurement of what was carried. It is never to swap in a
+/// measurement of what was offered.
+fn window_overrun(encoder_kbps: u32, transport: &ConnStats) -> f32 {
+    overrun_signal(encoder_kbps, transport.bandwidth_kbps)
+}
+
 /// Periodic host → client status, and the adaptive bitrate loop.
+#[allow(clippy::too_many_arguments)]
 async fn status_loop(
     inner: Arc<Inner>,
     session: Arc<QuicSession>,
@@ -405,6 +519,8 @@ async fn status_loop(
     counters: Arc<VideoCounters>,
     streaming: Arc<AtomicBool>,
     tile_counters: Arc<TileCounters>,
+    audio_counters: Arc<AudioCounters>,
+    secure_desktop: Arc<AtomicBool>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(STATUS_INTERVAL_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -423,6 +539,16 @@ async fn status_loop(
         let media = pipeline.stats();
         let state = pipeline.state();
         let paused = matches!(state, SessionState::Paused(_));
+        // Publish the pause to the audio sender, from the same value that goes
+        // to the client as `ControlMsg::SecureDesktopActive` a few lines below.
+        // One store per tick against one relaxed load per audio packet: the
+        // secure desktop is a human-timescale event and this is a mute, not a
+        // synchronisation primitive. Sourcing it here rather than letting the
+        // audio thread read `pipeline.state()` itself is what makes "the
+        // picture is frozen" and "audio is muted" the same fact — they are
+        // literally the same boolean — at the cost of muting landing within one
+        // status interval instead of instantly.
+        secure_desktop.store(paused, Ordering::Relaxed);
 
         // Merge: the transport owns RTT/loss/bandwidth, the pipeline owns the
         // capture and encode numbers. Neither invents the other's.
@@ -466,7 +592,12 @@ async fn status_loop(
         // lifetime comparison did.
         let pressure = delivery.backpressure_ratio();
 
-        let overrun = overrun_signal(media.bitrate_kbps, transport.bandwidth_kbps);
+        // What the link CARRIED, and what the pump merely OFFERED. They are not
+        // interchangeable and only the first belongs in the overrun signal —
+        // see [`window_overrun`], which is where that reasoning is written down.
+        let carried_kbps = transport.bandwidth_kbps;
+        let offered_kbps = delivery.throughput_kbps();
+        let overrun = window_overrun(media.bitrate_kbps, &transport);
         // A keyframe the fragmenter refused outranks every measured signal:
         // nothing of it reached the wire, and the next IDR would be the same
         // size unless the bitrate comes down. Read-and-clear, then hand the
@@ -478,15 +609,21 @@ async fn status_loop(
         let congestion =
             window_congestion(transport.loss, delivery, overrun, warm, oversized_keyframe);
         if let Some(next) = adaptor.lock().observe(now, congestion, transport.rtt_ms) {
+            // All three numbers, labelled for what they actually are. `offered`
+            // sitting at ~1.1x the encoder while `carried` has collapsed is the
+            // exact signature of quinn accepting datagrams and discarding them,
+            // and it is only visible because the two are printed separately.
             tracing::info!(
                 "adaptive bitrate → {next} kbps (loss {:.1}%, send pressure {:.1}%, \
-                 overrun {:.1}%{}: encoder {} kbps vs link {} kbps)",
+                 overrun {:.1}%{}: encoder {} kbps, link carried {} kbps, \
+                 video offered {} kbps)",
                 transport.loss * 100.0,
                 pressure * 100.0,
                 overrun * 100.0,
                 if warm { "" } else { " [gated]" },
                 media.bitrate_kbps,
-                transport.bandwidth_kbps
+                carried_kbps,
+                offered_kbps
             );
             apply_bitrate(&inner, &pipeline, next);
         }
@@ -528,6 +665,11 @@ async fn status_loop(
             s.frames_unfragmentable = counters.frames_unfragmentable.load(Ordering::Relaxed);
             s.emit_ms_max = emit_ms_max;
             s.input_injected = injected;
+            s.audio_status = audio_counters.status();
+            s.audio_packets_sent = audio_counters.packets_sent.load(Ordering::Relaxed);
+            s.audio_bytes_sent = audio_counters.bytes_sent.load(Ordering::Relaxed);
+            s.audio_backpressured = audio_counters.backpressured.load(Ordering::Relaxed);
+            s.audio_silent_suppressed = audio_counters.silent_suppressed.load(Ordering::Relaxed);
         });
         // Cumulative injected count beside the send rate: under full video load
         // this should keep climbing as the client types (proving input is not
@@ -572,6 +714,24 @@ async fn status_loop(
         // rather than discard work it has already recorded as delivered.
         pipeline.set_tile_budget_kbps(budget);
 
+        // Audio, logged together for the same reason the tile line is: the four
+        // numbers only mean anything beside each other. `audio_backpressured`
+        // climbing while `backpressured` stays flat is audio correctly yielding
+        // the send buffer to video; both climbing is a link in real trouble;
+        // `silent_suppressed` climbing alone is a quiet desktop costing nothing.
+        let audio_status = audio_counters.status();
+        if audio_status != AudioStatus::Disabled {
+            tracing::info!(
+                ?audio_status,
+                audio_packets = audio_counters.packets_sent.load(Ordering::Relaxed),
+                audio_kbytes = audio_counters.bytes_sent.load(Ordering::Relaxed) / 1024,
+                audio_backpressured = audio_counters.backpressured.load(Ordering::Relaxed),
+                audio_silent_suppressed = audio_counters.silent_suppressed.load(Ordering::Relaxed),
+                backpressured,
+                "audio diag"
+            );
+        }
+
         let tile_strips = tile_counters.strips_sent.load(Ordering::Relaxed);
         if tile_strips > 0 {
             // Hazard 6's observable signature, logged together on purpose: if
@@ -614,5 +774,136 @@ async fn event_loop(
             }
             SessionEvent::Stats(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One second of a mid-range stream, big enough that the ratios below are
+    /// not dominated by rounding.
+    const ENCODER_KBPS: u32 = 6_000;
+
+    fn link_carrying(kbps: u32) -> ConnStats {
+        ConnStats {
+            bandwidth_kbps: kbps,
+            ..ConnStats::default()
+        }
+    }
+
+    /// The [`WindowDelivery`] `egress::video_pump` records for a window in
+    /// which it offered every one of the encoder's bytes to `send_datagram`.
+    ///
+    /// Built from the fragmenter's real arithmetic rather than a fudge factor:
+    /// the payload, one `FRAG_HEADER_LEN` header per `mtu - FRAG_HEADER_LEN`
+    /// chunk, plus one full-width XOR parity fragment per FEC block. The point
+    /// is not the exact number, it is that this is *strictly greater* than the
+    /// encoder's own figure no matter how the fragmenter is tuned — the pump
+    /// adds framing, it never removes any.
+    ///
+    /// `sent`/`offered` are set equal because that is the case under test:
+    /// quinn accepted every frame. Nothing was backpressured, so
+    /// `backpressure_ratio` reads zero and the overrun diagnostic is the only
+    /// congestion evidence left.
+    fn offered_everything(encoder_kbps: u32) -> WindowDelivery {
+        const MTU: u64 = 1_200;
+        const FRAG_HEADER_LEN: u64 = 12;
+        const FEC_BLOCK: u64 = 10;
+        let chunk = MTU - FRAG_HEADER_LEN;
+        let payload = encoder_kbps as u64 * 1_000 / 8;
+        let frags = payload.div_ceil(chunk);
+        let parity = frags.div_ceil(FEC_BLOCK);
+        WindowDelivery {
+            sent: 60,
+            offered: 60,
+            bytes: payload + frags * FRAG_HEADER_LEN + parity * (chunk + FRAG_HEADER_LEN),
+            dt_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn overrun_fires_when_the_link_carries_less_than_the_encoder_produces() {
+        // The failure this signal exists for, and the only one that produces
+        // it: quinn accepted every datagram we offered and then dropped most of
+        // them itself. Nothing appears as packet loss (nothing was put on the
+        // wire) and nothing appears as backpressure (the send buffer never
+        // filled). The sole remaining evidence is that the transport moved far
+        // fewer bytes than the encoder produced.
+        let stalled = link_carrying(2_000);
+        assert!(
+            window_overrun(ENCODER_KBPS, &stalled) > 0.6,
+            "a link carrying a third of the encoder's output must read as heavy \
+             overrun, got {}",
+            window_overrun(ENCODER_KBPS, &stalled)
+        );
+
+        // A healthy link carrying everything — plus protocol overhead and the
+        // client's own uplink, which `bandwidth_kbps` also counts — reads as no
+        // overrun at all. This is the direction the 15% slack protects.
+        assert_eq!(window_overrun(ENCODER_KBPS, &link_carrying(6_400)), 0.0);
+        assert_eq!(window_overrun(ENCODER_KBPS, &link_carrying(20_000)), 0.0);
+    }
+
+    #[test]
+    fn the_overrun_denominator_is_bytes_carried_never_bytes_offered() {
+        // REGRESSION GUARD. `delivery.throughput_kbps()` counts what
+        // `egress::video_pump` handed to `send_datagram`, accumulated *before*
+        // the call, and `send_datagram` never refuses. On a link that has
+        // stalled completely that figure is unchanged, so an overrun computed
+        // from it is structurally zero in exactly the case the signal exists to
+        // catch. Read `window_overrun`'s doc comment before touching this.
+        let offered = offered_everything(ENCODER_KBPS);
+        assert!(
+            offered.throughput_kbps() > ENCODER_KBPS,
+            "the pump's own byte count is the encoder's output plus framing, so \
+             it can only ever exceed it: {} vs {ENCODER_KBPS}",
+            offered.throughput_kbps()
+        );
+        assert_eq!(
+            overrun_signal(ENCODER_KBPS, offered.throughput_kbps()),
+            0.0,
+            "a bytes-offered denominator cannot report overrun even when the \
+             link carried literally nothing — it is not a measurement of the \
+             link at all"
+        );
+
+        // The measurement actually in use sees that same window for what it is.
+        assert!(window_overrun(ENCODER_KBPS, &link_carrying(500)) > 0.0);
+    }
+
+    #[test]
+    fn a_bytes_offered_denominator_stays_silent_past_a_fifth_of_frames_lost() {
+        // Quantifies the previous test. Because the offered figure runs ~11%
+        // above the encoder's own, `overrun_signal`'s 15% slack is not crossed
+        // until over a fifth of frames are dropped outright — and at that point
+        // `backpressure_ratio` has already reported the same congestion far
+        // more directly, so the diagnostic adds nothing it did not already say.
+        for dropped_pct in [0u64, 5, 10, 15, 20] {
+            let mut window = offered_everything(ENCODER_KBPS);
+            window.bytes = window.bytes * (100 - dropped_pct) / 100;
+            assert_eq!(
+                overrun_signal(ENCODER_KBPS, window.throughput_kbps()),
+                0.0,
+                "{dropped_pct}% of the stream gone and a bytes-offered \
+                 denominator is still reporting a healthy link"
+            );
+        }
+    }
+
+    #[test]
+    fn overrun_is_scale_free_and_safe_at_the_edges() {
+        // Zero on either side is "no measurement", not "no congestion": a
+        // window in which the encoder produced nothing, or one in which the
+        // transport figure has not been sampled yet, must not drive the
+        // adaptor. `StatusWindow`'s warm-up gate is the other half of this.
+        assert_eq!(window_overrun(0, &link_carrying(6_000)), 0.0);
+        assert_eq!(window_overrun(ENCODER_KBPS, &link_carrying(0)), 0.0);
+        // And the ratio depends on the shortfall, not the absolute rate, so it
+        // reads the same on a 500 kbps link as on a 50 Mbps one.
+        assert_eq!(
+            window_overrun(1_000, &link_carrying(500)),
+            window_overrun(100_000, &link_carrying(50_000))
+        );
     }
 }

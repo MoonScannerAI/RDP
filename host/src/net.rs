@@ -74,7 +74,7 @@
 //! [`ReleaseGuard`]: serve::ReleaseGuard
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -94,6 +94,7 @@ use directdesk_shared::{Error, Result};
 use crate::session::{HostSession, SessionConfig as PipelineConfig, SessionState};
 
 mod adaptation;
+mod audio;
 mod egress;
 mod elevation;
 mod handshake;
@@ -171,6 +172,66 @@ fn primary_local_ip() -> Option<IpAddr> {
 // Public surface
 // ---------------------------------------------------------------------------
 
+/// What the system-audio sender is actually doing right now.
+///
+/// Four of these five states all look like "audio doesn't work" from the
+/// client's chair, and they have completely different causes and fixes. Without
+/// a report that tells them apart, the only evidence a support conversation can
+/// produce is "I hear nothing", which is unfalsifiable: it is equally consistent
+/// with a machine that has no playback device, a machine sitting at its lock
+/// screen, a machine playing nothing, and a machine whose packets are all being
+/// dropped for want of send-buffer room.
+///
+/// Deliberately **not** in [`ConnStats`]: that struct's encoding is pinned
+/// byte-for-byte by the anti-brick suite and is exchanged with already-deployed
+/// peers, so a field added there would fail every session on its first stats
+/// tick. This is host-local diagnostics and never crosses the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioStatus {
+    /// The feature is off, or no client has negotiated it. No thread is running.
+    #[default]
+    Disabled,
+    /// The thread is running but cannot open a capture endpoint: no playback
+    /// device, an unsupported mix format (5.1, 96 kHz), the Windows Audio
+    /// service down, or the AAC MFT refusing to start. Retried with backoff.
+    NoEndpoint,
+    /// Capture is healthy and deliberately silenced, because the host is on the
+    /// secure desktop (UAC prompt, lock screen, Ctrl-Alt-Del).
+    Muted,
+    /// Capture is healthy and the desktop is silent, so nothing is being sent.
+    /// This is the normal resting state and costs zero bandwidth.
+    Idle,
+    /// Packets are going out.
+    Streaming,
+}
+
+impl AudioStatus {
+    /// Wire-free encoding for the sender thread's [`AtomicU8`]. These numbers
+    /// never leave the process, so they carry no compatibility obligation.
+    fn as_u8(self) -> u8 {
+        match self {
+            AudioStatus::Disabled => 0,
+            AudioStatus::NoEndpoint => 1,
+            AudioStatus::Muted => 2,
+            AudioStatus::Idle => 3,
+            AudioStatus::Streaming => 4,
+        }
+    }
+
+    /// Inverse of [`AudioStatus::as_u8`]. An unknown byte reads as
+    /// [`AudioStatus::Disabled`] rather than panicking — a diagnostic must
+    /// never be the thing that takes a session down.
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => AudioStatus::NoEndpoint,
+            2 => AudioStatus::Muted,
+            3 => AudioStatus::Idle,
+            4 => AudioStatus::Streaming,
+            _ => AudioStatus::Disabled,
+        }
+    }
+}
+
 /// Who is connected, for the UI and the tray tooltip.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
@@ -236,6 +297,24 @@ pub struct StatusSnapshot {
     /// injector, so it is evidence the whole input path works rather than that
     /// something was queued.
     pub input_injected: u64,
+    /// What the system-audio sender is doing. See [`AudioStatus`] for why this
+    /// is five states and not a bool.
+    pub audio_status: AudioStatus,
+    /// Audio packets that reached `send_datagram`. Duplicates sent for
+    /// redundancy are *not* counted here — see `audio_bytes_sent`.
+    pub audio_packets_sent: u64,
+    /// Audio bytes handed to `send_datagram`, redundant copies included, so
+    /// this is the real cost of the feature on the link.
+    pub audio_bytes_sent: u64,
+    /// Audio packets dropped because sending one would have eaten into the
+    /// send-buffer headroom the video pump's own precheck had already counted
+    /// on. This climbing while `frames_backpressured` stays flat is the feature
+    /// working exactly as designed: audio yields, the picture does not stutter.
+    pub audio_backpressured: u64,
+    /// Access units the encoder produced that were deliberately not sent
+    /// because the desktop was silent or the host was on the secure desktop. A
+    /// silent desktop costs zero bandwidth, and this is the evidence of it.
+    pub audio_silent_suppressed: u64,
     pub last_error: Option<String>,
 }
 
@@ -318,6 +397,29 @@ pub struct NetConfig {
     /// Backstop ceiling (kbps) on lossless refinement traffic; `0` means the
     /// measured headroom is the only limit. See [`tile_budget_kbps`].
     pub tile_max_kbps: u32,
+    // ---- system audio ----------------------------------------------------
+    //
+    // These four sit on `NetConfig` directly and NOT inside `NetConfig::pipeline`,
+    // deliberately. `pipeline` is `crate::session::SessionConfig` — the media
+    // pipeline's own configuration, handed to `HostSession::start` and read by
+    // the media thread. Audio never touches the media pipeline: it is captured,
+    // encoded and sent by one thread of its own in `net::audio` that has no
+    // `HostSession` at all. Putting the knobs in `pipeline` would hand them to
+    // the one component that has no use for them, and would rebuild the whole
+    // D3D11/MF pipeline whenever one changed. Same precedent as
+    // `uac_clickthrough` and `tile_max_kbps` above.
+    /// Operator opt-in for system-audio capture. When `false` the host never
+    /// offers [`features::SYSTEM_AUDIO`], so the bit is never mutual and the
+    /// sender thread is never spawned.
+    ///
+    /// [`features::SYSTEM_AUDIO`]: directdesk_shared::protocol::features::SYSTEM_AUDIO
+    pub system_audio_enabled: bool,
+    /// Target AAC bitrate (kbps). See [`crate::config::HostConfig::system_audio_kbps`].
+    pub system_audio_kbps: u32,
+    /// Re-send each audio packet once, one packet later.
+    pub system_audio_redundancy: bool,
+    /// Loopback capture or the diagnostic tone.
+    pub system_audio_source: crate::config::AudioSource,
 }
 
 impl NetConfig {
@@ -334,6 +436,10 @@ impl NetConfig {
             uac_arm_ttl_secs: cfg.uac_arm_ttl_secs,
             blank_wallpaper_during_session: cfg.blank_wallpaper_during_session,
             tile_max_kbps: cfg.lossless_tile_max_kbps,
+            system_audio_enabled: cfg.system_audio_enabled,
+            system_audio_kbps: cfg.system_audio_kbps,
+            system_audio_redundancy: cfg.system_audio_redundancy,
+            system_audio_source: cfg.system_audio_source,
         }
     }
 }
@@ -652,6 +758,34 @@ struct TileCounters {
     control_sent: AtomicU64,
 }
 
+/// Written by the `dd-audio-tx` thread in [`audio`], read by
+/// `serve::status_loop`.
+///
+/// Deliberately **not** merged into [`ConnStats`]: see [`AudioStatus`].
+#[derive(Default)]
+struct AudioCounters {
+    packets_sent: AtomicU64,
+    /// Includes redundant copies; `packets_sent` does not.
+    bytes_sent: AtomicU64,
+    /// Packets dropped rather than displace video's already-counted headroom.
+    backpressured: AtomicU64,
+    /// Access units encoded (to keep the MDCT state coherent) but not sent.
+    silent_suppressed: AtomicU64,
+    /// An [`AudioStatus`] via [`AudioStatus::as_u8`]. A gauge, not a counter:
+    /// the sender overwrites it, and the status loop only ever reads it.
+    status: AtomicU8,
+}
+
+impl AudioCounters {
+    fn set_status(&self, s: AudioStatus) {
+        self.status.store(s.as_u8(), Ordering::Relaxed);
+    }
+
+    fn status(&self) -> AudioStatus {
+        AudioStatus::from_u8(self.status.load(Ordering::Relaxed))
+    }
+}
+
 /// The channel tag the host expects each inbound stream to open with.
 ///
 /// Re-exported so the loopback test can assert the host and the shared crate
@@ -694,6 +828,95 @@ mod tests {
         assert_eq!(nc.bitrate_cap_kbps, Some(5_000));
         assert_eq!(nc.quality_mode, QualityMode::LowBandwidth);
         assert!(nc.quic.validate().is_ok());
+    }
+
+    #[test]
+    fn audio_settings_reach_net_config_without_touching_the_pipeline() {
+        use crate::config::AudioSource;
+
+        let hc = crate::config::HostConfig {
+            system_audio_enabled: true,
+            system_audio_kbps: 128,
+            system_audio_redundancy: true,
+            system_audio_source: AudioSource::TestTone,
+            ..Default::default()
+        }
+        .sanitized();
+        let nc = NetConfig::from_host_config(&hc);
+        assert!(nc.system_audio_enabled);
+        assert_eq!(nc.system_audio_kbps, 128);
+        assert!(nc.system_audio_redundancy);
+        assert_eq!(nc.system_audio_source, AudioSource::TestTone);
+
+        // And the shipped default carries none of it, which is what makes the
+        // rollout's first step a no-op on the wire.
+        let off = NetConfig::from_host_config(&crate::config::HostConfig::default().sanitized());
+        assert!(!off.system_audio_enabled);
+    }
+
+    #[test]
+    fn audio_status_survives_the_atomic_round_trip() {
+        for s in [
+            AudioStatus::Disabled,
+            AudioStatus::NoEndpoint,
+            AudioStatus::Muted,
+            AudioStatus::Idle,
+            AudioStatus::Streaming,
+        ] {
+            assert_eq!(AudioStatus::from_u8(s.as_u8()), s);
+        }
+        // Distinct codes, or two realities would report as one — which is the
+        // entire reason this enum exists rather than a bool.
+        let codes: Vec<u8> = [
+            AudioStatus::Disabled,
+            AudioStatus::NoEndpoint,
+            AudioStatus::Muted,
+            AudioStatus::Idle,
+            AudioStatus::Streaming,
+        ]
+        .iter()
+        .map(|s| s.as_u8())
+        .collect();
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len());
+
+        // A byte nobody assigned must read as "off", never panic: this is a
+        // diagnostic, and a diagnostic may not be what ends a session.
+        assert_eq!(AudioStatus::from_u8(200), AudioStatus::Disabled);
+        assert_eq!(AudioStatus::default(), AudioStatus::Disabled);
+
+        let c = AudioCounters::default();
+        assert_eq!(c.status(), AudioStatus::Disabled);
+        c.set_status(AudioStatus::Streaming);
+        assert_eq!(c.status(), AudioStatus::Streaming);
+    }
+
+    #[test]
+    fn audio_diagnostics_are_host_local_and_never_touch_conn_stats() {
+        // ConnStats rides inside `ControlMsg::Stats` and is decoded
+        // positionally by already-deployed peers, so an audio field added
+        // *there* would fail every session on its first stats tick — the
+        // anti-brick suite pins its encoding for exactly that reason. The audio
+        // counters therefore live on StatusSnapshot, which never crosses the
+        // wire. Recording a full set of them must leave both embedded
+        // `ConnStats` bit-identical to a default one.
+        let s = StatusSnapshot {
+            audio_status: AudioStatus::Streaming,
+            audio_packets_sent: 1_234,
+            audio_bytes_sent: 567_890,
+            audio_backpressured: 7,
+            audio_silent_suppressed: 42,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            s.transport,
+            ConnStats::default(),
+            "an audio counter reached the wire stats struct"
+        );
+        assert_eq!(s.pipeline, ConnStats::default());
     }
 
     // -- route -------------------------------------------------------------

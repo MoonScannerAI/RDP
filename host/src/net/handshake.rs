@@ -242,6 +242,9 @@ fn offered_features(cfg: &NetConfig) -> u64 {
     if cfg.pipeline.lossless_tiles_enabled {
         bits |= directdesk_shared::protocol::features::LOSSLESS_TILES;
     }
+    if cfg.system_audio_enabled {
+        bits |= directdesk_shared::protocol::features::SYSTEM_AUDIO;
+    }
     bits
 }
 
@@ -470,7 +473,7 @@ mod tests {
 
     #[test]
     fn host_hello_advertises_the_intersection() {
-        use directdesk_shared::protocol::features::LOSSLESS_TILES;
+        use directdesk_shared::protocol::features::{LOSSLESS_TILES, SYSTEM_AUDIO};
 
         // Both sides want it → on.
         assert_eq!(
@@ -489,21 +492,61 @@ mod tests {
             host_hello(u64::MAX, LOSSLESS_TILES).features,
             LOSSLESS_TILES
         );
+
+        // The same four cases for audio. The third one is load-bearing beyond
+        // "a feature stays off": audio shares the media *datagram* path with
+        // video, so a host that sent an audio datagram to a client which never
+        // asked would be handing the video reassembler something it must
+        // reject. The bit being mutual is what makes that unreachable.
+        assert_eq!(
+            host_hello(SYSTEM_AUDIO, SYSTEM_AUDIO).features,
+            SYSTEM_AUDIO
+        );
+        assert_eq!(host_hello(SYSTEM_AUDIO, 0).features, 0);
+        assert_eq!(host_hello(0, SYSTEM_AUDIO).features, 0);
+        assert_eq!(host_hello(u64::MAX, SYSTEM_AUDIO).features, SYSTEM_AUDIO);
+
+        // Two features negotiate independently: a client that wants only one of
+        // them must not be handed both, and must not lose the one it asked for.
+        let both = LOSSLESS_TILES | SYSTEM_AUDIO;
+        assert_eq!(host_hello(both, both).features, both);
+        assert_eq!(host_hello(SYSTEM_AUDIO, both).features, SYSTEM_AUDIO);
+        assert_eq!(host_hello(LOSSLESS_TILES, both).features, LOSSLESS_TILES);
+        assert_eq!(host_hello(both, SYSTEM_AUDIO).features, SYSTEM_AUDIO);
     }
 
     #[test]
     fn offered_features_follow_config() {
-        use directdesk_shared::protocol::features::LOSSLESS_TILES;
+        use directdesk_shared::protocol::features::{LOSSLESS_TILES, SYSTEM_AUDIO};
 
         let mut cfg =
             NetConfig::from_host_config(&crate::config::HostConfig::default().sanitized());
+        // The case rollout actually depends on: a host running the shipped
+        // defaults offers *nothing at all*, so the new binary is byte-identical
+        // on the wire to the one already deployed on the remote machine.
         assert_eq!(
-            offered_features(&cfg) & LOSSLESS_TILES,
+            offered_features(&cfg),
             0,
             "shipped default must offer nothing — rollout step 1 is byte-identical on the wire"
         );
+        assert_eq!(offered_features(&cfg) & LOSSLESS_TILES, 0);
+        assert_eq!(offered_features(&cfg) & SYSTEM_AUDIO, 0);
+
+        // Each flag lights its own bit and only its own bit.
         cfg.pipeline.lossless_tiles_enabled = true;
         assert_eq!(offered_features(&cfg) & LOSSLESS_TILES, LOSSLESS_TILES);
+        assert_eq!(offered_features(&cfg) & SYSTEM_AUDIO, 0);
+
+        cfg.system_audio_enabled = true;
+        assert_eq!(offered_features(&cfg) & SYSTEM_AUDIO, SYSTEM_AUDIO);
+        assert_eq!(
+            offered_features(&cfg),
+            LOSSLESS_TILES | SYSTEM_AUDIO,
+            "both on means both offered, and nothing else"
+        );
+
+        cfg.pipeline.lossless_tiles_enabled = false;
+        assert_eq!(offered_features(&cfg), SYSTEM_AUDIO, "audio alone");
     }
 
     // -- auth messages -----------------------------------------------------

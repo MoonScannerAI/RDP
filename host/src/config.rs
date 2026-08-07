@@ -62,6 +62,103 @@ pub const MAX_TILES_PER_PASS: u32 = 512;
 /// improve.
 pub const MAX_TILE_KBPS: u32 = 40_000;
 
+/// Bounds for [`HostConfig::system_audio_kbps`].
+///
+/// Deliberately wider than the rates the Windows AAC MFT actually documents
+/// (96/128/160/192 kbps — `audio_encoder::DOCUMENTED_BYTES_PER_SECOND`).
+/// `audio_encoder::choose_output_type` already rounds a target *up* to the
+/// cheapest enumerated offer that meets it and falls back to the highest offer
+/// when nothing reaches it, so an in-band value that no encoder offers is
+/// handled correctly rather than refused. All this clamp has to do is keep a
+/// hand-edited `0` or `4000000` from reaching that selection at all.
+///
+/// Note `0` does **not** mean "off" here, unlike [`MAX_TILE_KBPS`]'s idiom:
+/// [`HostConfig::system_audio_enabled`] is the off switch, so a `0` is a typo
+/// and is clamped up to the floor rather than silently disabling sound.
+///
+/// The ceiling is **not** free to move: past a certain bitrate a single AAC
+/// access unit no longer fits the wire's payload cap and *every* frame fails
+/// `directdesk_shared::audio::encode_packet`, which is silence behind a
+/// repeating warn. See the compile-time assertion below, which is what keeps
+/// the two numbers from being sized independently again.
+pub const MIN_SYSTEM_AUDIO_KBPS: u32 = 32;
+pub const MAX_SYSTEM_AUDIO_KBPS: u32 = 320;
+
+/// Bytes in the largest AAC-LC access unit `kbps` can produce at `sample_rate`.
+///
+/// One AAC-LC access unit is a fixed 1024 samples per channel — the host pins
+/// `frameLengthFlag = 0` in the `AudioSpecificConfig` it hands the client's
+/// decoder, and `audio_encoder`'s tests pin that bit — so a unit's duration is
+/// `1024 / sample_rate` seconds and its size at a constant bitrate follows
+/// directly. Rounded up, because a partial byte still occupies a whole one.
+const fn max_access_unit_bytes(kbps: u32, sample_rate: u32) -> usize {
+    // kbps * 1000 bits/s, times 1024/sample_rate seconds, over 8 bits/byte.
+    // Ordered so the multiply happens in u64 and nothing truncates early.
+    // The rate is floored at 1 for the same reason `audio_encoder::hns_at`
+    // floors it: a nonsense rate must give a nonsense answer, never a division
+    // by zero — and here, never an underflow in the round-up either.
+    let bits = kbps as u64 * 1_000 * 1_024;
+    let rate = if sample_rate == 0 { 1 } else { sample_rate };
+    let bits_per_byte = rate as u64 * 8;
+    bits.div_ceil(bits_per_byte) as usize
+}
+
+/// The lowest sample rate `audio_capture` will accept.
+///
+/// The *lowest* rate is the worst case here, not the highest: an access unit is
+/// a fixed number of samples, so the slower they are played the longer it lasts
+/// and the more bits a constant bitrate packs into it. Pinned against the real
+/// supported set by a test below, so adding a lower rate fails there rather
+/// than quietly invalidating the assertion underneath.
+const LOWEST_AUDIO_SAMPLE_RATE: u32 = 44_100;
+
+/// **The bitrate ceiling and the wire payload cap must agree, and they were
+/// sized independently.**
+///
+/// `MAX_SYSTEM_AUDIO_KBPS` bounds what the AAC encoder is asked to produce;
+/// `directdesk_shared::audio::MAX_AUDIO_PAYLOAD` bounds what a single audio
+/// datagram may carry. Nothing connected them, and they crossed at 352.8 kbps
+/// (44.1 kHz, where a 1024-sample unit is 23.2 ms): above that, every single
+/// access unit is refused by `encode_packet` and the session's audio is a
+/// repeating "audio packet not encodable" warn and nothing else — no error, no
+/// status, just no sound. The old 512 was over that line. It was unreachable in
+/// practice only because the Windows AAC MFT tops out at 192 kbps, which is a
+/// property of the encoder Microsoft shipped rather than anything this code
+/// enforces.
+///
+/// 320 rather than the arithmetic maximum of 352 for the same reason the rest
+/// of this module leaves headroom: AAC's bit reservoir lets an individual frame
+/// run over the nominal average for a transient, so sizing the cap to the exact
+/// breakeven would put the worst case precisely on the boundary. 320 is also
+/// well above the 192 kbps ceiling anything real will negotiate, so nothing
+/// reachable is lost.
+const _: () = assert!(
+    max_access_unit_bytes(MAX_SYSTEM_AUDIO_KBPS, LOWEST_AUDIO_SAMPLE_RATE)
+        <= directdesk_shared::audio::MAX_AUDIO_PAYLOAD,
+    "MAX_SYSTEM_AUDIO_KBPS can produce an AAC access unit larger than \
+     MAX_AUDIO_PAYLOAD: every frame would fail encode_packet and the session \
+     would run silent behind a repeating warn"
+);
+/// And the floor must still be a bitrate, not a rounding error.
+const _: () = assert!(MIN_SYSTEM_AUDIO_KBPS > 0 && MIN_SYSTEM_AUDIO_KBPS < MAX_SYSTEM_AUDIO_KBPS);
+
+/// Where the system-audio thread gets its samples.
+///
+/// [`AudioSource::TestTone`] is a product feature, not test scaffolding: on a
+/// host in another state with nobody in the room and nothing playing, "I hear
+/// nothing" is un-diagnosable — it could be a dead capture, a dead encoder, a
+/// dead transport or simply a quiet desktop. Switching the source to a tone
+/// collapses that to one bit. See [`crate::audio_capture::TestTone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AudioSource {
+    /// WASAPI shared-mode loopback off the default render endpoint — what the
+    /// user actually hears.
+    #[default]
+    Loopback,
+    /// A synthetic 440 Hz sine. Needs no audio hardware and is deterministic.
+    TestTone,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostConfig {
@@ -160,6 +257,49 @@ pub struct HostConfig {
     /// deltas near-zero. Default `true` — most users would rather have the
     /// bandwidth than see their wallpaper during a remote session.
     pub blank_wallpaper_during_session: bool,
+    /// Opt-in: capture what this machine is playing (WASAPI loopback off the
+    /// default render endpoint), encode it as AAC-LC, and send it to the client
+    /// in QUIC datagrams beside the video.
+    ///
+    /// Default `false` for the first installs, for exactly the reason
+    /// [`lossless_tiles_enabled`] is: the host is remote, so the staged rollout
+    /// ships the code first and turns it on separately — a binary that is
+    /// byte-identical on the wire is a safe deploy, and a config flip is
+    /// trivially reversible where a bad binary is not. It only ever activates
+    /// when the client also advertises [`features::SYSTEM_AUDIO`], so an old
+    /// client sees nothing regardless.
+    ///
+    /// That mutual-bit guarantee matters more here than it does for tiles.
+    /// Refinement gets a stream of its own, so a client that never asked for it
+    /// simply never sees the stream open. Audio instead shares the *media
+    /// datagram path* with video, and an audio datagram arriving at a peer that
+    /// predates the feature would be handed to the video reassembler. The video
+    /// decoder rejects `FLAG_AUDIO` outright so that is survivable — but "never
+    /// sent to a peer that did not ask" is the guarantee actually relied on,
+    /// and this flag being off by default is the first half of it.
+    ///
+    /// [`lossless_tiles_enabled`]: HostConfig::lossless_tiles_enabled
+    /// [`features::SYSTEM_AUDIO`]: directdesk_shared::protocol::features::SYSTEM_AUDIO
+    pub system_audio_enabled: bool,
+    /// Target AAC bitrate in kbps. Clamped into
+    /// `[MIN_SYSTEM_AUDIO_KBPS, MAX_SYSTEM_AUDIO_KBPS]`; the encoder then picks
+    /// the cheapest rate it actually offers at or above this.
+    ///
+    /// 96 by default rather than the encoder module's 128: audio here is a
+    /// *second* producer sharing one congestion window with the picture, and
+    /// the difference between 96 and 128 kbps of AAC on desktop sound (chimes,
+    /// speech, the occasional video) is not something a listener on a remote
+    /// session will notice, while 32 kbps of headroom left to the video is.
+    pub system_audio_kbps: u32,
+    /// Send every audio packet twice — once as itself, and once again one
+    /// packet later. Costs exactly double the audio bitrate and needs no client
+    /// code at all (the receiver's reorder window already discards duplicates
+    /// and fills holes), so it is the cheapest possible answer to a link that
+    /// drops the occasional datagram. Default `false`: on a healthy link it is
+    /// pure waste.
+    pub system_audio_redundancy: bool,
+    /// Which source the audio thread pumps. See [`AudioSource`].
+    pub system_audio_source: AudioSource,
 }
 
 /// Lower/upper bounds for [`HostConfig::uac_arm_ttl_secs`].
@@ -191,6 +331,11 @@ impl Default for HostConfig {
             uac_clickthrough: false,
             uac_arm_ttl_secs: 20,
             blank_wallpaper_during_session: true,
+            // Off by default: step 1 of the rollout ships this code inert too.
+            system_audio_enabled: false,
+            system_audio_kbps: 96,
+            system_audio_redundancy: false,
+            system_audio_source: AudioSource::Loopback,
         }
     }
 }
@@ -364,6 +509,11 @@ impl HostConfig {
                 .saturating_mul(2)
                 .min(MAX_TILE_LEASE_MS);
         }
+        // Note the absent `if != 0`: `system_audio_enabled` is the off switch,
+        // so a 0 here is a typo and is clamped up rather than read as "silent".
+        self.system_audio_kbps = self
+            .system_audio_kbps
+            .clamp(MIN_SYSTEM_AUDIO_KBPS, MAX_SYSTEM_AUDIO_KBPS);
         self
     }
 
@@ -516,6 +666,145 @@ mod tests {
         // Rollout step 1 ships this code inert: the first remote install must
         // be byte-identical on the wire to what is already deployed.
         assert!(!HostConfig::default().sanitized().lossless_tiles_enabled);
+    }
+
+    #[test]
+    fn system_audio_is_off_by_default() {
+        // Rollout step 1 ships this code inert as well: the first remote
+        // install must be byte-identical on the wire to what is already
+        // deployed, and `offered_features` is derived from this flag, so an
+        // off default is what makes the host advertise no audio bit at all.
+        let c = HostConfig::default().sanitized();
+        assert!(!c.system_audio_enabled);
+        assert_eq!(c.system_audio_kbps, 96);
+        assert!(!c.system_audio_redundancy);
+        assert_eq!(c.system_audio_source, AudioSource::Loopback);
+    }
+
+    #[test]
+    fn system_audio_fields_roundtrip_through_json() {
+        let c = HostConfig {
+            system_audio_enabled: true,
+            system_audio_kbps: 128,
+            system_audio_redundancy: true,
+            system_audio_source: AudioSource::TestTone,
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&c).unwrap();
+        let back: HostConfig = serde_json::from_str(&text).unwrap();
+        assert!(back.system_audio_enabled);
+        assert_eq!(back.system_audio_kbps, 128);
+        assert!(back.system_audio_redundancy);
+        assert_eq!(back.system_audio_source, AudioSource::TestTone);
+        assert_eq!(c, back);
+        // The source is an externally-tagged unit variant, i.e. a plain string,
+        // so a human editing host.json by hand writes what they would guess.
+        assert!(
+            text.contains(r#""system_audio_source":"TestTone""#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn system_audio_missing_keys_fall_back_to_safe_defaults() {
+        // An older config file predating audio must default to OFF — the whole
+        // staged rollout depends on a deployed host.json not turning it on.
+        let back: HostConfig = serde_json::from_str(r#"{"udp_port":47990}"#).unwrap();
+        assert!(!back.system_audio_enabled);
+        assert_eq!(back.system_audio_kbps, 96);
+        assert!(!back.system_audio_redundancy);
+        assert_eq!(back.system_audio_source, AudioSource::Loopback);
+    }
+
+    #[test]
+    fn system_audio_kbps_is_clamped_and_zero_is_not_an_off_switch() {
+        let lo = HostConfig {
+            system_audio_kbps: 0,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(
+            lo.system_audio_kbps, MIN_SYSTEM_AUDIO_KBPS,
+            "0 is a typo, not 'silent': system_audio_enabled is the off switch"
+        );
+        let hi = HostConfig {
+            system_audio_kbps: 9_999_999,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(hi.system_audio_kbps, MAX_SYSTEM_AUDIO_KBPS);
+        // A value already in band is the operator's and is left alone.
+        let mid = HostConfig {
+            system_audio_kbps: 160,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(mid.system_audio_kbps, 160);
+    }
+
+    #[test]
+    fn no_in_band_audio_bitrate_can_outgrow_the_wire_payload_cap() {
+        use directdesk_shared::audio::MAX_AUDIO_PAYLOAD;
+
+        // The `const _: () = assert!(..)` above is the real guard — this is the
+        // readable statement of it, swept across the whole clamped range rather
+        // than checked only at the ceiling. Every bitrate `sanitized()` can
+        // produce must yield an access unit `encode_packet` will accept, at
+        // every rate the capture side can hand the encoder.
+        for kbps in MIN_SYSTEM_AUDIO_KBPS..=MAX_SYSTEM_AUDIO_KBPS {
+            for f in crate::audio_capture::AudioFormat::SUPPORTED {
+                let unit = max_access_unit_bytes(kbps, f.sample_rate);
+                assert!(
+                    unit <= MAX_AUDIO_PAYLOAD,
+                    "{kbps} kbps at {} produces a {unit}-byte access unit, over \
+                     the {MAX_AUDIO_PAYLOAD}-byte payload cap: every frame would \
+                     fail encode_packet and the session would run silent",
+                    f.label()
+                );
+            }
+        }
+
+        // And the cap really is the binding constraint rather than trivially
+        // slack: one step past the arithmetic breakeven must not fit, or this
+        // test would keep passing after someone raised the ceiling.
+        assert!(max_access_unit_bytes(353, 44_100) > MAX_AUDIO_PAYLOAD);
+        assert!(max_access_unit_bytes(512, 44_100) > MAX_AUDIO_PAYLOAD);
+    }
+
+    #[test]
+    fn the_lowest_supported_sample_rate_is_the_one_the_cap_is_sized_against() {
+        // `LOWEST_AUDIO_SAMPLE_RATE` is hardcoded because a const assertion
+        // cannot walk `AudioFormat::SUPPORTED`. This is what keeps it honest:
+        // adding a lower capture rate makes an access unit longer, and so
+        // larger at the same bitrate, which would invalidate the assertion
+        // silently.
+        let lowest = crate::audio_capture::AudioFormat::SUPPORTED
+            .iter()
+            .map(|f| f.sample_rate)
+            .min()
+            .expect("the supported set is never empty");
+        assert_eq!(
+            lowest, LOWEST_AUDIO_SAMPLE_RATE,
+            "the capture side's slowest rate moved; re-derive the audio bitrate \
+             ceiling against it"
+        );
+    }
+
+    #[test]
+    fn access_unit_sizing_is_the_aac_frame_arithmetic() {
+        // 1024 samples at 48 kHz is 21.33 ms, so 384 kbps is exactly 1024
+        // bytes. These three fix the formula against hand arithmetic rather
+        // than against itself.
+        assert_eq!(max_access_unit_bytes(384, 48_000), 1_024);
+        assert_eq!(max_access_unit_bytes(96, 48_000), 256);
+        assert_eq!(max_access_unit_bytes(128, 48_000), 342, "rounded up");
+        // A slower rate makes the same unit longer, hence bigger.
+        assert!(max_access_unit_bytes(128, 44_100) > max_access_unit_bytes(128, 48_000));
+        // Degenerate inputs must not divide by zero, underflow or overflow.
+        assert_eq!(max_access_unit_bytes(0, 48_000), 0);
+        assert_eq!(max_access_unit_bytes(0, 0), 0);
+        let _ = max_access_unit_bytes(1, 0);
+        let _ = max_access_unit_bytes(u32::MAX, 44_100);
     }
 
     #[test]
@@ -762,5 +1051,13 @@ mod tests {
         assert!(!c.uac_clickthrough);
         assert_eq!(c.uac_arm_ttl_secs, 20);
         assert!(c.blank_wallpaper_during_session);
+        // The deployed file predates system audio entirely. Every audio key is
+        // therefore absent, and the whole staged rollout rests on absence
+        // meaning OFF — so the shape of the file that is actually on the remote
+        // machine is asserted here rather than only in a synthetic fixture.
+        assert!(!c.system_audio_enabled);
+        assert_eq!(c.system_audio_kbps, 96);
+        assert!(!c.system_audio_redundancy);
+        assert_eq!(c.system_audio_source, AudioSource::Loopback);
     }
 }
