@@ -548,6 +548,21 @@ const TILE_LOSS_CUTOFF: f32 = 0.02;
 /// the generous direction degrades the video this feature exists to improve.
 const TILE_HEADROOM_SHARE: u32 = 4;
 
+/// Whether the link is currently too strained for tiles to spend any budget.
+///
+/// The one predicate [`tile_budget_kbps`] and [`TileThrottle::observe`] must
+/// agree on. `observe` checks this itself before it ever calls
+/// `tile_budget_kbps`, so the two are on the same path today — but they are
+/// two separate copies of the same judgment call, and if they were ever edited
+/// out of step a window one function calls strained could still be granted
+/// budget by the other: exactly the class of bug this design exists to
+/// prevent, just moved from the network to the code that decides whether to
+/// use it.
+#[must_use]
+pub fn tiles_strained(pressure: f32, loss: f32, oversized_keyframe: bool, streaming: bool) -> bool {
+    !streaming || oversized_keyframe || pressure > 0.0 || loss > TILE_LOSS_CUTOFF
+}
+
 /// Bandwidth (kbps) refinement tiles may use over the next window.
 ///
 /// **This is the one hazard the design cannot structurally remove.** Tiles ride
@@ -577,7 +592,7 @@ pub fn tile_budget_kbps(
     cap_kbps: u32,
 ) -> u32 {
     // Any backpressure at all: quinn already had to drop something we offered.
-    if !streaming || oversized_keyframe || pressure > 0.0 || loss > TILE_LOSS_CUTOFF {
+    if tiles_strained(pressure, loss, oversized_keyframe, streaming) {
         return 0;
     }
     let headroom = adaptor_target.saturating_sub(media_kbps) / TILE_HEADROOM_SHARE;
@@ -700,8 +715,7 @@ impl TileThrottle {
         streaming: bool,
         cap_kbps: u32,
     ) -> u32 {
-        let strained =
-            !streaming || oversized_keyframe || pressure > 0.0 || loss > TILE_LOSS_CUTOFF;
+        let strained = tiles_strained(pressure, loss, oversized_keyframe, streaming);
         if strained {
             // Only learn from strain refinement could plausibly have caused,
             // and `pressure` is the signal that actually implicates it: it means
@@ -2293,7 +2307,6 @@ const TILE_POLL_MS: u64 = 15;
 #[derive(Default)]
 struct TileCounters {
     strips_sent: AtomicU64,
-    strips_dropped: AtomicU64,
     bytes_sent: AtomicU64,
     control_sent: AtomicU64,
 }
@@ -2578,14 +2591,13 @@ async fn status_loop(
         pipeline.set_tile_budget_kbps(budget);
 
         let tile_strips = tile_counters.strips_sent.load(Ordering::Relaxed);
-        if tile_strips > 0 || tile_counters.strips_dropped.load(Ordering::Relaxed) > 0 {
+        if tile_strips > 0 {
             // Hazard 6's observable signature, logged together on purpose: if
             // `backpressured` climbs while tile traffic flows and loss stays at
             // zero, tiles are stealing the congestion window from video and the
             // budget above is too generous.
             tracing::info!(
                 tile_strips,
-                tile_dropped = tile_counters.strips_dropped.load(Ordering::Relaxed),
                 tile_kbytes = tile_counters.bytes_sent.load(Ordering::Relaxed) / 1024,
                 tile_spent_kbps,
                 tile_budget_kbps = budget,
@@ -3285,6 +3297,86 @@ mod tests {
             tile_budget_kbps(20_000, 2_000, 0.0, 0.0, false, false, 0),
             0
         );
+    }
+
+    #[test]
+    fn tile_budget_kbps_and_tile_throttle_agree_on_strain() {
+        // `tile_budget_kbps` and `TileThrottle::observe` each decide, on their
+        // own, whether a window is too strained to spend anything. Both now
+        // delegate that call to `tiles_strained`, but they are still two call
+        // sites and could be edited out of step in the future — a window one
+        // judged strained getting a grant from the other is precisely the
+        // hazard the doc comment on `tiles_strained` warns about. Sweep every
+        // combination of the four strain inputs and check both functions
+        // against the shared predicate, which pins them to each other.
+        //
+        // `adaptor_target` / `media_kbps` are fixed so the measured headroom
+        // (4_500 kbps) is always positive: that isolates "zero because
+        // strained" from "zero because there was no headroom to begin with",
+        // which is a different, already-covered case.
+        const ADAPTOR_TARGET: u32 = 20_000;
+        const MEDIA_KBPS: u32 = 2_000;
+        const CAP_KBPS: u32 = 0;
+
+        for &pressure in &[0.0_f32, 0.3] {
+            for &loss in &[0.0_f32, 0.05] {
+                for &oversized_keyframe in &[false, true] {
+                    for &streaming in &[true, false] {
+                        let strained =
+                            tiles_strained(pressure, loss, oversized_keyframe, streaming);
+
+                        let budget = tile_budget_kbps(
+                            ADAPTOR_TARGET,
+                            MEDIA_KBPS,
+                            pressure,
+                            loss,
+                            oversized_keyframe,
+                            streaming,
+                            CAP_KBPS,
+                        );
+                        assert_eq!(
+                            budget == 0,
+                            strained,
+                            "tile_budget_kbps vs tiles_strained mismatch: \
+                             pressure={pressure}, loss={loss}, \
+                             oversized_keyframe={oversized_keyframe}, streaming={streaming}"
+                        );
+
+                        // Fresh throttle per case: only the strain branch is
+                        // under test, not the ceiling's cross-window learning.
+                        let mut throttle = TileThrottle::new();
+                        let throttled = throttle.observe(
+                            0,
+                            ADAPTOR_TARGET,
+                            MEDIA_KBPS,
+                            pressure,
+                            loss,
+                            oversized_keyframe,
+                            streaming,
+                            CAP_KBPS,
+                        );
+                        assert_eq!(
+                            throttled == 0,
+                            strained,
+                            "TileThrottle::observe vs tiles_strained mismatch: \
+                             pressure={pressure}, loss={loss}, \
+                             oversized_keyframe={oversized_keyframe}, streaming={streaming}"
+                        );
+
+                        // And therefore, transitively, the two public
+                        // functions agree with each other on every strain
+                        // combination in the grid.
+                        assert_eq!(
+                            budget == 0,
+                            throttled == 0,
+                            "tile_budget_kbps and TileThrottle::observe disagree: \
+                             pressure={pressure}, loss={loss}, \
+                             oversized_keyframe={oversized_keyframe}, streaming={streaming}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
