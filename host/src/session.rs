@@ -1778,16 +1778,7 @@ fn rebuild_encoder(
         capture.dimensions()
     };
     let info = capture.adapter_info().clone();
-    let enc_cfg = EncoderConfig {
-        width: w,
-        height: h,
-        fps: want.max(1),
-        bitrate_kbps: bitrate_kbps.max(1),
-        gop_seconds: cfg.gop_seconds.max(1),
-        adapter_luid: Some(info.luid),
-        adapter_vendor_id: Some(info.vendor_id),
-        adapter_name: info.short(),
-    };
+    let enc_cfg = EncoderConfig::for_adapter(&info, w, h, want, bitrate_kbps, cfg.gop_seconds);
     MfH264Encoder::new(enc_cfg, Some(capture.device()))
 }
 
@@ -1798,7 +1789,7 @@ type Pipeline = (
     SessionDescription,
 );
 
-fn build_pipeline(cfg: &SessionConfig) -> Result<Pipeline> {
+pub fn build_pipeline(cfg: &SessionConfig) -> Result<Pipeline> {
     let mut capture = DdaCapture::new()?;
     if cfg.idle_repeat_ms == 0 {
         capture.set_repeat_after(Duration::MAX);
@@ -1824,16 +1815,14 @@ fn build_pipeline(cfg: &SessionConfig) -> Result<Pipeline> {
         }
     };
 
-    let enc_cfg = EncoderConfig {
-        width: w,
-        height: h,
-        fps: cfg.target_fps.max(1),
-        bitrate_kbps: cfg.bitrate_kbps.max(1),
-        gop_seconds: cfg.gop_seconds.max(1),
-        adapter_luid: Some(info.luid),
-        adapter_vendor_id: Some(info.vendor_id),
-        adapter_name: info.short(),
-    };
+    let enc_cfg = EncoderConfig::for_adapter(
+        &info,
+        w,
+        h,
+        cfg.target_fps,
+        cfg.bitrate_kbps,
+        cfg.gop_seconds,
+    );
     let encoder = MfH264Encoder::new(enc_cfg, Some(capture.device()))?;
 
     let desc = SessionDescription {

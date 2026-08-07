@@ -133,6 +133,37 @@ rather than through an emulated POSIX shell also avoids some spurious
 locking behavior observed with MSYS/Git-Bash wrappers around the MSVC
 linker on this toolchain.
 
+`LNK1120` is a different animal and looks much more alarming — it is
+`unresolved externals`, which normally means real missing code. If the
+unresolved names look like this:
+
+```
+error LNK2019: unresolved external symbol anon.1318...79.11.llvm.10730987116848275106
+error LNK2019: unresolved external symbol _ZN4core3ptr183drop_in_place$LT$...$GT$...llvm.10730987116848275106
+fatal error LNK1120: 2 unresolved externals
+```
+
+then nothing is missing from the source. `anon.*` and the `.llvm.<hash>`
+suffix are LLVM **codegen-unit-internal** symbols: one object file is
+referencing a symbol another CGU was supposed to emit and did not. That is a
+**stale incremental-compilation cache**, and the usual cause is a build that
+was interrupted partway through (Ctrl-C, a killed background job, a machine
+sleeping mid-link).
+
+Fix by deleting the cache, which is entirely regenerable:
+
+```powershell
+Remove-Item -Recurse -Force target\debug\incremental
+```
+
+Two things worth knowing before you reach for `cargo clean` instead: this
+directory is by far the largest thing in `target\` (23.6 GB when this was
+last hit, against ~47 GB for all of `target\`), so removing just this is both
+the faster fix and the one that reclaims the most disk. And `cargo check`
+will NOT reproduce the failure — `check` never links — so a green
+`cargo check` alongside a failing `cargo test` link step is itself a hint
+that you are looking at this and not at a code error.
+
 ## Building the installer
 
 Once you have release binaries, see [`tools/build-installer.ps1`](../tools/build-installer.ps1)

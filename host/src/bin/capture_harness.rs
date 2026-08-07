@@ -14,10 +14,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use directdesk_host::capture::{CaptureState, DdaCapture};
-use directdesk_host::convert::{bgra_to_nv12, GpuConverter};
-use directdesk_host::mf_encoder::{EncoderConfig, FrameInput, MfH264Encoder};
+use directdesk_host::capture::CaptureState;
+use directdesk_host::config::HostConfig;
+use directdesk_host::convert::bgra_to_nv12;
+use directdesk_host::mf_encoder::FrameInput;
 use directdesk_host::mfinit::MfThread;
+use directdesk_host::session::build_pipeline;
 use directdesk_shared::traits::{Encoder, FrameSource};
 use parking_lot::Mutex;
 
@@ -245,41 +247,29 @@ fn main() -> anyhow::Result<()> {
 fn pipeline(shared: &Arc<Shared>) -> anyhow::Result<()> {
     let _mf = MfThread::enter().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut capture = DdaCapture::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-    capture.set_repeat_after(Duration::from_millis(33));
+    // Same knobs production uses, taken from the same place production takes
+    // them — not a second, hand-tuned copy that quietly drifts out of date.
+    // capture/convert/encode come from `build_pipeline` itself rather than a
+    // re-implementation, for the same reason: this harness is the instrument
+    // the DXGI dirty-rect check in docs/TEST_REPORT.md relies on, and an
+    // instrument that measures a pipeline nobody ships is worse than no
+    // instrument. See docs/TEST_REPORT.md for the values this replaced
+    // (idle repeat 33 ms, fps 60, bitrate 15000 kbps).
+    let cfg = HostConfig::default().sanitized().pipeline();
+    let (mut capture, mut converter, mut encoder, desc) =
+        build_pipeline(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (w, h) = capture.dimensions();
-    let info = capture.adapter_info().clone();
-
-    let converter = match GpuConverter::new(capture.device(), capture.context(), w, h) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::warn!("GPU converter unavailable ({e}); CPU BT.709 path");
-            None
-        }
-    };
-
-    let mut encoder = MfH264Encoder::new(
-        EncoderConfig {
-            width: w,
-            height: h,
-            fps: 60,
-            bitrate_kbps: 15_000,
-            gop_seconds: 4,
-            adapter_luid: Some(info.luid),
-            adapter_vendor_id: Some(info.vendor_id),
-            adapter_name: info.short(),
-        },
-        Some(capture.device()),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut decoder = MfH264Decoder::new(w, h).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let gpu_texture_input = converter.is_some() && encoder.accepts_textures();
+    // `build_pipeline` already computed this (`converter.is_some() &&
+    // encoder.accepts_textures()`) to fill in `desc.gpu_encode_input`; read it
+    // back off the description instead of recomputing it.
+    let gpu_texture_input = desc.gpu_encode_input;
     {
         let mut hud = shared.hud.lock();
-        hud.adapter = format!("{} (LUID {:#x})", info.name, info.luid);
-        hud.output = info.output_name.clone();
+        hud.adapter = format!("{} (LUID {:#x})", desc.adapter, desc.adapter_luid);
+        hud.output = desc.output.clone();
         hud.encoder = encoder.describe();
         hud.decoder = decoder.describe();
         hud.convert_path = if converter.is_some() {
@@ -298,7 +288,6 @@ fn pipeline(shared: &Arc<Shared>) -> anyhow::Result<()> {
         hud.best_mae = f32::MAX;
     }
 
-    let mut converter = converter;
     let mut gpu_ok = converter.is_some();
     let mut cpu_bgra = Vec::new();
     let mut cpu_nv12 = Vec::new();

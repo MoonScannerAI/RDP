@@ -30,6 +30,8 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
+use crate::capture::AdapterInfo;
+
 /// What the encoder is actually running on. Reported honestly by `describe()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderPath {
@@ -241,6 +243,39 @@ impl Default for EncoderConfig {
             adapter_luid: None,
             adapter_vendor_id: None,
             adapter_name: String::new(),
+        }
+    }
+}
+
+impl EncoderConfig {
+    /// The config for encoding `width`x`height` on the adapter `info`
+    /// describes, at `fps`/`bitrate_kbps`/`gop_seconds`.
+    ///
+    /// Centralizes what used to be three independently hand-copied struct
+    /// literals (`session::build_pipeline`, `session::rebuild_encoder`, and
+    /// `capture_harness`), all of which populate `adapter_luid`,
+    /// `adapter_vendor_id` and `adapter_name` from an [`AdapterInfo`] the same
+    /// way. `fps`/`bitrate_kbps`/`gop_seconds` are floored at 1 here — every
+    /// call site independently applied the same `.max(1)` before this existed,
+    /// since `0` in any of the three is a divide-by-zero or a meaningless
+    /// "never" further down the pipeline.
+    pub fn for_adapter(
+        info: &AdapterInfo,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+        gop_seconds: u32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            fps: fps.max(1),
+            bitrate_kbps: bitrate_kbps.max(1),
+            gop_seconds: gop_seconds.max(1),
+            adapter_luid: Some(info.luid),
+            adapter_vendor_id: Some(info.vendor_id),
+            adapter_name: info.short(),
         }
     }
 }
