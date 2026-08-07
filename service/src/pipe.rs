@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use directdesk_shared::protocol::{decode_strict, parse_frame_len};
+use directdesk_shared::protocol::{decode_framed, encode_framed_capped};
 use directdesk_shared::svc_ipc::{SvcRequest, SvcResponse, MAX_IPC_MSG};
 use windows::Win32::Foundation::{
     LocalFree, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, MAX_PATH,
@@ -71,17 +71,7 @@ const MAX_FRAME: usize = 4 + MAX_IPC_MSG;
 /// Serialize a response as `u32-le length || postcard body`, capped at
 /// [`MAX_IPC_MSG`].
 pub fn encode_frame<T: serde::Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
-    let body = postcard::to_stdvec(msg)?;
-    if body.len() > MAX_IPC_MSG {
-        anyhow::bail!(
-            "outgoing message {} bytes exceeds cap {MAX_IPC_MSG}",
-            body.len()
-        );
-    }
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&body);
-    Ok(out)
+    Ok(encode_framed_capped(msg, MAX_IPC_MSG)?)
 }
 
 /// Parse one complete frame (prefix included) into a request.
@@ -89,19 +79,7 @@ pub fn encode_frame<T: serde::Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
 /// Rejects: short frames, zero-length bodies, bodies over [`MAX_IPC_MSG`],
 /// prefix/body length disagreement, unknown enum variants, trailing bytes.
 pub fn decode_request(frame: &[u8]) -> anyhow::Result<SvcRequest> {
-    if frame.len() < 4 {
-        anyhow::bail!("short frame: {} bytes", frame.len());
-    }
-    let prefix: [u8; 4] = frame[..4].try_into().expect("checked length");
-    let declared = parse_frame_len(prefix, MAX_IPC_MSG)?;
-    let body = &frame[4..];
-    if body.len() != declared {
-        anyhow::bail!(
-            "frame length mismatch: prefix says {declared}, body is {}",
-            body.len()
-        );
-    }
-    Ok(decode_strict::<SvcRequest>(body)?)
+    Ok(decode_framed::<SvcRequest>(frame, MAX_IPC_MSG)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +533,7 @@ fn wait_io(
 mod tests {
     use super::*;
     use crate::dispatch::mock::harness;
+    use directdesk_shared::protocol::decode_strict;
     use std::time::Duration;
 
     use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
@@ -607,10 +586,7 @@ mod tests {
         fn request(&self, req: SvcRequest) -> anyhow::Result<SvcResponse> {
             let frame = encode_frame(&req)?;
             let reply = self.send_raw(&frame)?;
-            anyhow::ensure!(reply.len() >= 4, "short reply");
-            let declared = parse_frame_len(reply[..4].try_into().unwrap(), MAX_IPC_MSG)?;
-            anyhow::ensure!(reply.len() - 4 == declared, "reply length mismatch");
-            Ok(decode_strict::<SvcResponse>(&reply[4..])?)
+            Ok(decode_framed::<SvcResponse>(&reply, MAX_IPC_MSG)?)
         }
     }
 

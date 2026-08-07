@@ -27,13 +27,13 @@ pub const MIN_BITRATE_KBPS: u32 = 300;
 /// Highest bitrate the UI will let a user pin the encoder to.
 pub const MAX_BITRATE_KBPS: u32 = 60_000;
 
+/// Highest frame rate the encoder is ever asked for.
+pub use directdesk_shared::protocol::MAX_TARGET_FPS;
 /// Lowest frame rate a *config file* may express. Deliberately 1, not the UI's
 /// user-facing floor of 10: this bound only exists to keep a hand-edited `0`
 /// from reaching a divisor. The floor a person can actually pick is a UI
 /// concern and lives in the settings panel.
-pub const MIN_TARGET_FPS: u32 = 1;
-/// Highest frame rate the encoder is ever asked for.
-pub const MAX_TARGET_FPS: u32 = 240;
+pub use directdesk_shared::protocol::MIN_TARGET_FPS;
 
 /// Bounds for the lossless-tile knobs (see the fields on [`HostConfig`]).
 ///

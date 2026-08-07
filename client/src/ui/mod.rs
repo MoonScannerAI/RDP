@@ -47,6 +47,13 @@ const ELEVATION_BANNER_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// enough that a stray arm doesn't stay live for an unrelated later prompt.
 const DEFAULT_ELEVATION_TTL_SECS: u32 = 20;
 
+/// FPS choices offered by the picker, in display order. `0` means "Auto —
+/// follow whatever the host is already running at"; every other entry must
+/// fall within `UI_MIN_TARGET_FPS..=MAX_TARGET_FPS` (see the test below) so
+/// the picker can never offer a value the config's own sanitizing would
+/// immediately clamp away.
+pub const FPS_CHOICES: [u32; 8] = [0, 60, 45, 30, 24, 20, 15, 10];
+
 /// How the frame source was created, for honest labelling in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceMode {
@@ -774,7 +781,7 @@ impl ClientApp {
             let combo = egui::ComboBox::from_id_salt("preferred_fps")
                 .selected_text(fps_label(current_fps))
                 .show_ui(ui, |ui| {
-                    for fps in [0, 60, 45, 30, 24, 20, 15, 10] {
+                    for fps in FPS_CHOICES {
                         if ui
                             .selectable_label(current_fps == fps, fps_label(fps))
                             .clicked()
@@ -882,7 +889,7 @@ impl ClientApp {
                     let current = self.config.quality_mode;
                     let mut chosen = current;
                     egui::ComboBox::from_id_salt("quality")
-                        .selected_text(quality_label(current))
+                        .selected_text(current.label())
                         .show_ui(ui, |ui| {
                             for mode in [
                                 QualityMode::TextDesktop,
@@ -890,10 +897,7 @@ impl ClientApp {
                                 QualityMode::Motion,
                                 QualityMode::LowBandwidth,
                             ] {
-                                if ui
-                                    .selectable_label(current == mode, quality_label(mode))
-                                    .clicked()
-                                {
+                                if ui.selectable_label(current == mode, mode.label()).clicked() {
                                     chosen = mode;
                                 }
                             }
@@ -1493,15 +1497,6 @@ fn released_notice() -> String {
     format!("Input released ({RELEASE_CHORD}) — click Capture input or press the chord to resume")
 }
 
-pub fn quality_label(mode: QualityMode) -> &'static str {
-    match mode {
-        QualityMode::TextDesktop => "Text / desktop",
-        QualityMode::Balanced => "Balanced",
-        QualityMode::Motion => "Motion",
-        QualityMode::LowBandwidth => "Low bandwidth",
-    }
-}
-
 /// Kept free of egui so it's unit-testable without a context.
 pub fn fps_label(fps: u32) -> String {
     if fps == 0 {
@@ -1638,6 +1633,18 @@ pub fn should_reassert_fps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use directdesk_shared::protocol::{MAX_TARGET_FPS, UI_MIN_TARGET_FPS};
+
+    #[test]
+    fn fps_choices_are_auto_or_within_the_ui_range() {
+        for fps in FPS_CHOICES {
+            assert!(
+                fps == 0 || (UI_MIN_TARGET_FPS..=MAX_TARGET_FPS).contains(&fps),
+                "fps choice {fps} is neither Auto (0) nor within \
+                 UI_MIN_TARGET_FPS..=MAX_TARGET_FPS"
+            );
+        }
+    }
 
     #[test]
     fn every_quality_mode_has_a_label() {
@@ -1647,7 +1654,7 @@ mod tests {
             QualityMode::Motion,
             QualityMode::LowBandwidth,
         ] {
-            assert!(!quality_label(mode).is_empty());
+            assert!(!mode.label().is_empty());
         }
     }
 

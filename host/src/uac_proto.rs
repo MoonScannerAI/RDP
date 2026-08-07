@@ -12,10 +12,8 @@
 //! and disconnects on any mismatch, so the pipe cannot be driven by a process
 //! that merely guessed the (already ACL-restricted) pipe name.
 
-use directdesk_shared::protocol::{
-    decode_strict, encode_framed, parse_frame_len, InputMsg, MAX_CONTROL_MSG,
-};
-use directdesk_shared::{Error, Result};
+use directdesk_shared::protocol::{decode_framed, encode_framed, InputMsg, MAX_CONTROL_MSG};
+use directdesk_shared::Result;
 use serde::{Deserialize, Serialize};
 
 /// Hard cap on a single UAC wire frame. Every message here is tiny (an auth
@@ -58,22 +56,7 @@ pub fn encode(msg: &UacWireMsg) -> Result<Vec<u8>> {
 /// with the body length, unknown variants, and trailing bytes — the same strict
 /// contract the network decoder enforces.
 pub fn decode_frame(frame: &[u8]) -> Result<UacWireMsg> {
-    if frame.len() < 4 {
-        return Err(Error::Invalid(format!(
-            "short UAC frame: {} bytes",
-            frame.len()
-        )));
-    }
-    let prefix: [u8; 4] = frame[..4].try_into().expect("checked length");
-    let declared = parse_frame_len(prefix, MAX_UAC_MSG)?;
-    let body = &frame[4..];
-    if body.len() != declared {
-        return Err(Error::Invalid(format!(
-            "UAC frame length mismatch: prefix says {declared}, body is {}",
-            body.len()
-        )));
-    }
-    decode_strict::<UacWireMsg>(body)
+    decode_framed::<UacWireMsg>(frame, MAX_UAC_MSG)
 }
 
 /// A window rectangle in virtual-desktop pixels, as `GetWindowRect` reports it.

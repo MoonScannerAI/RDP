@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use directdesk_shared::protocol::{QualityMode, DEFAULT_UDP_PORT};
+use directdesk_shared::protocol::{QualityMode, DEFAULT_UDP_PORT, MAX_TARGET_FPS, MIN_TARGET_FPS};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +132,7 @@ impl ClientConfig {
         // 0 is the sentinel for "Auto" and must pass through untouched; any
         // other hand-edited value gets pulled into a sane range.
         if self.preferred_fps != 0 {
-            self.preferred_fps = self.preferred_fps.clamp(5, 240);
+            self.preferred_fps = self.preferred_fps.clamp(MIN_TARGET_FPS, MAX_TARGET_FPS);
         }
         // One-time migration: a config written before integer scales existed
         // has `auto_snap_1to1: true` and no opinion on `auto_snap_scale` (it
@@ -249,12 +249,16 @@ mod tests {
 
     #[test]
     fn preferred_fps_is_clamped_to_a_sane_range() {
+        // The floor is MIN_TARGET_FPS (1), not the UI picker's floor (10): this
+        // clamp only exists to keep a hand-edited config's arithmetic safe, so
+        // a hand-edited 1..=4 (unreachable from the picker, which never offers
+        // less than 10) passes through unclamped rather than being pulled up.
         let low = ClientConfig {
             preferred_fps: 1,
             ..Default::default()
         }
         .sanitized();
-        assert_eq!(low.preferred_fps, 5);
+        assert_eq!(low.preferred_fps, 1);
 
         let high = ClientConfig {
             preferred_fps: 1_000,

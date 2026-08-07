@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use directdesk_shared::crypto::storage::SecretStore;
 use directdesk_shared::crypto::HostIdentity;
-use directdesk_shared::protocol::QualityMode;
+use directdesk_shared::protocol::{QualityMode, UI_MIN_TARGET_FPS};
 
 use super::AppShared;
 use crate::config::{HostConfig, MAX_BITRATE_KBPS, MAX_TARGET_FPS, MIN_BITRATE_KBPS};
@@ -584,7 +584,7 @@ impl HostApp {
                         ui.end_row();
 
                         ui.strong("Quality");
-                        ui.monospace(status.quality_mode.map_or("—", quality_label));
+                        ui.monospace(status.quality_mode.map_or("—", QualityMode::label));
                         ui.strong("Throughput");
                         ui.monospace(format!("{} kbps (1s)", status.delivery.throughput_kbps()));
                         ui.end_row();
@@ -651,7 +651,7 @@ impl HostApp {
                 ui.horizontal(|ui| {
                     ui.label("Quality mode");
                     egui::ComboBox::from_id_salt("quality")
-                        .selected_text(quality_label(self.edit.quality))
+                        .selected_text(self.edit.quality.label())
                         .show_ui(ui, |ui| {
                             for mode in [
                                 QualityMode::TextDesktop,
@@ -659,11 +659,7 @@ impl HostApp {
                                 QualityMode::Motion,
                                 QualityMode::LowBandwidth,
                             ] {
-                                ui.selectable_value(
-                                    &mut self.edit.quality,
-                                    mode,
-                                    quality_label(mode),
-                                );
+                                ui.selectable_value(&mut self.edit.quality, mode, mode.label());
                             }
                         });
                 });
@@ -671,7 +667,7 @@ impl HostApp {
                     ui.label("Max frame rate");
                     ui.add(
                         egui::DragValue::new(&mut self.edit.fps)
-                            .range(10..=MAX_TARGET_FPS)
+                            .range(UI_MIN_TARGET_FPS..=MAX_TARGET_FPS)
                             .suffix(" fps"),
                     );
                     ui.label(
@@ -734,15 +730,6 @@ impl HostApp {
 // Formatting
 // ---------------------------------------------------------------------------
 
-pub fn quality_label(mode: QualityMode) -> &'static str {
-    match mode {
-        QualityMode::TextDesktop => "Text / desktop",
-        QualityMode::Balanced => "Balanced",
-        QualityMode::Motion => "Motion",
-        QualityMode::LowBandwidth => "Low bandwidth",
-    }
-}
-
 pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs >= 3_600 {
@@ -794,7 +781,7 @@ mod tests {
             QualityMode::Motion,
             QualityMode::LowBandwidth,
         ] {
-            assert!(!quality_label(m).is_empty());
+            assert!(!m.label().is_empty());
         }
     }
 
