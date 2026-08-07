@@ -112,14 +112,24 @@ const CONSTRAINED: usize = 2;
 /// hundredths. Refinement must not cost video frames; two percent is the
 /// "small epsilon" that allows for a frame straddling the end of the run.
 ///
-/// **This is currently a tripwire, not slack.** The constrained row presents 840
-/// frames against a control's 856, and the floor is 839 — one frame of margin.
-/// The number has been eroding as the throttle has got better at tracking the
-/// link's real capacity (9 refused frames under the raw policy, then 10, 13, and
-/// now 16), because a ceiling that sits close to the damage threshold lands on it
-/// harder when it finally crosses. Do not widen this constant to make room: the
-/// next revision of the throttle needs to attack the overshoot *count*, and this
-/// is the assertion that will say whether it did.
+/// **This is currently a tripwire with zero margin.** The constrained row
+/// presents 839 frames against a control's 856, and the floor is exactly 839. The
+/// number has eroded steadily as the throttle got better at tracking the link's
+/// real capacity — 9 refused frames under the raw policy, then 10, 13, 16 — since
+/// a ceiling that sits close to the damage threshold lands on it harder when it
+/// finally crosses. Modelling whole strips took it to 17.
+///
+/// Two things follow, and they point in opposite directions:
+///
+/// * Do **not** widen this constant to make room. The next revision of the
+///   throttle needs to attack the overshoot *count*, and this is the assertion
+///   that will say whether it did.
+/// * Do not read a one-frame movement here as signal either. Swept across the
+///   realistic 1-4 KiB strip band the same configuration presents 840 / 839 /
+///   844 — the count is now sensitive to when a strip happens to land relative
+///   to a frame, at about the same magnitude as the effect being measured. It is
+///   a bound worth keeping and a poor instrument for comparing policies; the mean
+///   adaptor target is the instrument for that.
 const FRAME_EPSILON_PCT: usize = 2;
 
 /// 60 ms one way, no jitter, `loss_pct` datagram loss.
@@ -370,6 +380,36 @@ fn refinement_actually_ran() -> Result<()> {
 /// link is still a struggling link. This states that positively: on the 3% row
 /// most windows grant nothing, and the total refinement traffic is an order of
 /// magnitude below the clean row's.
+///
+/// # What the learned ceiling costs on top, and where it goes
+///
+/// This row is the one where the throttle can only lose: the link's loss is
+/// nothing to do with refinement (zero backpressure, and a video path
+/// bit-identical to tiles being switched off), so every kbps the ceiling
+/// withholds is work not done for no benefit. The measured deficit against the
+/// unbounded policy is 1 452 of 4 428 kbps-windows — a third — and the whole of
+/// it lands in **two** windows:
+///
+/// | window | raw gap | learned | deficit | why |
+/// |--------|---------|---------|---------|-----|
+/// | 0 | 1 768 | 500 | 1 268 (87%) | cold start: nothing measured yet |
+/// | 3 | 748 | 564 | 184 (13%) | creep-rate growth after a revoked window |
+/// | 4.. | equal | equal | 0 | the gap collapses below the ceiling |
+///
+/// Neither is the ceiling being wrong. Window 0 is the throttle declining to
+/// spend 1 768 kbps on a luxury before a single congestion measurement exists,
+/// which is the entire point of a floor. Window 3 is the price of the rule that
+/// a window which was granted nothing may grow the ceiling by a *creep* and not
+/// a *step* — the concession keeps a chronically strained link from being pinned
+/// at the floor forever, while refusing to let it ratchet at full speed on no
+/// evidence back to the unvalidated raw gap. 184 kbps-windows, or 23 KB of 540,
+/// is a cheap price for that and this test pins it there.
+///
+/// Parity arrives at window 4 and holds for the remaining 25 — and note *why*:
+/// not because the ceiling caught up (it stops at 564) but because loss drives
+/// the adaptor down to its floor, which collapses the headroom gap to ~143 kbps,
+/// well under the ceiling. On this row the throttle stops being the binding
+/// constraint almost immediately, which is the correct outcome.
 #[test]
 fn a_lossy_link_gets_almost_no_refinement() -> Result<()> {
     let lossy = run(&CONDITIONS[1], TileSim::on(CONDITIONS[1].link_kbps))?;
@@ -409,8 +449,10 @@ fn a_lossy_link_gets_almost_no_refinement() -> Result<()> {
     // where the budget was never what limited refinement.
     //
     // Before the attribution fix, every lossy window read as a refusal, the
-    // ceiling never left TILE_CEILING_MIN_KBPS for the whole run, and this row
-    // moved 355 KB against the raw policy's 540. It now moves 385.
+    // ceiling never left TILE_CEILING_MIN_KBPS for the whole run and this row
+    // moved 355 KB against the raw policy's 540. It now reaches 564 and moves
+    // 362 KB — see the deficit analysis below for why that is nearly all cold
+    // start rather than throttling.
     let raw = run(&CONDITIONS[1], TileSim::raw_gap(CONDITIONS[1].link_kbps))?;
     let peak = windows.iter().map(|w| w.ceiling_kbps).max().unwrap_or(0);
     assert!(
@@ -419,32 +461,103 @@ fn a_lossy_link_gets_almost_no_refinement() -> Result<()> {
          whose loss refinement did not cause"
     );
 
-    // And the residual is now exactly the opening slow start, nothing else:
-    // every window after the first grants precisely what the unbounded policy
-    // would. That first window is the throttle refusing to spend 1 768 kbps on
-    // refinement before a single congestion measurement exists, which is the
-    // behaviour, not a defect.
+    // The residual is a bounded *prefix*, not a permanent tax. Walk both runs
+    // window by window and find the point from which the learned policy grants
+    // exactly what the unbounded one does, for the whole rest of the run.
     let raw_windows = raw.host().tile_windows();
     assert_eq!(windows.len(), raw_windows.len());
-    for (i, (learned, unbounded)) in windows.iter().zip(raw_windows).enumerate().skip(1) {
-        assert_eq!(
-            learned.budget_kbps, unbounded.budget_kbps,
-            "window {i} at {} ms: the ceiling narrowed the grant to {} where the \
-             raw policy gave {} — the throttle is still costing work on a link \
-             it does not limit",
-            learned.at_ms, learned.budget_kbps, unbounded.budget_kbps,
+    let mut deficits: Vec<i64> = Vec::with_capacity(windows.len());
+    let mut granted: i64 = 0;
+    for (learned, unbounded) in windows.iter().zip(raw_windows) {
+        granted += i64::from(unbounded.budget_kbps);
+        deficits.push(i64::from(unbounded.budget_kbps) - i64::from(learned.budget_kbps));
+        assert!(
+            learned.budget_kbps <= unbounded.budget_kbps,
+            "at {} ms the ceiling granted {} where the raw gap granted {} — a \
+             ceiling may only ever narrow",
+            learned.at_ms,
+            learned.budget_kbps,
+            unbounded.budget_kbps
         );
     }
-    // Which bounds the whole cost of the ceiling on this row to one window.
-    let first_window_deficit =
-        u64::from(raw_windows[0].budget_kbps - windows[0].budget_kbps) * 1_000 / 8;
-    let total_deficit = raw.host().tile_stats().tile_bytes_sent
-        - lossy.host().tile_stats().tile_bytes_sent;
+    let parity_from = deficits
+        .iter()
+        .rposition(|&d| d != 0)
+        .map_or(0, |last| last + 1);
     assert!(
-        total_deficit <= first_window_deficit,
-        "refinement did {total_deficit} bytes less work than the raw policy, \
-         more than the {first_window_deficit} the opening slow start accounts \
-         for"
+        parity_from <= 4,
+        "the learned policy did not reach parity with the raw gap until window \
+         {parity_from} of {}; the ramp is supposed to be a short prefix, not a \
+         standing cost",
+        windows.len()
+    );
+    // Two windows carry the whole of it, and they are two different things.
+    assert_eq!(
+        deficits.iter().filter(|&&d| d != 0).count(),
+        2,
+        "the deficit is spread over {:?}; it should be the opening slow start \
+         plus exactly one creep-rate recovery window",
+        deficits
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d != 0)
+            .collect::<Vec<_>>()
+    );
+    let total: i64 = deficits.iter().sum();
+    let opening = deficits[0];
+    let ramp = total - opening;
+
+    // 1. The opening slow start: 1 768 kbps of raw gap against a 500 kbps floor,
+    //    because nothing has been measured yet. That is the design and it is
+    //    ~87% of the whole deficit.
+    assert!(
+        opening * 100 >= total * 80,
+        "the opening slow start is only {opening} of a {total} kbps-window \
+         deficit; something other than the cold start has become the cost"
+    );
+    // 2. The creep-rate recovery. A strained window grants nothing and so spends
+    //    nothing, and the throttle concedes growth on the window after it rather
+    //    than pinning the ceiling forever — but that concession is evidence-free,
+    //    so it buys a 64 kbps creep and not a 500 kbps step. On this row that
+    //    costs exactly one window: window 3 grants 564 where the raw gap grants
+    //    748. Under step-rate growth the ceiling would have been 1 000 there and
+    //    the two would have matched.
+    //
+    //    So the price of refusing to ratchet on no evidence is 184 kbps-windows
+    //    out of 4 428, or 23 KB of the 540 KB the raw policy moves. It is a good
+    //    trade: the alternative is that a link which strains every other window
+    //    climbs at the full step with nothing supporting it, and arrives back at
+    //    the unvalidated raw gap the ceiling exists to bound.
+    assert!(
+        ramp * 100 < granted * 10,
+        "the creep-rate ramp cost {ramp} of {granted} kbps-windows granted, over \
+         10% — at that price the concession should buy a step rather than a \
+         creep, or be refused outright"
+    );
+    // And the total, so the headline number cannot drift unnoticed. It is a
+    // third of the raw policy's work, but that third is overwhelmingly the cold
+    // start, not the learned ceiling being wrong.
+    assert!(
+        total * 100 <= granted * 35,
+        "the learned ceiling cost {total} of {granted} kbps-windows granted"
+    );
+
+    // None of this may turn on the strip size, which is a property of the screen
+    // rather than of the throttle. Sweep the realistic 1-4 KiB band.
+    let mut volumes = Vec::new();
+    for bytes in [1_024u64, 2_048, 4_096] {
+        let mut tiles = TileSim::on(CONDITIONS[1].link_kbps);
+        tiles.tile_strip_bytes = bytes;
+        volumes.push(run(&CONDITIONS[1], tiles)?.host().tile_stats().tile_bytes_sent);
+    }
+    let (lo, hi) = (
+        *volumes.iter().min().expect("swept"),
+        *volumes.iter().max().expect("swept"),
+    );
+    assert!(
+        (hi - lo) * 100 < hi * 2,
+        "refinement volume swung {lo}..{hi} bytes across a 1-4 KiB strip size; \
+         this row's conclusions depend on a modelling constant"
     );
     Ok(())
 }
@@ -586,9 +699,18 @@ fn a_quiet_screen_is_free_and_parks_the_ceiling_above_its_own_demand() -> Result
 /// | v1 `TileThrottle`, ungated step     | 6 404 | 5 421 | 4 310   | 10      | 3/29     |
 /// | v2 + evidence gate on the increase  | 6 433 | 6 060 | 4 171   | 13      | 3/29     |
 /// | v3 + ssthresh and attribution       | 6 698 | 5 310 | 4 334   | 16      | 3/29     |
+/// | v4 + creep on the concession        | 6 698 | 5 310 | 4 334   | 17      | 3/29     |
 ///
 /// Against a tiles-OFF control that means 11 258. So v3 holds 59% of the control
 /// where raw holds 56% — real, measurable, and nowhere near closed.
+///
+/// v4 is bit-identical to v3 on this row and that is expected: the creep-on-a
+/// -concession rule only fires on a window that was granted nothing, and the only
+/// such windows here are the three recovery windows after an overshoot — where
+/// the ceiling already sits *at* `safe` and was creeping anyway. The rule bites
+/// on the 3% lossy row instead; see [`a_lossy_link_gets_almost_no_refinement`].
+/// The refused-frame count moves 16 → 17 purely because refinement now emits
+/// whole 2 KiB strips rather than a divisible byte stream, which is burstier.
 ///
 /// The three fixes and what each bought:
 ///
@@ -1171,6 +1293,60 @@ fn a_revoked_window_does_not_stall_the_ceiling() {
     );
 }
 
+/// The concession to a window that was granted nothing buys a *creep*, never a
+/// *step*.
+///
+/// This is the narrow case the rule turns on, and it is the 3% lossy row's
+/// window 3 exactly. A loss-only strained window revokes the budget and marks
+/// the next window unjudgeable — but, because refinement is not implicated in
+/// plain loss, it leaves `safe_kbps` alone. So the recovery window arrives with
+/// the ceiling still *below* the known-safe level, where the fast ramp would
+/// normally apply, and with no evidence whatsoever that the link would carry
+/// more.
+///
+/// Granting a full step there is how a chronically lossy link ratchets its
+/// ceiling back up to the raw unvalidated gap the ceiling exists to bound: every
+/// other window is strained, so every other window is unjudgeable, so every
+/// other window grows for free. A creep keeps the concession — the link is not
+/// pinned at the floor — while making it cost twelve times as long to reach a
+/// level nothing has justified.
+#[test]
+fn a_recovery_window_buys_a_creep_not_a_step() {
+    const TARGET: u32 = 8_000;
+    const MEDIA: u32 = 1_000;
+    let mut t = TileThrottle::new();
+
+    // A lossy window: strained, so the budget goes — but with no backpressure
+    // the ceiling is untouched and `safe` is never set, so the ceiling is still
+    // in nominal fast-ramp territory.
+    assert_eq!(
+        t.observe(TILE_CEILING_MIN_KBPS, TARGET, MEDIA, 0.0, 0.05, false, true, 0),
+        0
+    );
+    assert_eq!(t.ceiling(), TILE_CEILING_MIN_KBPS, "loss alone must not learn");
+
+    // The recovery window. It binds, and it is unjudgeable, so it grows — by a
+    // creep, because "you had no chance to prove yourself" is a concession and
+    // not proof.
+    let granted = t.observe(0, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
+    assert_eq!(
+        t.ceiling(),
+        TILE_CEILING_MIN_KBPS + TILE_CEILING_CREEP_KBPS,
+        "a window with no evidence behind it took the full step"
+    );
+    assert_eq!(granted, t.ceiling());
+
+    // Whereas a window that did spend its grant, on the same untouched `safe`,
+    // takes the step: the fast ramp is still available, it just has to be earned.
+    let mut u = TileThrottle::new();
+    u.observe(TILE_CEILING_MIN_KBPS, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
+    assert_eq!(
+        u.ceiling(),
+        TILE_CEILING_MIN_KBPS + TILE_CEILING_STEP_KBPS,
+        "evidence must still buy the fast ramp, or this is a blanket slowdown"
+    );
+}
+
 /// Packet loss with no backpressure must not lower the learned ceiling.
 ///
 /// The two signals mean different things and only one of them implicates
@@ -1533,11 +1709,13 @@ fn matrix_summary() -> Result<()> {
     for cond in CONDITIONS {
         let (off, on) = pair(cond)?;
         let raw = run(cond, TileSim::raw_gap(cond.link_kbps))?;
+        let div = run(cond, TileSim::on(cond.link_kbps).divisible())?;
         let wild = unthrottled(cond)?;
         eprintln!("--- {} (link {} kbps) ---", cond.label, cond.link_kbps);
         eprintln!("  off : {}", summary(&off));
         eprintln!("  raw : {}", summary(&raw));
         eprintln!("  on  : {}", summary(&on));
+        eprintln!("  div : {}", summary(&div));
         eprintln!("  wild: {}", summary(&wild));
 
         let windows = on.host().tile_windows();

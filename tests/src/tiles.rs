@@ -168,6 +168,32 @@ pub struct TileSim {
     ///
     /// [`TileThrottle`]: directdesk_host::net::TileThrottle
     pub tile_supply_kbps: u32,
+    /// Size of one refinement strip in bytes — the granule refinement can
+    /// actually send. `0` models a perfectly divisible byte stream, which is
+    /// what this harness used to assume and what nothing in production can do.
+    ///
+    /// # Why this is not a detail
+    ///
+    /// A strip is indivisible: `host::session` compresses a run of up to four
+    /// 64x64 tiles and hands it to the wire whole or not at all. So a per-pass
+    /// allowance smaller than one strip buys *nothing*, not a fraction of a
+    /// strip — and at the 500 kbps floor with 60 fps passes the allowance is
+    /// 1 041 bytes against a text strip of 1-4 KiB.
+    ///
+    /// That is a livelock, and it was a real one: every strip was refused, the
+    /// pass abandoned the rest of its plan, the next pass re-planned the same
+    /// strip, nothing was ever sent, `spent_kbps` stayed at zero, and the
+    /// throttle's `used_its_grant` gate therefore never let the ceiling leave
+    /// the floor. The fix is a token bucket (`session::tile_bucket_cap`) that
+    /// accumulates the allowance across passes until a strip fits, capped at one
+    /// worst-case strip plus one pass so a long idle stretch cannot hoard a
+    /// burst.
+    ///
+    /// [`TileEngine::end_tick`] reproduces both halves — the quantisation and
+    /// the bucket — because modelling only the first would reproduce a bug the
+    /// host no longer has, and modelling neither leaves the entire low-budget
+    /// regime untested.
+    pub tile_strip_bytes: u64,
 }
 
 impl TileSim {
@@ -181,6 +207,7 @@ impl TileSim {
             tile_max_kbps: DEFAULT_TILE_MAX_KBPS,
             link_burst_ms: DEFAULT_LINK_BURST_MS,
             tile_supply_kbps: 0,
+            tile_strip_bytes: DEFAULT_STRIP_BYTES,
         }
     }
 
@@ -222,7 +249,32 @@ impl TileSim {
             ..Self::on(link_kbps)
         }
     }
+
+    /// The same row with refinement modelled as a divisible byte stream rather
+    /// than as whole strips.
+    ///
+    /// Only useful for measuring what the strip granule costs: it is not a
+    /// configuration anything can be in, since a strip is compressed and sent
+    /// whole or not at all.
+    #[must_use]
+    pub fn divisible(self) -> Self {
+        Self {
+            tile_strip_bytes: 0,
+            ..self
+        }
+    }
 }
+
+/// Typical encoded size of one refinement strip, in bytes.
+///
+/// A strip is up to four 64x64 tiles of deflated BGR. `MAX_STRIP_ENCODED` is
+/// ~49 KiB, but that is the worst case — every row incompressible — and text,
+/// which is what refinement exists for, deflates to 1-4 KiB. 2 KiB is the middle
+/// of that band. [`a_lossy_link_gets_almost_no_refinement`] sweeps the band to
+/// check nothing here turns on the exact value.
+///
+/// [`a_lossy_link_gets_almost_no_refinement`]: ../../tiles_netsim/index.html
+pub const DEFAULT_STRIP_BYTES: u64 = 2_048;
 
 /// Mirrors `HostConfig::lossless_tile_max_kbps`'s default, so a row that does
 /// not deliberately set a ceiling gets the shipped one.
@@ -296,6 +348,10 @@ pub struct TileEngine {
     tile_backlog_bytes: u64,
     /// Sub-byte remainder of the tile budget's per-tick production.
     tile_bits_carry: u64,
+    /// Allowance earned but not yet spent, because it is not yet a whole strip.
+    /// Mirrors `session::tile_refine_pass`'s `bucket`; see
+    /// [`TileSim::tile_strip_bytes`].
+    tile_alloc_bytes: u64,
 
     /// Bandwidth tiles may spend, refilled at each window close.
     budget_kbps: u32,
@@ -347,6 +403,7 @@ impl TileEngine {
             link_bits_carry: 0,
             tile_backlog_bytes: 0,
             tile_bits_carry: 0,
+            tile_alloc_bytes: 0,
             budget_kbps: 0,
             throttle: TileThrottle::new(),
             prev_tile_bytes: 0,
@@ -456,24 +513,44 @@ impl TileEngine {
     /// window is left over, queueing the rest behind this tick's video.
     ///
     /// Refinement produces the smaller of its budget and what the screen
-    /// actually has to refine — see [`TileSim::tile_supply_kbps`]. With the
-    /// default supply of "unlimited" this is exactly the budget, so every row
-    /// that does not opt in is byte-for-byte unchanged.
+    /// actually has to refine — see [`TileSim::tile_supply_kbps`] — quantised to
+    /// whole strips of [`TileSim::tile_strip_bytes`], with the leftover carried
+    /// in a bucket exactly as `session::tile_refine_pass` carries it.
     pub fn end_tick(&mut self) {
         let rate_kbps = if self.cfg.tile_supply_kbps == 0 {
             self.budget_kbps
         } else {
             self.budget_kbps.min(self.cfg.tile_supply_kbps)
         };
+        let strip = self.cfg.tile_strip_bytes;
         if !self.cfg.tiles_enabled || rate_kbps == 0 {
-            // Nothing produced. Any carried remainder is stale once the budget
-            // is revoked, so drop it rather than let a burst leak out later.
+            // Nothing earned. The sub-byte remainder is stale once the budget is
+            // revoked, so drop it — but the bucket is *clamped*, not cleared,
+            // which is what production does when `pass_bytes` is zero: it keeps
+            // at most one strip, so a revoked stretch cannot hoard a burst but
+            // an almost-complete strip is not thrown away either.
             self.tile_bits_carry = 0;
+            self.tile_alloc_bytes = self.tile_alloc_bytes.min(strip);
             return;
         }
         self.tile_bits_carry += u64::from(rate_kbps) * self.tick_ms;
-        let produced = self.tile_bits_carry / 8;
+        let earned = self.tile_bits_carry / 8;
         self.tile_bits_carry %= 8;
+
+        // Whole strips only. `0` keeps the old perfectly-divisible model so the
+        // cost of the granule itself can be measured against it.
+        let produced = if strip == 0 {
+            earned
+        } else {
+            // `tile_bucket_cap`: one whole strip plus one pass's allowance.
+            self.tile_alloc_bytes = (self.tile_alloc_bytes + earned).min(strip + earned);
+            let whole = (self.tile_alloc_bytes / strip) * strip;
+            self.tile_alloc_bytes -= whole;
+            whole
+        };
+        if produced == 0 {
+            return;
+        }
 
         // Whatever window is left after video takes it immediately; the rest
         // queues, bounded by the same depth as the bucket so a link that cannot
@@ -663,11 +740,12 @@ mod tests {
     }
 
     /// An application-limited source produces its supply, not its budget, and
-    /// the default of `0` still means "always exactly the budget".
+    /// `divisible()` still means "always exactly the budget".
     #[test]
     fn a_quiet_screen_produces_its_supply_not_its_budget() {
         // 4 000 kbps of budget against a screen with only 1 000 kbps to send.
-        let mut engine = TileEngine::new(TileSim::app_limited(8_000, 1_000), 5);
+        let cfg = TileSim::app_limited(8_000, 1_000).divisible();
+        let mut engine = TileEngine::new(cfg, 5);
         engine.budget_kbps = 4_000;
         for _ in 0..200 {
             engine.bucket_bytes = engine.bucket_depth();
@@ -677,13 +755,61 @@ mod tests {
         assert_eq!(engine.stats().tile_bytes_sent, 125_000);
 
         // The same engine with no supply cap produces the whole budget.
-        let mut engine = TileEngine::new(TileSim::on(8_000), 5);
+        let mut engine = TileEngine::new(TileSim::on(8_000).divisible(), 5);
         engine.budget_kbps = 4_000;
         for _ in 0..200 {
             engine.bucket_bytes = engine.bucket_depth();
             engine.end_tick();
         }
         assert_eq!(engine.stats().tile_bytes_sent, 500_000);
+    }
+
+    /// The livelock the production token bucket exists to prevent: a per-pass
+    /// allowance far smaller than one strip must still add up to whole strips
+    /// rather than to nothing at all.
+    #[test]
+    fn a_sub_strip_allowance_accumulates_instead_of_sending_nothing() {
+        // 500 kbps over a 5 ms tick is 312 bytes — a seventh of a 2 KiB strip.
+        // Spent strictly per tick this would send nothing, ever.
+        let mut engine = TileEngine::new(TileSim::on(8_000), 5);
+        engine.budget_kbps = super::super::tiles::DEFAULT_TILE_MAX_KBPS.min(500);
+        for _ in 0..200 {
+            engine.bucket_bytes = engine.bucket_depth();
+            engine.end_tick();
+        }
+        // One second at 500 kbps is 62 500 bytes; 30 whole 2 KiB strips of it.
+        let sent = engine.stats().tile_bytes_sent;
+        assert_eq!(sent, 30 * DEFAULT_STRIP_BYTES, "strips must be whole");
+        assert!(
+            sent * 100 >= 62_500 * 90,
+            "the granule lost {}% of the grant, which is not quantisation, it \
+             is a livelock",
+            100 - sent * 100 / 62_500
+        );
+
+        // Everything sent is a whole number of strips, always.
+        assert_eq!(engine.stats().tile_bytes_sent % DEFAULT_STRIP_BYTES, 0);
+    }
+
+    /// A revoked budget clamps the bucket to one strip rather than clearing it
+    /// or letting it hoard — the shape of `session::tile_bucket_cap` at
+    /// `pass_bytes == 0`.
+    #[test]
+    fn a_revoked_budget_clamps_the_bucket_to_one_strip() {
+        let mut engine = TileEngine::new(TileSim::on(8_000), 5);
+        engine.budget_kbps = 4_000;
+        for _ in 0..100 {
+            engine.bucket_bytes = engine.bucket_depth();
+            engine.end_tick();
+        }
+        engine.tile_alloc_bytes = DEFAULT_STRIP_BYTES * 50;
+
+        engine.budget_kbps = 0;
+        engine.end_tick();
+        assert_eq!(
+            engine.tile_alloc_bytes, DEFAULT_STRIP_BYTES,
+            "a revoked window must neither hoard the bucket nor discard it"
+        );
     }
 
     /// The backlog is bounded: a link that cannot carry the budget sheds the

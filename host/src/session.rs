@@ -702,6 +702,8 @@ fn media_thread(
     // grid cannot hold them for us, so this is the only place they survive
     // between passes.
     let mut revoke_retry: Vec<u32> = Vec::new();
+    // Carried-over tile allowance; see `tile_bucket_cap`.
+    let mut tile_bucket: usize = 0;
 
     while !shared.stop.load(Ordering::Relaxed) {
         let tick = Instant::now();
@@ -1124,6 +1126,7 @@ fn media_thread(
                         shared.tile_budget_kbps.load(Ordering::Relaxed),
                         shared.fps_now.load(Ordering::Relaxed),
                     ),
+                    &mut tile_bucket,
                     &mut tile_win,
                     &mut revoke_retry,
                     &shared.tiles_reset_req,
@@ -1223,6 +1226,22 @@ fn translate_moves<'a>(
 /// once per captured frame, so the per-pass share is that allowance divided by
 /// the frame rate. Taken from the *live* rate rather than the configured one,
 /// so lowering fps does not silently multiply tile traffic per pass.
+/// Ceiling on the carried-over allowance.
+///
+/// The per-pass share of a small budget is smaller than a single strip: at the
+/// throttle's 500 kbps floor and 60 fps it is 1041 bytes, while a strip of text
+/// is 1-4 KiB. Spent strictly per pass, every strip would be refused forever,
+/// nothing would ever be sent, and the throttle — which grows its ceiling only
+/// on evidence of spending — would stay floored permanently. So the allowance
+/// accumulates until a strip fits.
+///
+/// Capped at one worst-case strip plus a pass, which is the least that
+/// guarantees any legal strip eventually becomes affordable while bounding how
+/// much a long-idle period may hoard and release in one burst.
+fn tile_bucket_cap(pass_bytes: usize) -> usize {
+    directdesk_shared::tiles::MAX_STRIP_ENCODED.saturating_add(pass_bytes)
+}
+
 fn tile_pass_bytes(budget_kbps: u32, fps_now: u32) -> usize {
     let per_second = u64::from(budget_kbps) * 1000 / 8;
     (per_second / u64::from(fps_now.max(1))) as usize
@@ -1342,6 +1361,21 @@ fn drain_revocations(
         }
         // Hold the ids for the next pass; `send_tile_control` handed them back
         // precisely so this is possible, and it has already logged the drop.
+        //
+        // Residual, stated accurately: if a held id is re-sent as a strip
+        // before the retry flushes, the retry retracts a tile that is now
+        // legitimately refined. That is NOT "bounded by one lease" — the host
+        // believes the tile is `Refined` and `plan_reverify`/`commit_renewed`
+        // keep extending its lease, so `begin_pass`'s expiry path never fires
+        // and it is never re-sent. The region stays on H.264 until its pixels
+        // actually change or the session resets.
+        //
+        // Kept because it needs a one-frame race (the top-of-frame drain must
+        // fail on a full queue *and* the pump must free more than the revoke
+        // reserve during convert/encode), and because it errs toward
+        // over-revoking, which is the direction the grid's governing invariant
+        // explicitly prefers. Excluding ids committed this pass would close it
+        // if it is ever observed.
         Err(TileMsg::Revoke { ids }) => *retry = ids,
         Err(_) => reset_req.store(true, Ordering::Relaxed),
     }
@@ -1459,9 +1493,12 @@ fn tile_refine_pass(
     tiles_tx: &Sender<TileMsg>,
     cfg: &SessionConfig,
     now_ms: u32,
-    // Bytes of tile payload this pass may queue, from the bandwidth the
-    // network layer measured as genuinely spare. `0` means send nothing.
+    // Bytes of tile payload the network layer's measured spare bandwidth
+    // affords this pass. `0` means send nothing.
     pass_bytes: usize,
+    // Carried-over allowance, so a per-pass share smaller than one strip still
+    // adds up to something sendable. See `tile_bucket_cap`.
+    bucket: &mut usize,
     win: &mut TileWindow,
     // Revocations a previous pass could not queue, carried by the media thread
     // across frames. See [`drain_revocations`].
@@ -1514,7 +1551,11 @@ fn tile_refine_pass(
     // `plan_strips` calls `begin_pass` and that is what expires leases and
     // sweeps unresolved tiles — freezing the state machine under congestion is
     // exactly when stale pixels would linger.
-    let budget = if pass_bytes == 0 {
+    *bucket = bucket
+        .saturating_add(pass_bytes)
+        .min(tile_bucket_cap(pass_bytes));
+    let allowance = *bucket;
+    let budget = if allowance == 0 {
         0
     } else {
         strip_budget(
@@ -1560,7 +1601,7 @@ fn tile_refine_pass(
         // which a strip can still be declined safely. Past `try_send` the grid
         // records it as delivered, so anything downstream that discarded it
         // would leave that square soft until the client reconnects.
-        if spent_bytes.saturating_add(data.len()) > pass_bytes {
+        if spent_bytes.saturating_add(data.len()) > allowance {
             grid.abandon(plan);
             win.budget_held += 1;
             stalled = true;
@@ -1583,6 +1624,7 @@ fn tile_refine_pass(
         if tiles_tx.try_send(msg).is_ok() {
             grid.commit_sent(plan, &hashes, now_ms, lease_ms);
             spent_bytes = spent_bytes.saturating_add(wire as usize);
+            *bucket = bucket.saturating_sub(wire as usize);
             win.strips += 1;
             win.wire_bytes += wire;
             win.raw_bytes += u64::from(plan.w) * u64::from(plan.h) * 3;
@@ -2044,6 +2086,42 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_allowance_accumulates_until_a_real_strip_fits() {
+        // The livelock this bucket exists to prevent. At the throttle's floor
+        // (500 kbps) and the default 60 fps, one pass affords 1041 bytes — less
+        // than a single strip of text, which the module's own compression
+        // figures put at 1-4 KiB. Spent strictly per pass, every strip is
+        // refused, nothing is ever sent, `spent_kbps` stays 0, and the throttle
+        // (which grows only on evidence of spending) stays floored forever. The
+        // feature would burn a whole-frame readback, hash and deflate on every
+        // idle frame and emit nothing.
+        let pass = tile_pass_bytes(TILE_CEILING_FLOOR_KBPS_FOR_TEST, 60);
+        assert!(
+            pass < 4_096,
+            "precondition: a floored per-pass share really is smaller than a strip ({pass})"
+        );
+
+        let mut bucket = 0usize;
+        let cap = tile_bucket_cap(pass);
+        let mut passes = 0;
+        while bucket < 4_096 {
+            bucket = bucket.saturating_add(pass).min(cap);
+            passes += 1;
+            assert!(passes < 1_000, "the allowance never reached one strip");
+        }
+        // A few frames, not forever.
+        assert!(passes <= 8, "took {passes} passes to afford a 4 KiB strip");
+
+        // And the cap always admits the worst legal strip, so no strip can be
+        // permanently unaffordable at any budget.
+        assert!(tile_bucket_cap(0) >= directdesk_shared::tiles::MAX_STRIP_ENCODED);
+    }
+
+    /// The throttle's floor, mirrored here so this test states the coupling it
+    /// depends on rather than hiding it behind a literal.
+    const TILE_CEILING_FLOOR_KBPS_FOR_TEST: u32 = crate::net::TILE_CEILING_MIN_KBPS;
 
     #[test]
     fn strip_budget_never_spends_the_revoke_reserve() {

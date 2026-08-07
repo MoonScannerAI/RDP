@@ -642,10 +642,22 @@ pub struct TileThrottle {
     /// Highest level not yet known to hurt — TCP's `ssthresh` in all but name.
     /// Below it the ceiling ramps; above it it creeps.
     safe_kbps: u32,
-    /// Whether the window just closed was strained, and therefore granted
-    /// nothing. Distinguishes "refinement declined its grant" from "refinement
-    /// was never given one" — `spent_kbps` is zero in both cases and cannot
-    /// tell them apart.
+    /// Whether the window just closed was strained, and so granted nothing.
+    ///
+    /// Distinguishes "refinement declined its grant" from "refinement was never
+    /// given one" — `spent_kbps` is zero in both cases and cannot tell them
+    /// apart. A recovery window is allowed to grow the ceiling without spend
+    /// evidence, because it had no opportunity to produce any; otherwise a link
+    /// that strains every other window could never climb out of the floor.
+    ///
+    /// That concession does let a chronically lossy link ratchet the ceiling up
+    /// without evidence, so the growth it permits is a *creep*, not a step. The
+    /// ratchet is bounded three ways: by `gap`, by `ceiling_was_binding`, and —
+    /// decisively — by the fact that the moment it actually causes backpressure
+    /// the backoff fires, pins `safe_kbps`, and everything above that creeps
+    /// anyway. Refusing the concession outright was measured to cost a third of
+    /// all refinement on lossy links that had zero backpressure, i.e. links
+    /// refinement was demonstrably not harming.
     last_window_strained: bool,
 }
 
@@ -740,10 +752,13 @@ impl TileThrottle {
         let judgeable = !self.last_window_strained;
         let used_its_grant = spent_kbps.saturating_mul(2) >= self.ceiling_kbps;
         if ceiling_was_binding && (!judgeable || used_its_grant) {
-            let step = if self.ceiling_kbps < self.safe_kbps {
-                TILE_CEILING_STEP_KBPS
-            } else {
+            // A window that produced no evidence buys only a creep, never a
+            // step: it is a concession to "you had no chance to prove
+            // yourself", not proof of anything.
+            let step = if !judgeable || self.ceiling_kbps >= self.safe_kbps {
                 TILE_CEILING_CREEP_KBPS
+            } else {
+                TILE_CEILING_STEP_KBPS
             };
             self.ceiling_kbps = self
                 .ceiling_kbps
@@ -3430,6 +3445,58 @@ mod tests {
         assert!(
             grew <= 12 * TILE_CEILING_CREEP_KBPS,
             "recovery above the safe level must creep, grew {grew} in 12 windows"
+        );
+    }
+
+    #[test]
+    fn repeated_loss_without_backpressure_drifts_only_at_the_creep_rate() {
+        // A recovery window is allowed to grow the ceiling without spend
+        // evidence, because it had no chance to produce any. On a chronically
+        // lossy link that concession does let the ceiling drift upward — and
+        // that is a deliberate trade, not an oversight.
+        //
+        // Refusing it outright was measured to cost a third of all refinement
+        // on lossy links whose backpressure count was *zero*, i.e. links
+        // refinement was demonstrably not harming. Allowing it at the full step
+        // rate is the ratchet that reverts the budget to the raw unvalidated
+        // gap. So it is allowed, at the creep rate: 8x slower, bounded by the
+        // gap, and self-correcting — the first window it actually causes
+        // backpressure, the backoff fires and pins `safe`.
+        let mut t = TileThrottle::new();
+        let start = t.ceiling();
+        for _ in 0..30 {
+            // Lossy, but never any backpressure.
+            t.observe(0, 28_000, 0, 0.0, 0.05, false, true, 0);
+            t.observe(0, 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        let drift = t.ceiling() - start;
+        assert!(
+            drift <= 30 * TILE_CEILING_CREEP_KBPS,
+            "drifted {drift} over 30 lossy cycles — that is step-rate, not creep-rate"
+        );
+
+        // And it self-corrects the moment it actually costs anything.
+        let raised = t.ceiling();
+        t.observe(raised, 28_000, 0, 0.3, 0.0, false, true, 0);
+        assert!(
+            t.ceiling() < raised,
+            "backpressure must claw back the drift; {} vs {raised}",
+            t.ceiling()
+        );
+    }
+
+    #[test]
+    fn a_genuine_backoff_still_grants_its_recovery_window() {
+        // The other half: a window whose strain DID lower the ceiling must be
+        // allowed to grow again without spend evidence, or a link that strains
+        // every other window can never climb out.
+        let mut t = TileThrottle::new();
+        t.observe(2_000, 28_000, 0, 0.3, 0.0, false, true, 0);
+        let floored = t.ceiling();
+        t.observe(0, 28_000, 0, 0.0, 0.0, false, true, 0);
+        assert!(
+            t.ceiling() > floored,
+            "recovery stalled at {floored} after a real backoff"
         );
     }
 

@@ -193,6 +193,30 @@ pub fn lease_covers(frame_ts_ms: u32, valid_from_ms: u32, valid_through_ms: u32)
     frame_ts_ms.wrapping_sub(valid_from_ms) <= valid_through_ms.wrapping_sub(valid_from_ms)
 }
 
+/// Has a lease's end passed, as of `frame_ts_ms`?
+///
+/// **Deliberately one-sided, and [`lease_covers`] must not be substituted for
+/// it.** "Not yet valid" and "no longer valid" are entirely different states,
+/// and only the second one justifies destroying a tile.
+///
+/// A freshly arrived tile is *routinely* not yet valid: the host stamps
+/// `valid_from_ms` with the capture timestamp of the frame the refinement pass
+/// ran on, while the client is still compositing an **earlier** frame — the
+/// encoder's pipeline depth, the outbound frame queue, pacing and the decoder's
+/// own latency all sit between them. So a brand-new tile normally arrives with
+/// its window starting slightly in the future. Evicting on the two-sided test
+/// would therefore delete almost every tile before it was ever painted, while
+/// the host — which has already recorded it as delivered and keeps renewing it
+/// — would never re-send it. The feature would spend bandwidth and refine
+/// nothing. Waiting is free; deleting is not.
+///
+/// Uses the signed-difference trick so it is correct across the `u32` wrap for
+/// any interval shorter than ~24.8 days.
+#[must_use]
+pub fn lease_ended(frame_ts_ms: u32, valid_through_ms: u32) -> bool {
+    (frame_ts_ms.wrapping_sub(valid_through_ms) as i32) > 0
+}
+
 /// Capacity budget derived from the frame size: one full frame of tiles plus
 /// 25% headroom, capped at [`MAX_STORE_BYTES`].
 ///
@@ -401,6 +425,10 @@ impl TileStore {
         inner.bytes = 0;
         inner.covered = 0;
         inner.armed = false;
+        // The host capture clock restarts from a fresh epoch whenever DDA is
+        // rebuilt, so a timestamp learned under the old grid must not be used
+        // to judge leases issued under the new one.
+        inner.last_frame_ts = None;
         inner.size = (0, 0);
         inner.edge = 0;
         inner.cols = 0;
@@ -520,8 +548,12 @@ impl TileStore {
         let mut freed_bytes = 0usize;
         let mut freed_px = 0u64;
         inner.tiles.retain(|_, tile| {
-            let (from, through) = tile.lease();
-            if lease_covers(frame_ts_ms, from, through) {
+            let (_from, through) = tile.lease();
+            // `lease_ended`, NOT `lease_covers` — a tile whose window has not
+            // opened yet is the normal state of a freshly arrived one, and
+            // destroying it there would delete nearly every tile before it
+            // could be painted. See `lease_ended`.
+            if !lease_ended(frame_ts_ms, through) {
                 return true;
             }
             dropped += 1;
@@ -573,6 +605,11 @@ impl TileStore {
         }
 
         inner.armed = true;
+        // Forget the old clock. A `Reset` follows a capture rebuild, and the
+        // host's capture clock restarts from a fresh epoch there — judging a
+        // new-generation lease against a timestamp from the old one would
+        // delete healthy tiles.
+        inner.last_frame_ts = None;
         inner.size = (width, height);
         inner.edge = edge;
         inner.cols = tile_cols(width, edge);
@@ -728,7 +765,8 @@ impl TileStore {
                 // it when the pixels change. Extending the lease here would
                 // paint content the host abandoned, unbounded. Drop it instead
                 // and wait for a real strip.
-                if last_seen.is_some_and(|now| !lease_covers(now, from, through)) {
+                let _ = from;
+                if last_seen.is_some_and(|now| lease_ended(now, through)) {
                     lapsed.push(TileKey(id));
                     continue;
                 }
@@ -1650,6 +1688,101 @@ mod tests {
             });
             assert!(store.is_armed(), "edge {edge} is legitimate");
         }
+    }
+
+    #[test]
+    fn a_tile_that_is_not_valid_yet_is_never_evicted() {
+        // THE regression test for this module. A freshly arrived tile is
+        // normally not yet valid: the host stamps `valid_from_ms` with the
+        // capture ts of the frame its refinement pass ran on, while the client
+        // is still compositing an earlier frame — encoder pipeline depth, the
+        // frame queue, pacing and decoder latency all sit in between. So the
+        // margin is zero by construction and routinely negative.
+        //
+        // Evicting on the two-sided `lease_covers` deleted essentially every
+        // tile before it could be painted, and because the host had already
+        // recorded delivery and kept renewing it, it was never re-sent: the
+        // feature spent bandwidth and refined nothing, silently.
+        let store = armed_store(64, 64);
+        let src = bgra_source(64, 64);
+        let (codec, data) = compress_strip(&src, 64 * 4, 0, 0, 64, 64, 6).unwrap();
+        store.apply(TileMsg::Strip {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 64,
+            codec,
+            valid_from_ms: 130,
+            lease_ms: 4_000,
+            data,
+        });
+        assert_eq!(store.resident_tiles(), 1);
+
+        // The client is compositing a frame captured 30 ms BEFORE this tile's
+        // window opens. It must survive, unpainted, and then be painted.
+        assert_eq!(store.sweep_expired(100), 0, "a not-yet-valid tile must live");
+        assert_eq!(store.resident_tiles(), 1);
+
+        let mut tiles = Vec::new();
+        let size = store.snapshot_into(&mut tiles).unwrap();
+        let mut dst = sentinel_frame(64, 64);
+        assert_eq!(
+            composite_tiles(&mut dst, 64, 64, 100, size, &tiles, false).painted,
+            0,
+            "still too early to paint"
+        );
+        assert_eq!(
+            composite_tiles(&mut dst, 64, 64, 200, size, &tiles, false).painted,
+            1,
+            "and then it paints, because it was not destroyed"
+        );
+    }
+
+    #[test]
+    fn lease_ended_is_one_sided_and_wraps() {
+        // Before the window opens is NOT ended.
+        assert!(!lease_ended(100, 300));
+        assert!(!lease_ended(299, 300));
+        assert!(!lease_ended(300, 300), "inclusive at the end");
+        assert!(lease_ended(301, 300));
+        // Across the u32 wrap, in both directions.
+        assert!(!lease_ended(u32::MAX - 10, u32::MAX));
+        assert!(lease_ended(10, u32::MAX));
+        assert!(!lease_ended(u32::MAX, 10), "10 is 'after' only by wrapping");
+    }
+
+    #[test]
+    fn a_reset_forgets_the_previous_clock() {
+        // The host capture clock restarts from a fresh epoch on a DDA rebuild,
+        // which is exactly when a `Reset` arrives. A stale `last_frame_ts` from
+        // the old (much larger) clock would make `renew` judge new-generation
+        // leases as long expired and delete healthy tiles.
+        let store = armed_store(64, 64);
+        store.sweep_expired(5_000_000);
+        store.apply(TileMsg::Reset {
+            width: 64,
+            height: 64,
+            edge: 64,
+        });
+
+        let src = bgra_source(64, 64);
+        let (codec, data) = compress_strip(&src, 64 * 4, 0, 0, 64, 64, 6).unwrap();
+        store.apply(TileMsg::Strip {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 64,
+            codec,
+            valid_from_ms: 0,
+            lease_ms: 4_000,
+            data,
+        });
+        let out = store.apply(TileMsg::Renew {
+            ids: vec![0],
+            valid_through_ms: 9_000,
+        });
+        assert_eq!(out.admitted, 1, "the new grid's tile must survive renewal");
+        assert_eq!(store.resident_tiles(), 1);
     }
 
     #[test]
