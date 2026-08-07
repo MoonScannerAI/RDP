@@ -160,8 +160,11 @@ static text converges to pixel-exact. Off by default on the host
 (`lossless_tiles_enabled`); it activates only when the client also advertises
 `features::LOSSLESS_TILES` and the host echoes the bit back.
 
-**Status: implemented, headless verification green. NOT yet exercised on the
-real Philippines↔Ohio link — see the staged rollout in the plan.**
+**Status: implemented, headless verification green, and first activated on the
+real Philippines↔Ohio link on 2026-08-07 — the feature negotiates and streams,
+and the operator reports a clear image-quality improvement. The congestion
+residual below is still UNMEASURED on a real link; see the staged rollout in
+the plan.**
 
 ### Wire stability (the anti-brick suite)
 
@@ -254,6 +257,9 @@ That policy is covered by unit tests in `client/src/tiles.rs` instead.
 | DXGI dirty rects are a true superset of what changed, on real hardware | `host/src/bin/capture_harness.rs --dirty` on the Ohio host | NOT RUN | |
 | Cross-version against `DirectDesk-bins.zip` (old client ↔ new host, and the reverse), real QUIC, incl. pairing + reconnect | rollout step 0 | **FAIL — but pre-existing, not caused by tiles.** See below | 2026-08-07 |
 | Cross-version against a **binary built from `a5a928f`** — the commit the Ohio host is believed to be running. Real exes, real QUIC, pairing + reconnect, fresh secret stores per scenario | rollout step 0, rebuilt baseline | **PASS — all four pairings** | 2026-08-07 |
+| Feature actually negotiates and streams over the real WAN link, host `lossless_tiles_enabled: true` | Ohio host at `f7255c1` (hash-verified against the local build), live session. Client logged `host accepted lossless tile refinement`, host logged `lossless tile stream open` ~2 s later; no `lossless tiles disabled` and no `tile stream write failed` for the session's duration | **PASS** | 2026-08-07 |
+| Image quality on the real link with tiles on | Operator judgement on a live session, not a measurement | **PASS (subjective)** | 2026-08-07 |
+| Video-budget residual (the ~59% figure below) under real, supply-limited demand | Not measured. The sessions used for the check sat on a near-static desktop, so frame cadence was governed by `idle_repeat_ms`, not by refinement demand — the residual cannot be read off these logs | NOT RUN | |
 ### Congestion coupling (netsim matrix, `tests/tests/tiles_netsim.rs`)
 
 Tiles ride streams and video rides datagrams, so they never share a send buffer —

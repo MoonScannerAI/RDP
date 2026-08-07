@@ -196,6 +196,40 @@ If the client shows black but the host is not on a secure desktop:
    frame, the problem is upstream of decode (capture/encode/network), not
    the decoder.
 
+## "The stream is stuck at 4–6 fps and clicks feel dead"
+
+Almost always **not** a fault. On a desktop that isn't changing, the host has
+nothing to encode and falls back to sending an idle repeat every
+`idle_repeat_ms`. That value is **healed to 250 ms on load** if the config
+still carries the old `33`:
+
+```rust
+if self.idle_repeat_ms == 33 { self.idle_repeat_ms = 250; }   // host/src/config.rs
+```
+
+250 ms is exactly **4 fps**, which is what you see on a static screen, rising
+to a normal 40–80 fps the moment anything actually moves. The trap is that a
+click that *does* land can take a quarter second to show its result, which
+reads as "input isn't working."
+
+Before chasing input, confirm which half is actually broken — the host logs
+both counters once a second:
+
+```
+host input diag input_injected=3204 frames_sent=128
+```
+
+* `input_injected` climbing while `frames_sent` crawls → **input is fine**, the
+  screen is simply static. Look at frame cadence, not at input.
+* `input_injected` flat while you click → input genuinely isn't arriving.
+* Partial `SendInput` acceptance logs a distinct warning naming UIPI
+  (`host/src/input_inject.rs`); `input_injected` only counts *accepted* events,
+  so a silent climb rules UIPI out.
+
+If a static screen at 4 fps is too sluggish to work with, lower
+`idle_repeat_ms` in `%ProgramData%\DirectDesk\host.json` — but note any value
+of exactly `33` is rewritten to 250, so pick something else (e.g. `50`).
+
 ## High latency checklist
 
 Expected baseline for the reference deployment (Philippines client ↔ Ohio
