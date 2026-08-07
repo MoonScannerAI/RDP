@@ -1,105 +1,38 @@
-//! Small Win32 helpers: owned handles, wide strings, COM apartment guard, and
-//! the best-effort "is the console user's autostart entry present" query.
+//! Small Win32 helpers: owned handles, wide strings, an event, COM apartment
+//! guard, a launched-child tracker, and the best-effort "is the console
+//! user's autostart entry present" query.
+//!
+//! `OwnedHandle`, `wide`, `pcwstr`, `from_wide_ptr`, `Event`, and
+//! `cancel_overlapped` used to be defined here directly; they now live in
+//! `directdesk_shared::winutil` (the host needs the identical definitions)
+//! and are just re-exported below. Everything else here is service-specific.
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+pub use directdesk_shared::winutil::{
+    cancel_overlapped, from_wide_ptr, pcwstr, wide, Event, OwnedHandle,
+};
 
-/// A `HANDLE` that closes itself. `HANDLE` is a raw pointer so it is not `Send`
-/// by default; handles are kernel objects and are safe to move between threads,
-/// which is why the `Send`/`Sync` impls below are sound.
+use windows::Win32::System::Threading::TerminateProcess;
+
+/// A process launched via `CreateProcessAsUserW`: the host agent
+/// ([`crate::supervisor`]) and the SYSTEM UAC-injector worker
+/// ([`crate::uac_injector`]) each track one of these. The two call sites used
+/// to declare identical copies of this struct; same crate, so there is no
+/// reason not to share it.
 #[derive(Debug)]
-pub struct OwnedHandle(HANDLE);
-
-// SAFETY: Win32 kernel handles are process-wide and thread-agnostic.
-unsafe impl Send for OwnedHandle {}
-unsafe impl Sync for OwnedHandle {}
-
-impl OwnedHandle {
-    /// # Safety
-    /// `handle` must be a valid handle that this object may exclusively close.
-    pub unsafe fn new(handle: HANDLE) -> Self {
-        Self(handle)
-    }
-
-    pub fn raw(&self) -> HANDLE {
-        self.0
-    }
+pub(crate) struct Child {
+    pub(crate) process: OwnedHandle,
+    pub(crate) pid: u32,
 }
 
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            // SAFETY: we own this handle and only close it once.
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-}
-
-/// NUL-terminated UTF-16 buffer suitable for `PCWSTR`.
-pub fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Borrow a `Vec<u16>` produced by [`wide`] as a `PCWSTR`.
-pub fn pcwstr(buf: &[u16]) -> PCWSTR {
-    PCWSTR(buf.as_ptr())
-}
-
-/// Read a NUL-terminated wide string from a raw pointer.
-///
-/// # Safety
-/// `ptr` must point at a NUL-terminated UTF-16 string.
-pub unsafe fn from_wide_ptr(ptr: *const u16) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut len = 0usize;
-    // SAFETY: caller guarantees NUL termination.
-    while unsafe { *ptr.add(len) } != 0 {
-        len += 1;
-    }
-    // SAFETY: len is the length up to (not including) the NUL.
-    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
-}
-
-/// A manual-reset Win32 event, used to wake blocked threads at shutdown and to
-/// deliver "restart the host" nudges without polling.
-pub struct Event(OwnedHandle);
-
-impl Event {
-    pub fn manual_reset() -> anyhow::Result<Self> {
-        use windows::Win32::System::Threading::CreateEventW;
-        // SAFETY: unnamed manual-reset event, initially unsignaled.
-        let h = unsafe { CreateEventW(None, true, false, None)? };
-        // SAFETY: CreateEventW returned a valid, exclusively owned handle.
-        Ok(Self(unsafe { OwnedHandle::new(h) }))
-    }
-
-    pub fn signal(&self) {
-        // SAFETY: our own event handle.
+impl Child {
+    /// Forcibly kill the process. The UAC-injector worker has no graceful
+    /// shutdown (it is short-lived and SYSTEM-integrity); the supervisor uses
+    /// this only as the last resort after a `WM_CLOSE` grace period expires.
+    pub(crate) fn terminate(&self) {
+        // SAFETY: our own process handle, obtained from CreateProcessAsUserW.
         unsafe {
-            let _ = windows::Win32::System::Threading::SetEvent(self.0.raw());
+            let _ = TerminateProcess(self.process.raw(), 1);
         }
-    }
-
-    pub fn reset(&self) {
-        // SAFETY: our own event handle.
-        unsafe {
-            let _ = windows::Win32::System::Threading::ResetEvent(self.0.raw());
-        }
-    }
-
-    pub fn is_signaled(&self) -> bool {
-        use windows::Win32::Foundation::WAIT_OBJECT_0;
-        use windows::Win32::System::Threading::WaitForSingleObject;
-        // SAFETY: zero-timeout poll on our own event handle.
-        unsafe { WaitForSingleObject(self.0.raw(), 0) == WAIT_OBJECT_0 }
-    }
-
-    pub fn raw(&self) -> HANDLE {
-        self.0.raw()
     }
 }
 
@@ -229,26 +162,6 @@ pub fn console_user_sid_string() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wide_is_nul_terminated() {
-        let w = wide("abc");
-        assert_eq!(w, vec![b'a' as u16, b'b' as u16, b'c' as u16, 0]);
-    }
-
-    #[test]
-    fn wide_roundtrips_through_pointer() {
-        let w = wide("DirectDesk Service");
-        // SAFETY: `w` is NUL-terminated and alive for the call.
-        let back = unsafe { from_wide_ptr(w.as_ptr()) };
-        assert_eq!(back, "DirectDesk Service");
-    }
-
-    #[test]
-    fn from_wide_ptr_handles_null() {
-        // SAFETY: null is explicitly handled.
-        assert_eq!(unsafe { from_wide_ptr(std::ptr::null()) }, "");
-    }
 
     #[test]
     fn com_mta_guard_initializes_and_releases() {

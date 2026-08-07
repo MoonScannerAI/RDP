@@ -41,10 +41,10 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, WaitForMultipleObjects, INFINITE, PROCESS_NAME_FORMAT,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 use crate::dispatch::{dispatch, Backend};
-use crate::winutil::{pcwstr, wide, Event, OwnedHandle};
+use crate::winutil::{cancel_overlapped, pcwstr, wide, Event, OwnedHandle};
 
 /// DACL for the pipe, in SDDL:
 /// * `D:P`            — protected DACL, no inherited ACEs
@@ -407,7 +407,7 @@ fn accept(pipe: &OwnedHandle, stop: &StopSignal) -> anyhow::Result<bool> {
                 unsafe { GetOverlappedResult(pipe.raw(), &ov, &mut transferred, true) }?;
                 Ok(true)
             } else {
-                cancel(pipe, &ov);
+                cancel_overlapped(pipe, &ov);
                 Ok(false)
             }
         }
@@ -462,7 +462,7 @@ impl From<anyhow::Error> for ReadError {
 }
 
 fn read_message(pipe: &OwnedHandle, stop: &StopSignal, buf: &mut [u8]) -> Result<usize, ReadError> {
-    let ev = Event::manual_reset().map_err(ReadError::Io)?;
+    let ev = Event::manual_reset().map_err(|e| ReadError::Io(e.into()))?;
     let mut ov = OVERLAPPED {
         hEvent: ev.raw(),
         ..Default::default()
@@ -542,18 +542,8 @@ fn wait_io(
         }
     } else {
         // Stop signalled, timed out, or the wait itself failed: abandon the I/O.
-        cancel(pipe, ov);
+        cancel_overlapped(pipe, ov);
         Ok(None)
-    }
-}
-
-fn cancel(pipe: &OwnedHandle, ov: &OVERLAPPED) {
-    // SAFETY: cancelling our own pending operation, then draining its result so
-    // `ov` is no longer referenced by the kernel before it is dropped.
-    unsafe {
-        let _ = CancelIoEx(pipe.raw(), Some(ov));
-        let mut n = 0u32;
-        let _ = GetOverlappedResult(pipe.raw(), ov, &mut n, true);
     }
 }
 

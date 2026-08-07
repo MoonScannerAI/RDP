@@ -50,6 +50,12 @@ features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_Memory",
+    # For `winutil`: Threading gives CreateEventW/SetEvent/ResetEvent/
+    # WaitForSingleObject, IO gives CancelIoEx/GetOverlappedResult/OVERLAPPED.
+    # The host and service crates already carry both; these entries only matter
+    # when `shared` is built or tested on its own.
+    "Win32_System_Threading",
+    "Win32_System_IO",
 ]
 
 [dev-dependencies]

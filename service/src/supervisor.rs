@@ -34,9 +34,8 @@ use windows::Win32::Foundation::{ERROR_NO_TOKEN, HANDLE, LPARAM, WAIT_OBJECT_0};
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetExitCodeProcess, TerminateProcess, WaitForMultipleObjects,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
@@ -44,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::dispatch::SupervisorOps;
 use crate::paths::quote;
-use crate::winutil::{pcwstr, wide, Event, OwnedHandle};
+use crate::winutil::{pcwstr, wide, Child, Event, OwnedHandle};
 
 /// First restart delay after a crash.
 pub const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -149,13 +148,6 @@ pub fn console_user_token() -> Result<OwnedHandle, LaunchError> {
     }
 }
 
-/// A launched host process.
-#[derive(Debug)]
-struct Child {
-    process: OwnedHandle,
-    pid: u32,
-}
-
 /// Launch the host agent in the interactive session as the console user.
 fn launch_host(host_exe: &std::path::Path) -> Result<Child, LaunchError> {
     if !host_exe.exists() {
@@ -223,9 +215,9 @@ fn stop_child(child: &Child) {
         pid = child.pid,
         "host agent did not close in time; terminating"
     );
+    child.terminate();
     // SAFETY: our own process handle.
     unsafe {
-        let _ = TerminateProcess(child.process.raw(), 1);
         let _ = WaitForSingleObject(child.process.raw(), 2_000);
     }
 }

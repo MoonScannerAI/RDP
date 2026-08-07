@@ -43,12 +43,12 @@ use windows::Win32::Security::{
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, TerminateProcess, CREATE_NO_WINDOW,
+    CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW,
     CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 use crate::paths::quote;
-use crate::winutil::{pcwstr, wide, OwnedHandle};
+use crate::winutil::{pcwstr, wide, Child, OwnedHandle};
 
 /// `MAXIMUM_ALLOWED` generic access right (winnt.h). Kept local so this module
 /// does not need the `Win32_System_SystemServices` feature just for a constant.
@@ -90,26 +90,6 @@ pub enum InjectorError {
     MissingExe(PathBuf),
     #[error("{0}")]
     Win(#[from] windows::core::Error),
-}
-
-// ---------------------------------------------------------------------------
-// A launched worker process
-// ---------------------------------------------------------------------------
-
-/// A launched SYSTEM worker. Mirrors `supervisor::Child`.
-#[derive(Debug)]
-struct Child {
-    process: OwnedHandle,
-    pid: u32,
-}
-
-impl Child {
-    fn terminate(&self) {
-        // SAFETY: our own process handle, obtained from CreateProcessAsUserW.
-        unsafe {
-            let _ = TerminateProcess(self.process.raw(), 1);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

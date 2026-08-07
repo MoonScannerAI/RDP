@@ -21,5 +21,6 @@ pub mod tiles;
 pub mod traits;
 pub mod transport;
 pub mod video;
+pub mod winutil;
 
 pub use error::{Error, Result};
