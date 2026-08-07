@@ -58,6 +58,18 @@ pub struct StreamCaps {
     /// is no privacy or surprise cost, and against every host shipped so far it
     /// is a no-op.
     pub lossless_tiles: bool,
+    /// Ask hosts to stream their system audio.
+    ///
+    /// Default **true**, and the asymmetry with the host's default is
+    /// deliberate rather than an oversight. On the host, *offering* audio is
+    /// the deploy risk: it opens a capture stream on somebody's machine, so it
+    /// stays off until an operator turns it on. On the client, *asking* costs
+    /// nothing — the host's Hello reply is the intersection, so a host that
+    /// lacks the feature, or has it switched off, simply never echoes the bit
+    /// and never sends a datagram. Defaulting this to false would mean every
+    /// user of an audio-enabled host had to find a second switch to get the
+    /// feature the operator already turned on.
+    pub system_audio: bool,
 }
 
 impl Default for StreamCaps {
@@ -72,6 +84,7 @@ impl Default for StreamCaps {
             // for 60. 0 preserves today's behaviour bit-for-bit.
             preferred_fps: 0,
             lossless_tiles: true,
+            system_audio: true,
         }
     }
 }
@@ -100,6 +113,7 @@ impl ConnectRequest {
             max_height: caps.max_height,
             preferred_fps: caps.preferred_fps,
             lossless_tiles: caps.lossless_tiles,
+            system_audio: caps.system_audio,
         }
     }
 }
@@ -124,6 +138,7 @@ pub struct ConnectSupervisor {
     state_tx: crossbeam_channel::Sender<ConnectionState>,
     control_in_tx: crossbeam_channel::Sender<ControlMsg>,
     tiles_tx: crossbeam_channel::Sender<directdesk_shared::tiles::TileMsg>,
+    audio_tx: crossbeam_channel::Sender<directdesk_shared::audio::AudioFrame>,
 
     // Outbound (UI -> transport). The pumps forward to whichever sender is
     // installed here; `None` means "no active connection, drop the message".
@@ -151,6 +166,7 @@ impl ConnectSupervisor {
             state_tx,
             control_tx: control_in_tx,
             tiles_tx,
+            audio_tx,
             input_rx,
             control_rx,
         } = transport;
@@ -170,6 +186,7 @@ impl ConnectSupervisor {
             state_tx,
             control_in_tx,
             tiles_tx,
+            audio_tx,
             input_target,
             control_target,
             current: None,
@@ -208,6 +225,7 @@ impl ConnectSupervisor {
             state_tx: self.state_tx.clone(),
             control_tx: self.control_in_tx.clone(),
             tiles_tx: self.tiles_tx.clone(),
+            audio_tx: self.audio_tx.clone(),
             input_rx,
             control_rx: control_out_rx,
         };
@@ -300,6 +318,25 @@ mod tests {
         let sup =
             ConnectSupervisor::new(rt.handle().clone(), store, transport, StreamCaps::default());
         (session, sup)
+    }
+
+    /// The client asks for system audio by default and carries the ask into
+    /// [`ConnectParams`]. Pinned because the default is a deliberate asymmetry
+    /// with the host's (which is off): asking costs nothing, offering does.
+    #[test]
+    fn the_client_asks_for_system_audio_by_default_and_threads_it_through() {
+        let caps = StreamCaps::default();
+        assert!(caps.system_audio, "asking costs nothing; the host decides");
+        let params = request().into_params(caps);
+        assert!(params.system_audio);
+
+        // And a client that declines carries the decline, so the Hello bit is
+        // driven by the caps and nothing else.
+        let quiet = StreamCaps {
+            system_audio: false,
+            ..StreamCaps::default()
+        };
+        assert!(!request().into_params(quiet).system_audio);
     }
 
     #[test]

@@ -69,6 +69,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use directdesk_shared::audio::AudioFrame;
 use directdesk_shared::crypto::auth::{
     ClientAuthenticator, TrustedPeer, TrustedPeers, TRUSTED_HOSTS_KEY,
 };
@@ -129,6 +130,13 @@ pub struct ConnectParams {
     /// back, so leaving this true costs nothing against a host that does not
     /// support it or has it switched off.
     pub lossless_tiles: bool,
+    /// Ask the host to stream its system audio.
+    ///
+    /// Only a request, exactly like [`ConnectParams::lossless_tiles`]: the
+    /// feature is on solely if the host echoes `features::SYSTEM_AUDIO` back.
+    /// See [`crate::connect::StreamCaps::system_audio`] for why the client's
+    /// default is `true` while the host's is `false`.
+    pub system_audio: bool,
 }
 
 impl ConnectParams {
@@ -163,6 +171,7 @@ pub async fn run_client(
         control_tx,
         mut input_rx,
         tiles_tx,
+        audio_tx,
         mut control_rx,
     } = endpoints;
 
@@ -211,6 +220,7 @@ pub async fn run_client(
             route,
             paired_host,
             lossless_tiles,
+            system_audio,
         } = match established {
             Ok(e) => e,
             Err(HandshakeError {
@@ -252,6 +262,10 @@ pub async fn run_client(
             // Generous: the decode thread drains eagerly and does latest-wins,
             // so we must not throw inbound video away at the transport seam.
             video_capacity: 256,
+            // Roughly half a second of AAC-LC access units. Deliberately not
+            // scaled up the way `video_capacity` was: a deep audio queue is a
+            // growing lip-sync offset, never a smoother stream.
+            audio_capacity: 32,
             // Tighter than the shared 500ms default: paired with the client's
             // KeyframeGate (pipeline.rs), a gap should get a fresh IDR request
             // on the wire sooner. Leave the shared default alone — sim
@@ -262,6 +276,14 @@ pub async fn run_client(
             },
             // The client is the receiving end of a one-directional video path.
             receive_video: true,
+            // And of the audio path, which is one-directional the same way.
+            // Left unconditionally on rather than gated on `system_audio`: a
+            // host that did not echo the bit sends no audio datagrams at all,
+            // so the flag costs an idle queue and nothing else, while gating it
+            // would add a second place the feature can be off. The demux that
+            // keeps these datagrams away from the video reassembler runs
+            // regardless of this flag either way.
+            receive_audio: true,
         };
         let (session, receivers) = match QuicSession::start(conn, streams, route, cfg) {
             Ok(pair) => pair,
@@ -301,6 +323,20 @@ pub async fn run_client(
             fwd.push(tokio::spawn(forward_tiles(
                 session.connection().clone(),
                 tiles_tx.clone(),
+            )));
+        }
+
+        // System audio, only when the host agreed to send it. Same treatment as
+        // the tile bridge and for the same reason: aborted with the rest of the
+        // session's bridges, and deliberately *not* given the `closed`
+        // notifier, because nothing that happens on the audio path may end the
+        // session. When the bit did not come back, `receivers.audio` is simply
+        // dropped here and the driver's audio queue closes with it.
+        if system_audio {
+            tracing::info!("host accepted system audio");
+            fwd.push(tokio::spawn(forward_audio(
+                receivers.audio,
+                audio_tx.clone(),
             )));
         }
 
@@ -541,6 +577,50 @@ async fn forward_tiles(conn: Connection, tx: crossbeam_channel::Sender<TileMsg>)
 }
 
 // ---------------------------------------------------------------------------
+// System audio (host -> client, unreliable datagrams)
+// ---------------------------------------------------------------------------
+
+/// Move the driver's decoded audio packets onto the UI's crossbeam channel for
+/// as long as the session lasts.
+///
+/// # This loop must never end the session
+///
+/// The same discipline [`forward_tiles`] documents, restated because it is just
+/// as load-bearing here and just as easy to "fix" away. Audio is a bonus layer
+/// over a session that is already correct: a client with no endpoint, no AAC
+/// decoder, or a host that never sends a datagram must lose exactly the audio
+/// and nothing else. So this function never touches `mark_closed`, never
+/// notifies `closed` — it is deliberately not given the notifier — and never
+/// reports a [`ConnectionState`]. When the driver's audio channel closes, it
+/// logs and returns, leaving the session fully alive with audio simply off.
+///
+/// Contrast [`forward_control`] and [`forward_events`], which sit on the other
+/// side of that line: control carries the session's *meaning* (stats, route,
+/// clipboard, `VideoConfig`), and `forward_events` holds the `closed` notifier
+/// precisely because a `PeerClosed`/`Closed` event is the session ending. A
+/// return from this function means "no more audio", never "no more session";
+/// `run_session_loop` is not watching it and cannot be woken by it.
+///
+/// Overflow is dropped rather than awaited, exactly like [`forward_video`] and
+/// [`forward_tiles`]: blocking here would back-pressure QUIC's receive window
+/// on behalf of a layer whose whole point is that it yields to everything else.
+/// A dropped access unit is one ~21 ms click, which the jitter buffer
+/// downstream already conceals as ordinary loss.
+async fn forward_audio(
+    mut rx: tokio::sync::mpsc::Receiver<AudioFrame>,
+    tx: crossbeam_channel::Sender<AudioFrame>,
+) {
+    let mut received: u64 = 0;
+    while let Some(frame) = rx.recv().await {
+        received += 1;
+        if tx.try_send(frame).is_err() {
+            tracing::trace!("audio queue full at UI seam; packet dropped");
+        }
+    }
+    tracing::info!(received, "audio stream ended; playback stops");
+}
+
+// ---------------------------------------------------------------------------
 // Connect + handshake
 // ---------------------------------------------------------------------------
 
@@ -555,6 +635,9 @@ struct Established {
     /// The host echoed `features::LOSSLESS_TILES`, so it intends to open the
     /// bulk tile stream on this connection.
     lossless_tiles: bool,
+    /// The host echoed `features::SYSTEM_AUDIO`, so it intends to send audio
+    /// datagrams on this connection.
+    system_audio: bool,
 }
 
 struct HandshakeError {
@@ -647,6 +730,9 @@ async fn connect_and_auth(
     if params.lossless_tiles {
         features |= protocol::features::LOSSLESS_TILES;
     }
+    if params.system_audio {
+        features |= protocol::features::SYSTEM_AUDIO;
+    }
     let hello = Hello {
         version: protocol::PROTOCOL_VERSION,
         features,
@@ -665,6 +751,7 @@ async fn connect_and_auth(
     // The host's reply *is* the intersection (`hello.features & offered`), so
     // one bit test settles it: no need to re-check what we asked for.
     let lossless_tiles = peer_hello.features & protocol::features::LOSSLESS_TILES != 0;
+    let system_audio = peer_hello.features & protocol::features::SYSTEM_AUDIO != 0;
 
     // Phase 1 — the host always issues its ServerChallenge immediately after the
     // Hello exchange, before it knows which branch we want. Read it now; in both
@@ -715,6 +802,7 @@ async fn connect_and_auth(
         route,
         paired_host,
         lossless_tiles,
+        system_audio,
     })
 }
 
@@ -990,6 +1078,56 @@ mod tests {
         assert!(!armed(FEATURE_PAIRING_REQUEST));
     }
 
+    /// The audio sibling of the test above. Same rule, same single bit test:
+    /// the host's reply *is* the intersection, so a client that asked and was
+    /// refused, a client that never asked, and a host that predates the flag
+    /// all end up with audio off — and the audio bridge is never spawned.
+    #[test]
+    fn audio_is_armed_only_by_the_hosts_echoed_bit() {
+        let armed = |features: u64| features & protocol::features::SYSTEM_AUDIO != 0;
+        assert!(armed(protocol::features::SYSTEM_AUDIO));
+        assert!(armed(
+            protocol::features::SYSTEM_AUDIO | protocol::features::LOSSLESS_TILES
+        ));
+        assert!(!armed(0), "a host that echoed nothing sends no audio");
+        assert!(!armed(protocol::features::CLIPBOARD_TEXT));
+        assert!(!armed(FEATURE_PAIRING_REQUEST));
+
+        // The two optional layers are independent: one being on must never arm
+        // the other. They ride different transports (a bulk stream vs
+        // datagrams) and a host may well support only one.
+        assert!(!armed(protocol::features::LOSSLESS_TILES));
+        let tiles = |f: u64| f & protocol::features::LOSSLESS_TILES != 0;
+        assert!(!tiles(protocol::features::SYSTEM_AUDIO));
+    }
+
+    /// What the client *offers* is driven by `params`, not by a constant, so a
+    /// client that declines audio cannot have it turned on by the host echoing
+    /// a bit we never sent (the host answers with an intersection, and a bit
+    /// absent from our offer cannot be in it).
+    #[test]
+    fn the_hello_offer_carries_exactly_what_the_params_asked_for() {
+        let offer = |lossless: bool, audio: bool| {
+            let mut features = 0u64;
+            if lossless {
+                features |= protocol::features::LOSSLESS_TILES;
+            }
+            if audio {
+                features |= protocol::features::SYSTEM_AUDIO;
+            }
+            features
+        };
+        assert_eq!(offer(false, false), 0);
+        assert_eq!(offer(false, true), protocol::features::SYSTEM_AUDIO);
+        assert_eq!(offer(true, false), protocol::features::LOSSLESS_TILES);
+        assert_eq!(
+            offer(true, true),
+            protocol::features::LOSSLESS_TILES | protocol::features::SYSTEM_AUDIO
+        );
+        // And neither collides with the handshake-only pairing hint.
+        assert_eq!(offer(true, true) & FEATURE_PAIRING_REQUEST, 0);
+    }
+
     #[tokio::test]
     async fn literal_ip_resolves_without_dns() {
         let c = resolve_candidates("127.0.0.1", 47990).await;
@@ -1008,6 +1146,7 @@ mod tests {
             max_height: 1080,
             preferred_fps: 60,
             lossless_tiles: true,
+            system_audio: true,
         };
         match p.start_stream() {
             ControlMsg::StartStream {

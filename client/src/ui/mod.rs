@@ -208,6 +208,12 @@ impl ClientApp {
         let mut pipeline = init.pipeline;
         let tiles = pipeline.tiles();
         pipeline.attach_tile_thread(init.session.tiles_rx.clone());
+        // System audio. Attached unconditionally, exactly like the tile thread:
+        // whether audio was negotiated is decided per connection, in the
+        // handshake, and this thread simply never sees a packet on a session
+        // that did not get it. It builds no decoder and opens no endpoint until
+        // the first packet's format tells it what to build.
+        pipeline.attach_audio_thread(init.session.audio_rx.clone());
 
         Self {
             address_input: init.config.host_address.clone(),
@@ -1245,6 +1251,8 @@ impl ClientApp {
         let mut open = true;
         let description = self.pipeline.status.description();
         let error = self.pipeline.status.error();
+        let audio = self.pipeline.audio_snapshot();
+        let audio_error = self.pipeline.audio_error();
         diagnostics::show(
             ctx,
             &mut open,
@@ -1262,6 +1270,8 @@ impl ClientApp {
                 keys_forwarded: self.input.keys_forwarded(),
                 moves_sent: self.input.moves_sent(),
                 moves_coalesced: self.input.moves_coalesced(),
+                audio,
+                audio_error: audio_error.as_deref(),
                 demo_mode: self.mode == SourceMode::LoopbackDemo,
             },
         );

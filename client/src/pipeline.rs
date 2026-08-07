@@ -8,8 +8,16 @@
 //!   straight into the slot, bypassing H.264 entirely, so the whole UI / input
 //!   / render loop is exercisable with no network and no host.
 //!
-//! A third, optional thread — [`Pipeline::attach_tile_thread`] — feeds the
-//! lossless refinement store the decode thread composites from.
+//! Two further optional threads hang off the same [`Pipeline`]:
+//!
+//! * [`Pipeline::attach_tile_thread`] — feeds the lossless refinement store the
+//!   decode thread composites from.
+//! * [`Pipeline::attach_audio_thread`] — the system-audio playback path: jitter
+//!   buffer, AAC-LC decoder, WASAPI endpoint, and the two controllers that keep
+//!   the latency honest.
+//!
+//! All of them share one stop flag and one join list, so [`Pipeline::shutdown`]
+//! (and therefore `Drop`) covers every thread this module ever spawns.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,6 +25,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
+use directdesk_shared::audio::jitter::{
+    AudioJitterBuffer, DriftCorrection, DriftCorrector, JitterConfig,
+};
+use directdesk_shared::audio::{AudioFormat, AudioFrame, AudioPacket};
+use directdesk_shared::error::{Error, Result};
 use directdesk_shared::protocol::ControlMsg;
 use directdesk_shared::tiles::TileMsg;
 use directdesk_shared::traits::{Decoder, PixelFormat, RawFrame};
@@ -24,6 +37,8 @@ use directdesk_shared::video::EncodedFrame;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use crate::audio_decoder::{new_audio_decoder, AudioDecode, AAC_FRAME_SAMPLES};
+use crate::audio_render::{new_pcm_sink, PcmSink};
 use crate::renderer::FrameSlot;
 use crate::tiles::{composite_tiles, Tile, TileStore};
 
@@ -145,6 +160,11 @@ pub struct Pipeline {
     /// Tints composited tiles so coverage is visible during bring-up. Read on
     /// the decode thread once per frame, written by the UI toggle.
     tile_highlight: Arc<AtomicBool>,
+    /// Gauges published by the audio thread. Created unconditionally so the
+    /// diagnostics panel has something to read whether or not audio was ever
+    /// negotiated — it reports `None` until the first packet is handled, which
+    /// is the honest answer for "we have measured nothing".
+    audio: Arc<AudioStatus>,
 }
 
 impl Pipeline {
@@ -155,7 +175,20 @@ impl Pipeline {
             status,
             tiles: Arc::new(TileStore::new()),
             tile_highlight: Arc::new(AtomicBool::new(false)),
+            audio: Arc::new(AudioStatus::default()),
         }
+    }
+
+    /// What the audio thread has measured, or `None` if it has measured
+    /// nothing yet (never attached, or no packet has arrived).
+    pub fn audio_snapshot(&self) -> Option<AudioSnapshot> {
+        self.audio.snapshot()
+    }
+
+    /// The last audio decoder / endpoint failure, if there was one. A session
+    /// with audio degraded to silence says so here rather than only in the log.
+    pub fn audio_error(&self) -> Option<String> {
+        self.audio.error()
     }
 
     /// The refinement store this pipeline composites from.
@@ -199,6 +232,40 @@ impl Pipeline {
                 tracing::info!("tile thread exiting");
             })
             .expect("spawn tile thread");
+        self.threads.push(handle);
+    }
+
+    /// Spawn the thread that plays inbound system audio.
+    ///
+    /// A thread of its own for the same two reasons the tile thread is one, and
+    /// a third that is specific to audio. Playback is paced by a clock that has
+    /// nothing to do with the video frame rate — one AAC-LC access unit every
+    /// ~21 ms — so pacing it off the decode loop would make every dropped video
+    /// frame an audible glitch. Media Foundation's AAC decoder and WASAPI's
+    /// render client are both COM objects with thread-affine apartments, so
+    /// they want a thread whose whole life they own. And a wedged audio path
+    /// must not be able to stall the picture, which is the whole reason audio
+    /// is treated as a bonus layer end to end (see `net::forward_audio`).
+    ///
+    /// Joins with the rest of the pipeline: same stop flag, same `threads` vec,
+    /// so [`Pipeline::shutdown`] (and therefore `Drop`) already covers it.
+    ///
+    /// Safe to call on a session that never negotiated audio: the channel
+    /// simply stays empty and the thread parks on the 100 ms poll in
+    /// [`recv_until_stopped`], building no decoder and opening no endpoint
+    /// (both are constructed lazily, from the first packet's format).
+    pub fn attach_audio_thread(&mut self, audio_rx: Receiver<AudioFrame>) {
+        let status = self.audio.clone();
+        let stop = self.stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("directdesk-audio".into())
+            .spawn(move || {
+                let mut audio = AudioLoop::new(status);
+                recv_until_stopped(&audio_rx, &stop, |frame| audio.handle_frame(frame));
+                audio.shutdown();
+                tracing::info!("audio thread exiting");
+            })
+            .expect("spawn audio thread");
         self.threads.push(handle);
     }
 
@@ -442,6 +509,659 @@ fn composite_onto(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// System audio
+// ---------------------------------------------------------------------------
+
+/// What the audio thread has actually measured.
+///
+/// Every number here is one this client observed itself; there is no host side
+/// to the audio panel. The `Option` fields are `None` when the thing that would
+/// produce them does not exist — no endpoint was opened, say — so the
+/// diagnostics panel can honour its HONESTY RULE and render "—" instead of a
+/// zero that reads as a measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioSnapshot {
+    /// Network-domain jitter buffer occupancy, ms.
+    pub buffered_ms: u32,
+    /// The depth controller's current target for that occupancy, ms.
+    pub target_ms: u32,
+    /// Access units handed to the jitter buffer, accepted or not.
+    pub packets_received: u64,
+    /// Access units the jitter buffer handed back in order.
+    pub packets_delivered: u64,
+    /// Sequence numbers that never arrived, or arrived too late to be used.
+    pub lost: u64,
+    /// Access units that arrived behind the jitter buffer's read point and were
+    /// dropped unplayed.
+    ///
+    /// Ordinarily a small number on a reordering link and nothing to act on.
+    /// It is published because it is the **only** gauge that moves in the one
+    /// failure mode that is otherwise completely silent: a peer that emits a
+    /// `seq` far ahead of its own stream (a host bug — QUIC authenticates these,
+    /// so it is not an injected datagram) seeds the buffer's read point at that
+    /// value, and every genuine packet after it reads late forever. In that
+    /// state `underruns` does not move, the depth target *decays* as if all were
+    /// well, `packets_received` keeps climbing, and audio is simply gone. With
+    /// this row, "received rising, delivered flat, late rising in lockstep" says
+    /// it outright. See `AudioJitterBuffer`'s "known limitation" docs.
+    pub late: u64,
+    /// Times the jitter buffer was asked for audio and had none.
+    pub underruns: u64,
+    /// Times the endpoint buffer was found dry at write time. `None` when no
+    /// endpoint was ever opened — which is a different fact from "opened and
+    /// never underran", and must not render as the same number.
+    pub device_underruns: Option<u64>,
+    /// Output latency read from the endpoint, ms. `None` for the same reason.
+    pub device_latency_ms: Option<u32>,
+    /// Frames dropped or inserted to correct clock drift, both domains.
+    pub drift_corrections: u64,
+}
+
+/// Shared audio gauges: written by the audio thread, read by the UI.
+///
+/// The audio mirror of [`SourceStatus`], but built on one `Mutex<Option<_>>`
+/// rather than a spread of atomics. The whole snapshot is published at once so
+/// the panel can never show a depth from one packet next to a packet count from
+/// another, and `None` — the state before the first packet — is representable,
+/// which a pile of `AtomicU64`s cannot do without inventing a sentinel.
+#[derive(Default)]
+pub struct AudioStatus {
+    snapshot: Mutex<Option<AudioSnapshot>>,
+    description: Mutex<String>,
+    error: Mutex<Option<String>>,
+}
+
+impl AudioStatus {
+    /// The latest published gauges, or `None` before the first packet.
+    pub fn snapshot(&self) -> Option<AudioSnapshot> {
+        *self.snapshot.lock()
+    }
+
+    /// Human-readable decoder/endpoint description, empty before either exists.
+    pub fn description(&self) -> String {
+        self.description.lock().clone()
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().clone()
+    }
+
+    fn publish(&self, snapshot: AudioSnapshot) {
+        *self.snapshot.lock() = Some(snapshot);
+    }
+
+    fn set_description(&self, text: impl Into<String>) {
+        *self.description.lock() = text.into();
+    }
+
+    fn set_error(&self, text: Option<String>) {
+        *self.error.lock() = text;
+    }
+}
+
+/// The one place this crate reads an [`AudioFrame`]'s access unit.
+///
+/// Both the jitter buffer (which wants a borrowed [`AudioPacket`]) and the
+/// decoder (which wants `&[u8]`) need these bytes, and the frame type is shared
+/// with the transport, so the field is named exactly once.
+#[inline]
+fn access_unit(frame: &AudioFrame) -> &[u8] {
+    &frame.data
+}
+
+/// Hand one decoded frame to the endpoint, dropping whatever did not fit.
+///
+/// [`PcmSink::write`] deliberately does not buffer — a second ring in front of
+/// the endpoint would add latency `GetCurrentPadding` cannot see, and that
+/// number is exactly what the drift corrector steers on — so it takes what fits
+/// and leaves the rest with us. A short write therefore means the endpoint
+/// buffer is genuinely full, i.e. we are ~400 ms behind; holding the remainder
+/// would only push us further behind, so it is dropped. Whole frames only, so a
+/// drop cannot rotate the channel assignment of everything after it.
+///
+/// A short write is normal and returns `Ok`. An `Err` is not: it means the
+/// endpoint stopped accepting audio altogether, which on Windows is what
+/// plugging in headphones looks like from here. That is a fact about the
+/// device, not about this frame, so it is returned rather than logged — see
+/// [`AudioLoop::write_to_sink`], which is the only caller and which retires the
+/// endpoint on it.
+fn write_pcm(sink: &mut dyn PcmSink, pcm: &[i16]) -> Result<()> {
+    if pcm.is_empty() {
+        return Ok(());
+    }
+    let frames = sink.write(pcm)?;
+    let channels = usize::from(sink.format().channels()).max(1);
+    let offered = pcm.len() / channels;
+    if (frames as usize) < offered {
+        tracing::trace!(
+            taken = frames,
+            offered,
+            "endpoint buffer full; dropping the tail of an audio frame"
+        );
+    }
+    Ok(())
+}
+
+/// First delay before re-opening a render endpoint that faulted.
+///
+/// Deliberately the same 500 ms / 15 s pair as the host's capture-side rebuild
+/// loop (`host::net::audio::REBUILD_BACKOFF_MIN`/`MAX`): the two sides are
+/// recovering from the same class of event — a WASAPI endpoint invalidated by a
+/// device change — and there is no reason for them to disagree about how eager
+/// to be about it.
+const SINK_REOPEN_BACKOFF_MIN_MS: u64 = 500;
+/// Ceiling on that backoff. A client with no playback device at all must not
+/// spend the session retrying, but a headset plugged in two minutes into a call
+/// must start working without a reconnect.
+const SINK_REOPEN_BACKOFF_MAX_MS: u64 = 15_000;
+
+/// How a replacement render endpoint is opened.
+///
+/// Always [`new_pcm_sink`] in production. It is a field rather than a direct
+/// call for the same reason `AudioLoop` takes its decoder and sink as trait
+/// objects: so `audio_loop_for_test` can drive the fault-and-recover path
+/// headless. Without the seam the re-open — the part most likely to be wrong,
+/// because "retry forever at packet rate" is the obvious mistake — would be the
+/// one piece of this loop no test could reach.
+type OpenSink = fn(AudioFormat) -> Result<Box<dyn PcmSink>>;
+
+/// Per-packet audio state, owned by the audio thread for its whole life.
+///
+/// The audio mirror of [`DecodeLoop`], split out for the same reason: so the
+/// whole playback path — jitter buffer, decoder, endpoint, and the two
+/// controllers that steer them — is drivable from a test with no Media
+/// Foundation, no WASAPI and no host. See `audio_loop_for_test`.
+///
+/// # Which buffer the drift corrector watches, and why it is not the obvious one
+///
+/// There are two elastic buffers here, and only one of them carries clock drift
+/// in *this* architecture. [`AudioJitterBuffer`] owns the network-domain one and
+/// runs a [`DriftCorrector`] over its own occupancy — but that corrector is
+/// specified for a caller that pops **once per DAC period**. This loop is
+/// **packet driven**: pops happen because a datagram arrived, not because a
+/// playback clock ticked. `handle_frame_at` therefore holds that window at its
+/// depth target explicitly, by draining to it on every arrival; see the pacing
+/// contract documented there and on [`AudioJitterBuffer`] itself. Occupancy
+/// consequently does not move with the crystals — it moves only when the depth
+/// controller moves the target. The difference between the host's capture clock
+/// and this machine's DAC clock accumulates in the *device-domain* buffer
+/// instead — the endpoint is filled at the host's rate and emptied at ours —
+/// which is exactly what [`PcmSink::padding_frames`] reports.
+///
+/// (An earlier version of this comment claimed the window's occupancy was
+/// "pinned at whatever the prebuffer filled it to and never moves" as a
+/// *consequence* of packet pacing. It is not: packet pacing on its own makes
+/// occupancy a ratchet in both directions. It is pinned because the drain in
+/// `handle_frame_at` pins it, and that is load-bearing rather than incidental.)
+///
+/// This loop therefore runs its own [`DriftCorrector`] over the endpoint's
+/// latency and acts on that, and deliberately does **not** act on the `drift`
+/// half of [`AudioJitterBuffer::observe`]'s return. That is a knowing departure
+/// from [`DriftCorrection`]'s "a command, not advice" contract, and the reason
+/// is that obeying it here is not conservative but actively wrong: with the
+/// window sitting a little under the target — which is the *normal* state, the
+/// prebuffer level is `target` minus the one packet just popped — the
+/// network-domain corrector reads a permanent shallow excursion and would
+/// command a 21 ms silence insertion every two seconds, forever. That is a
+/// click every two seconds bought by measuring the wrong buffer. The depth
+/// controller half of the same call **is** consumed: an underrun is a real
+/// event on the real window, and the target it produces is what the
+/// device-domain corrector steers towards.
+///
+/// The consequence is that `JitterStats::drift_drops` / `drift_inserts` count
+/// commands this loop did not obey, so [`AudioSnapshot::drift_corrections`]
+/// reports only the corrections that were actually applied. Counting the
+/// unobeyed ones would put a number in the panel that no audio ever passed
+/// through.
+struct AudioLoop {
+    jitter: AudioJitterBuffer,
+    /// `None` when no decoder could be built for the current format. Every
+    /// packet is then a no-op — exactly how [`DecodeLoop`] treats a missing
+    /// video decoder. Audio degrades to silence; it never panics, and it never
+    /// ends the thread.
+    decoder: Option<Box<dyn AudioDecode>>,
+    /// `None` when no endpoint could be opened, or when a live one faulted.
+    /// Unlike the decoder this one is retried — see `try_reopen_sink`.
+    sink: Option<Box<dyn PcmSink>>,
+    /// How `sink` gets (re)built. See [`OpenSink`].
+    open_sink: OpenSink,
+    /// When `sink` may next be re-opened, on this loop's clock. `None` means
+    /// there is nothing to re-open: either the endpoint is live, or no format
+    /// has been seen yet.
+    sink_retry_at_ms: Option<u64>,
+    /// Current re-open delay, doubled on each failed attempt and reset on
+    /// success. The whole point of the pair: without it, a client whose default
+    /// endpoint has gone would re-open it at packet rate — fifty attempts a
+    /// second, each one a COM activation.
+    sink_backoff_ms: u64,
+    /// The format `decoder` and `sink` were built for, `None` before the first
+    /// packet. Construction is necessarily lazy: both are bound to one format
+    /// for life, and the format arrives *with* a packet (it is a per-packet
+    /// header field, not a stream announcement).
+    format: Option<AudioFormat>,
+    /// Device-domain corrector — see the type's docs.
+    drift: DriftCorrector,
+    /// Set by `PushOutcome::BufferedFlushDecoder`; consumed immediately before
+    /// the next decode rather than on the spot, so a packet the drift corrector
+    /// drops cannot swallow the flush.
+    flush_pending: bool,
+    /// Set by [`DriftCorrection::DropFrame`]; consumed by the next pop.
+    drop_pending: bool,
+    /// Device-domain corrections actually applied. The network-domain ones are
+    /// already counted inside `JitterStats`.
+    device_corrections: u64,
+    /// Origin for the monotonic `now_ms` the two controllers are clocked on.
+    epoch: Instant,
+    status: Arc<AudioStatus>,
+}
+
+impl AudioLoop {
+    fn new(status: Arc<AudioStatus>) -> Self {
+        let config = JitterConfig::default();
+        Self {
+            jitter: AudioJitterBuffer::new(config),
+            decoder: None,
+            sink: None,
+            open_sink: new_pcm_sink,
+            sink_retry_at_ms: None,
+            sink_backoff_ms: SINK_REOPEN_BACKOFF_MIN_MS,
+            format: None,
+            drift: DriftCorrector::new(&config),
+            flush_pending: false,
+            drop_pending: false,
+            device_corrections: 0,
+            epoch: Instant::now(),
+            status,
+        }
+    }
+
+    /// Handle one received access unit, on the loop's own monotonic clock.
+    fn handle_frame(&mut self, frame: AudioFrame) {
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        self.handle_frame_at(now_ms, frame);
+    }
+
+    /// [`AudioLoop::handle_frame`] with the clock injected.
+    ///
+    /// Split out for the same reason every timed decision in
+    /// `directdesk_shared::audio::jitter` takes `now_ms`: the depth controller
+    /// decays over ten seconds and the drift corrector samples every two, so a
+    /// test that could not move the clock could not reach either of them.
+    fn handle_frame_at(&mut self, now_ms: u64, frame: AudioFrame) {
+        self.ensure_format(now_ms, frame.format);
+        self.try_reopen_sink(now_ms);
+
+        // The jitter buffer speaks the *wire* type, which borrows its payload;
+        // the channel hands us the owned one. Rebuilding the borrowed view here
+        // copies nothing and preserves the buffer's "allocate only on
+        // acceptance" property — a duplicate or a late arrival still costs no
+        // allocation at all.
+        let packet = AudioPacket {
+            seq: frame.seq,
+            capture_ms: frame.capture_ms,
+            discontinuity: frame.discontinuity,
+            format: frame.format,
+            payload: access_unit(&frame),
+        };
+        let outcome = self.jitter.push(&packet);
+        if outcome.needs_decoder_flush() {
+            // AAC-LC carries filterbank overlap from the previous frame, so
+            // running the decoder across a capture gap smears instead of
+            // cutting. The window also just emptied for a reason that has
+            // nothing to do with anyone's crystal, so the device-domain
+            // corrector must re-seed rather than read the gap as drift.
+            self.flush_pending = true;
+            self.drift.reset();
+        }
+
+        // --- The pacing contract ------------------------------------------
+        //
+        // THIS BUFFER IS PACKET DRIVEN HERE, NOT DAC DRIVEN. `pop` happens
+        // because a datagram arrived, not because a playback clock ticked —
+        // the real playback clock is four hundred milliseconds downstream,
+        // inside WASAPI's render buffer, and this thread never sees it tick.
+        // `AudioJitterBuffer`'s docs spell the contract out; both halves of it
+        // are here because each one is a shipped bug if it is dropped.
+        //
+        // 1. Pop only for a packet that was ACCEPTED. A discard is not a period
+        //    of audio. `system_audio_redundancy` re-sends packet N-1 behind
+        //    packet N, so half of all arrivals are duplicates by design; a pop
+        //    per arrival would run two pops against one push, drain the
+        //    prebuffer in ~85 ms, starve, refill in silence and repeat. The
+        //    feature that exists to repair a lossy link would chop the audio
+        //    several times a second on exactly the links it was turned on for.
+        //
+        // 2. Then KEEP POPPING while the window is above its depth target. Every
+        //    period the buffer withholds — a 40 ms reorder wait around a lost
+        //    packet — is a push with no matching pop, and without a catch-up
+        //    path that packet of occupancy is permanent: a packet-paced consumer
+        //    can otherwise never take two in one period. It ratchets, ~2 packets
+        //    per loss, until the window is full, and only a reconnect clears it.
+        //    Draining costs nothing: it moves audio from the network buffer into
+        //    the device buffer, which is where a packet-paced caller wants its
+        //    slack anyway. It discards nothing.
+        //
+        // The drain is gated on having actually played something. If the buffer
+        // is withholding it has already said so — once — by counting a starve;
+        // asking again inside the same arrival would report the same silent
+        // period twice and inflate the number the diagnostics panel shows.
+        //
+        // Termination: every iteration either pops (which strictly shrinks the
+        // window) or breaks.
+        //
+        // Popped frames are bound to a local rather than used as an `if let`
+        // scrutinee: the buffer's borrow must end before `play` takes
+        // `&mut self` again.
+        let mut played = false;
+        if outcome.was_buffered() {
+            let popped = self.jitter.pop(now_ms);
+            if let Some(popped) = popped {
+                self.play(now_ms, popped);
+                played = true;
+            }
+        }
+        while played && self.jitter.buffered_ms() > self.jitter.target_ms() as f32 {
+            let popped = self.jitter.pop(now_ms);
+            let Some(popped) = popped else { break };
+            self.play(now_ms, popped);
+        }
+
+        // The depth controller, once per packet. `observe` also consumes the
+        // buffer's underrun flag, so it must run every period whether or not
+        // anything popped — a period that starved is precisely the one it needs
+        // to hear about. Its `drift` half is discarded on purpose; see this
+        // type's docs for which buffer actually carries drift here.
+        let adjust = self.jitter.observe(now_ms);
+        if let Some(target_ms) = adjust.target_ms {
+            tracing::debug!(target_ms, "audio jitter depth target moved");
+        }
+
+        // The drift corrector, steering the *endpoint's* fill towards the depth
+        // controller's target. `latency_ms` is derived from `padding_frames`,
+        // which is the endpoint's real queue depth rather than an estimate, so
+        // there is nothing here to model or to get wrong.
+        let device_latency_ms = self.sink.as_ref().and_then(|s| s.latency_ms().ok());
+        let target_ms = self.jitter.target_ms();
+        let device_drift =
+            device_latency_ms.and_then(|ms| self.drift.observe(now_ms, ms as f32, target_ms));
+        match device_drift {
+            Some(DriftCorrection::DropFrame) => {
+                // Deferred to the next pop rather than done here: the packet
+                // for this period has already been played.
+                self.drop_pending = true;
+                self.device_corrections += 1;
+            }
+            Some(DriftCorrection::InsertSilence) => {
+                self.insert_silence(now_ms);
+                self.device_corrections += 1;
+            }
+            None => {}
+        }
+
+        self.publish(device_latency_ms);
+    }
+
+    /// Build (or rebuild) the decoder and endpoint for `format`.
+    ///
+    /// A format change mid-session is the ordinary path, not an exception — the
+    /// operator moving the host's default output to a Bluetooth headset changes
+    /// the capture mix underneath us — and the answer to it is a new decoder
+    /// and a new render stream, because an MFT's input type and an
+    /// `IAudioClient`'s `WAVEFORMATEX` are both fixed for the object's life.
+    ///
+    /// Neither failure ends the thread: the loop runs on as a no-op sink. That
+    /// mirrors how [`DecodeLoop::new`] handles `new_decoder()` failing, and it
+    /// is the only acceptable policy for a layer the session does not depend on.
+    /// `self.format` is set even on failure, so a host streaming a format this
+    /// machine cannot play does not re-attempt (and re-log) fifty times a
+    /// second.
+    ///
+    /// The two failures are then treated differently, and deliberately so:
+    ///
+    /// * A **decoder** failure is permanent. There is no such thing as an AAC
+    ///   MFT that turns up halfway through a call, so it is logged once and
+    ///   that is the end of it.
+    /// * An **endpoint** failure is not. "No default render endpoint" is the
+    ///   state of a laptop whose user has not plugged their headset in yet, and
+    ///   it resolves on its own. It is handed to `try_reopen_sink`, which
+    ///   retries behind a backoff — the same answer the host's capture side
+    ///   already gives to the same condition.
+    fn ensure_format(&mut self, now_ms: u64, format: AudioFormat) {
+        if self.format == Some(format) {
+            return;
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            tracing::info!(
+                "audio format changed to {} Hz {} ch; rebuilding decoder and endpoint",
+                format.sample_rate(),
+                format.channels()
+            );
+            if let Err(e) = sink.stop() {
+                tracing::debug!("stopping the old audio endpoint failed: {e}");
+            }
+        }
+        // Release the old pair before building the new one, so two render
+        // streams are never open on the same endpoint at once.
+        self.decoder = None;
+        self.sink = None;
+        self.format = Some(format);
+        self.flush_pending = false;
+        self.drop_pending = false;
+        self.drift.reset();
+        self.sink_backoff_ms = SINK_REOPEN_BACKOFF_MIN_MS;
+        self.sink_retry_at_ms = None;
+
+        match new_audio_decoder(format) {
+            Ok(decoder) => {
+                self.status.set_description(decoder.describe());
+                self.decoder = Some(decoder);
+            }
+            Err(e) => {
+                tracing::error!("audio decoder unavailable: {e}");
+                self.status.set_description("unavailable");
+                self.status.set_error(Some(e.to_string()));
+            }
+        }
+        match self.open_started_sink(format) {
+            Ok(sink) => self.sink = Some(sink),
+            Err(e) => {
+                tracing::error!("audio endpoint unavailable: {e}");
+                self.status.set_error(Some(e.to_string()));
+                self.schedule_sink_retry(now_ms);
+            }
+        }
+    }
+
+    /// Open an endpoint for `format` and start it, as one fallible step.
+    ///
+    /// A sink that opened but would not start is not a sink: leaving it in
+    /// `self.sink` would give the loop something that accepts writes and plays
+    /// none of them, which is worse than no endpoint at all because the
+    /// diagnostics would show one.
+    fn open_started_sink(&self, format: AudioFormat) -> Result<Box<dyn PcmSink>> {
+        let mut sink = (self.open_sink)(format)?;
+        sink.start()?;
+        Ok(sink)
+    }
+
+    /// Arm the next re-open attempt and widen the backoff for the one after.
+    fn schedule_sink_retry(&mut self, now_ms: u64) {
+        self.sink_retry_at_ms = Some(now_ms.saturating_add(self.sink_backoff_ms));
+        self.sink_backoff_ms = (self.sink_backoff_ms * 2).min(SINK_REOPEN_BACKOFF_MAX_MS);
+    }
+
+    /// The endpoint stopped accepting audio. Retire it and arrange a re-open.
+    ///
+    /// This is the client's half of a condition the host has always handled:
+    /// `AUDCLNT_E_DEVICE_INVALIDATED` and its relatives (see
+    /// `host::audio_capture::is_recoverable_hresult`) are what plugging in
+    /// headphones, connecting a Bluetooth headset, an exclusive-mode application
+    /// seizing the device, or the Windows Audio service restarting look like
+    /// from inside a live `IAudioClient`. Every one of them is followed moments
+    /// later by a perfectly good *new* default endpoint. The host drops its
+    /// capture stream and builds another; until now this loop logged a line and
+    /// carried on writing into a dead handle for the rest of the session — about
+    /// fifty warn lines a second, with `audio_error` still `None` and the packet
+    /// counters still climbing, so the diagnostics panel showed a healthy stream
+    /// playing to nobody.
+    ///
+    /// The HRESULT is deliberately not inspected. By the time an error reaches
+    /// here the endpoint has already refused audio, and the recovery for "the
+    /// device went away" and for "this device is broken" is the same move: drop
+    /// it, try again later, back off if later keeps failing. Classifying would
+    /// buy a way to give up permanently, which is not an improvement.
+    ///
+    /// Re-opening is deliberately *not* done by clearing `self.format`. That
+    /// would route recovery back through `ensure_format`, which runs on every
+    /// packet — so a client with no endpoint would attempt a COM activation ~48
+    /// times a second, forever, and rebuild a perfectly good decoder each time.
+    fn fault_sink(&mut self, now_ms: u64, e: Error) {
+        let text = e.to_string();
+        tracing::warn!("audio endpoint failed ({text}); closing it and retrying");
+        self.status.set_error(Some(text));
+        if let Some(sink) = self.sink.as_mut() {
+            if let Err(e) = sink.stop() {
+                tracing::debug!("stopping the failed audio endpoint: {e}");
+            }
+        }
+        self.sink = None;
+        self.schedule_sink_retry(now_ms);
+    }
+
+    /// Re-open a faulted endpoint, at most once per backoff interval.
+    fn try_reopen_sink(&mut self, now_ms: u64) {
+        if self.sink.is_some() {
+            return;
+        }
+        let (Some(due), Some(format)) = (self.sink_retry_at_ms, self.format) else {
+            return;
+        };
+        if now_ms < due {
+            return;
+        }
+        match self.open_started_sink(format) {
+            Ok(sink) => {
+                tracing::info!("audio endpoint re-opened");
+                self.sink = Some(sink);
+                self.sink_retry_at_ms = None;
+                self.sink_backoff_ms = SINK_REOPEN_BACKOFF_MIN_MS;
+                // The new endpoint is empty and the device-domain corrector's
+                // average describes a buffer that no longer exists; feeding it
+                // the new one's near-zero fill would read as an enormous
+                // negative drift.
+                self.drift.reset();
+                // Clearing the whole error is safe rather than optimistic: the
+                // only other producer is a decode failure, and a decoder that
+                // is still failing re-reports on the very next access unit.
+                self.status.set_error(None);
+            }
+            Err(e) => {
+                // Debug, not warn: this repeats until the device comes back,
+                // and the state is already visible as `audio_error` plus the
+                // `None` device gauges.
+                tracing::debug!("audio endpoint still unavailable: {e}");
+                self.status.set_error(Some(e.to_string()));
+                self.schedule_sink_retry(now_ms);
+            }
+        }
+    }
+
+    /// Play `pcm`, retiring the endpoint if it has stopped accepting audio.
+    ///
+    /// The one place PCM meets the device, so the one place a device fault can
+    /// be noticed. `insert_silence` goes through it for exactly that reason: a
+    /// silence insertion is a real write to a real endpoint and can fail the
+    /// same way.
+    fn write_to_sink(&mut self, now_ms: u64, pcm: &[i16]) {
+        // The result is taken out before anything else touches `self`, so the
+        // borrow of `self.sink` ends before `fault_sink` needs `&mut self`.
+        let result = match self.sink.as_mut() {
+            Some(sink) => write_pcm(&mut **sink, pcm),
+            None => return,
+        };
+        if let Err(e) = result {
+            self.fault_sink(now_ms, e);
+        }
+    }
+
+    /// Decode one popped access unit and play it.
+    fn play(&mut self, now_ms: u64, popped: AudioFrame) {
+        if self.drop_pending {
+            // The drift corrector asked for one frame of audio to disappear.
+            // Discarding it before the decoder is the cheapest of the places
+            // `DriftCorrection::DropFrame` permits. The pending flush is
+            // deliberately *not* consumed here: the next packet still needs it.
+            self.drop_pending = false;
+            return;
+        }
+        let Some(decoder) = self.decoder.as_mut() else {
+            return;
+        };
+        if self.flush_pending {
+            decoder.flush();
+            self.flush_pending = false;
+        }
+        let pcm = match decoder.submit(access_unit(&popped)) {
+            Ok(pcm) => pcm,
+            Err(e) => {
+                // One bad access unit is one click. AAC-LC frames are
+                // independently decodable, so there is nothing to recover and
+                // nothing to ask the host for — the next packet decodes on its
+                // own.
+                tracing::warn!(seq = popped.seq, "audio decode failed: {e}");
+                self.status.set_error(Some(e.to_string()));
+                return;
+            }
+        };
+        self.write_to_sink(now_ms, &pcm);
+    }
+
+    /// Play one frame period of silence without consuming a packet — the other
+    /// half of [`DriftCorrection`]'s accounting.
+    fn insert_silence(&mut self, now_ms: u64) {
+        let Some(format) = self.format else {
+            return;
+        };
+        if self.sink.is_none() {
+            return;
+        }
+        // One AAC-LC frame: 1024 samples per channel, 21.33 ms at 48 kHz — the
+        // unit `DriftCorrection` accounts in.
+        let silence = vec![0i16; AAC_FRAME_SAMPLES * usize::from(format.channels())];
+        self.write_to_sink(now_ms, &silence);
+    }
+
+    fn publish(&self, device_latency_ms: Option<u32>) {
+        let stats = self.jitter.stats();
+        self.status.publish(AudioSnapshot {
+            buffered_ms: self.jitter.buffered_ms().round() as u32,
+            target_ms: self.jitter.target_ms(),
+            packets_received: stats.received,
+            packets_delivered: stats.delivered,
+            lost: stats.lost,
+            late: stats.late,
+            underruns: stats.underrun,
+            device_underruns: self.sink.as_ref().map(|sink| sink.underruns()),
+            device_latency_ms,
+            // Applied, not commanded — see the type docs. `stats.drift_drops`
+            // and `stats.drift_inserts` are the network-domain corrector's
+            // unobeyed commands and are deliberately not summed in.
+            drift_corrections: self.device_corrections,
+        });
+    }
+
+    /// Stop the endpoint on the way out. Whatever is still queued is left in
+    /// place; the stream is about to be released anyway.
+    fn shutdown(&mut self) {
+        if let Some(sink) = self.sink.as_mut() {
+            if let Err(e) = sink.stop() {
+                tracing::debug!("audio endpoint stop failed: {e}");
+            }
+        }
+    }
+}
+
 /// `--loopback-demo`: synthetic RGBA frames at `fps`, no H.264 involved.
 ///
 /// This exists to exercise the render + input + stats loop end to end with no
@@ -555,6 +1275,8 @@ fn synth_frame(width: u32, height: u32, tick: u32, timestamp_ms: u32) -> RawFram
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio_decoder::NullAudioDecoder;
+    use crate::audio_render::{ms_to_frames, RecordingSink};
     use directdesk_shared::error::Error;
     use directdesk_shared::tiles::{compress_strip, TILE_EDGE};
     use directdesk_shared::traits::NullDecoder;
@@ -851,6 +1573,775 @@ mod tests {
 
         // Shares the pipeline's stop flag, so this returns rather than hanging.
         pipeline.shutdown();
+    }
+
+    // -- system audio ------------------------------------------------------
+
+    /// Share a test double with the [`AudioLoop`] that owns it.
+    ///
+    /// The loop takes its decoder and sink as `Box<dyn _>`, which a test cannot
+    /// look back inside afterwards. These two wrappers hand the loop a handle
+    /// and keep one, so assertions can be made against the *real* doubles —
+    /// `NullAudioDecoder` and `RecordingSink`, with their real whole-frame
+    /// rules and admission arithmetic — rather than against a stub written to
+    /// make the test pass.
+    #[derive(Clone)]
+    struct SharedNullDecoder(Arc<Mutex<NullAudioDecoder>>);
+
+    impl SharedNullDecoder {
+        fn new(format: AudioFormat) -> Self {
+            Self(Arc::new(Mutex::new(NullAudioDecoder::new(format))))
+        }
+        fn submits(&self) -> u64 {
+            self.0.lock().submits()
+        }
+        fn flushes(&self) -> u64 {
+            self.0.lock().flushes()
+        }
+    }
+
+    impl AudioDecode for SharedNullDecoder {
+        fn submit(&mut self, access_unit: &[u8]) -> directdesk_shared::error::Result<Vec<i16>> {
+            self.0.lock().submit(access_unit)
+        }
+        fn flush(&mut self) {
+            self.0.lock().flush();
+        }
+        fn format(&self) -> AudioFormat {
+            self.0.lock().format()
+        }
+        fn describe(&self) -> String {
+            self.0.lock().describe()
+        }
+    }
+
+    #[derive(Clone)]
+    struct SharedSink(Arc<Mutex<RecordingSink>>);
+
+    impl SharedSink {
+        fn new(format: AudioFormat) -> Self {
+            Self(Arc::new(Mutex::new(RecordingSink::new(format))))
+        }
+        fn written(&self) -> Vec<i16> {
+            self.0.lock().written().to_vec()
+        }
+        /// Queue a full endpoint buffer of audio, i.e. 400 ms of output
+        /// latency. What a client whose DAC crystal runs slow looks like after
+        /// a few hours of drift.
+        fn prefill(&self) {
+            let mut inner = self.0.lock();
+            inner.start().unwrap();
+            let frames = inner.buffer_frames() as usize;
+            let channels = usize::from(inner.format().channels());
+            let taken = inner.write(&vec![0i16; frames * channels]).unwrap();
+            assert_eq!(taken as usize, frames, "the prefill must fill the buffer");
+        }
+
+        /// Queue `ms` of output latency, so the device-domain drift corrector
+        /// starts *inside* its deadband. A long run that starts at zero latency
+        /// walks there by inserting silence, which is correct behaviour and
+        /// pure noise in a test about something else.
+        fn prefill_ms(&self, ms: u32) {
+            let mut inner = self.0.lock();
+            inner.start().unwrap();
+            let frames = ms_to_frames(ms, inner.format().sample_rate()) as usize;
+            let channels = usize::from(inner.format().channels());
+            inner.write(&vec![0i16; frames * channels]).unwrap();
+        }
+
+        /// Simulate the audio engine playing `frames` out of the endpoint.
+        fn drain(&self, frames: u32) {
+            self.0.lock().drain(frames);
+        }
+    }
+
+    impl PcmSink for SharedSink {
+        fn format(&self) -> AudioFormat {
+            self.0.lock().format()
+        }
+        fn buffer_frames(&self) -> u32 {
+            self.0.lock().buffer_frames()
+        }
+        fn padding_frames(&self) -> directdesk_shared::error::Result<u32> {
+            self.0.lock().padding_frames()
+        }
+        fn write(&mut self, pcm: &[i16]) -> directdesk_shared::error::Result<u32> {
+            self.0.lock().write(pcm)
+        }
+        fn start(&mut self) -> directdesk_shared::error::Result<()> {
+            self.0.lock().start()
+        }
+        fn stop(&mut self) -> directdesk_shared::error::Result<()> {
+            self.0.lock().stop()
+        }
+        fn underruns(&self) -> u64 {
+            self.0.lock().underruns()
+        }
+        fn describe(&self) -> String {
+            self.0.lock().describe()
+        }
+    }
+
+    /// An [`AudioDecode`] that refuses every access unit, counting the attempts.
+    /// `NullAudioDecoder` covers the always-succeeds case; this covers the
+    /// always-fails one, exactly as `ScriptedDecoder` does for video.
+    struct FailingAudioDecoder {
+        format: AudioFormat,
+        submits: Arc<AtomicU64>,
+    }
+
+    impl AudioDecode for FailingAudioDecoder {
+        fn submit(&mut self, _access_unit: &[u8]) -> directdesk_shared::error::Result<Vec<i16>> {
+            self.submits.fetch_add(1, Ordering::Relaxed);
+            Err(Error::Decoder("boom".into()))
+        }
+        fn flush(&mut self) {}
+        fn format(&self) -> AudioFormat {
+            self.format
+        }
+        fn describe(&self) -> String {
+            "always fails (test double)".into()
+        }
+    }
+
+    /// A sink that plays normally until [`FaultingSink::kill`], then refuses
+    /// everything — which is exactly what a live `IAudioClient` does the moment
+    /// its endpoint is invalidated underneath it, whether by headphones going
+    /// in, a Bluetooth headset connecting, an exclusive-mode application
+    /// seizing the device, or the Windows Audio service restarting.
+    #[derive(Clone)]
+    struct FaultingSink {
+        inner: SharedSink,
+        dead: Arc<AtomicBool>,
+        /// Writes refused since the fault. The number that must stop moving:
+        /// the old loop wrote into the dead handle ~48 times a second for the
+        /// rest of the session.
+        refusals: Arc<AtomicU64>,
+    }
+
+    impl FaultingSink {
+        fn new(format: AudioFormat) -> Self {
+            Self {
+                inner: SharedSink::new(format),
+                dead: Arc::new(AtomicBool::new(false)),
+                refusals: Arc::new(AtomicU64::new(0)),
+            }
+        }
+        fn kill(&self) {
+            self.dead.store(true, Ordering::Relaxed);
+        }
+        fn refusals(&self) -> u64 {
+            self.refusals.load(Ordering::Relaxed)
+        }
+        fn invalidated() -> Error {
+            Error::Other("audio render: device invalidated (test)".into())
+        }
+    }
+
+    impl PcmSink for FaultingSink {
+        fn format(&self) -> AudioFormat {
+            self.inner.format()
+        }
+        fn buffer_frames(&self) -> u32 {
+            self.inner.buffer_frames()
+        }
+        fn padding_frames(&self) -> directdesk_shared::error::Result<u32> {
+            if self.dead.load(Ordering::Relaxed) {
+                return Err(Self::invalidated());
+            }
+            self.inner.padding_frames()
+        }
+        fn write(&mut self, pcm: &[i16]) -> directdesk_shared::error::Result<u32> {
+            if self.dead.load(Ordering::Relaxed) {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(Self::invalidated());
+            }
+            self.inner.write(pcm)
+        }
+        fn start(&mut self) -> directdesk_shared::error::Result<()> {
+            self.inner.start()
+        }
+        fn stop(&mut self) -> directdesk_shared::error::Result<()> {
+            // Stopping an invalidated client fails too, which is the path that
+            // must be logged rather than propagated.
+            if self.dead.load(Ordering::Relaxed) {
+                return Err(Self::invalidated());
+            }
+            self.inner.stop()
+        }
+        fn underruns(&self) -> u64 {
+            self.inner.underruns()
+        }
+        fn describe(&self) -> String {
+            "faulting endpoint (test double)".into()
+        }
+    }
+
+    thread_local! {
+        /// Sinks [`test_open_sink`] has handed out, oldest first.
+        ///
+        /// [`OpenSink`] is a plain `fn` pointer — a field the production build
+        /// sets once should not cost an allocation — and a `fn` cannot capture,
+        /// so the tests' side channel is a thread-local. Each `#[test]` runs on
+        /// its own thread, so no two share one.
+        static OPENED_SINKS: std::cell::RefCell<Vec<SharedSink>> =
+            std::cell::RefCell::new(Vec::new());
+        /// Opens [`test_open_sink`] should fail before it starts succeeding —
+        /// a client with no default render endpoint yet.
+        static OPEN_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Opens attempted, successful or not.
+        static OPEN_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn test_open_sink(format: AudioFormat) -> directdesk_shared::error::Result<Box<dyn PcmSink>> {
+        OPEN_ATTEMPTS.with(|c| c.set(c.get() + 1));
+        let remaining = OPEN_FAILURES.with(|c| c.get());
+        if remaining > 0 {
+            OPEN_FAILURES.with(|c| c.set(remaining - 1));
+            return Err(Error::Other(
+                "audio render: no default endpoint (test)".into(),
+            ));
+        }
+        let sink = SharedSink::new(format);
+        OPENED_SINKS.with(|s| s.borrow_mut().push(sink.clone()));
+        Ok(Box::new(sink))
+    }
+
+    fn open_attempts() -> u32 {
+        OPEN_ATTEMPTS.with(|c| c.get())
+    }
+
+    /// Clear the seam's thread-local state and arm `failures` failed opens.
+    ///
+    /// Belt and braces: libtest normally gives every test its own thread, but
+    /// `--test-threads=1` does not, and a counter leaked from a previous test
+    /// would fail these in a way that looks exactly like a bug in the code under
+    /// test rather than in the fixture.
+    fn reset_open_sink_seam(failures: u32) {
+        OPENED_SINKS.with(|s| s.borrow_mut().clear());
+        OPEN_FAILURES.with(|c| c.set(failures));
+        OPEN_ATTEMPTS.with(|c| c.set(0));
+    }
+
+    fn opened_sinks() -> usize {
+        OPENED_SINKS.with(|s| s.borrow().len())
+    }
+
+    fn opened_sink(index: usize) -> SharedSink {
+        OPENED_SINKS.with(|s| s.borrow()[index].clone())
+    }
+
+    /// Assemble an [`AudioLoop`] directly from its fields, bypassing
+    /// `AudioLoop::ensure_format`'s calls into Media Foundation and WASAPI so a
+    /// test can hand it `NullAudioDecoder` + `RecordingSink` instead. The audio
+    /// twin of `decode_loop_for_test`, and the whole reason the playback path
+    /// is exercisable headless.
+    fn audio_loop_for_test(
+        format: AudioFormat,
+        decoder: Option<Box<dyn AudioDecode>>,
+        sink: Option<Box<dyn PcmSink>>,
+    ) -> AudioLoop {
+        // `prebuffer: false` for the same reason `jitter.rs`'s own `plain()`
+        // fixture turns it off: these tests are about the decode/play chain,
+        // and leaving the prebuffer in would make every one of them also a
+        // latency test with four packets of setup before anything happens.
+        // `audio_loop_with_config` is for the tests that must run the shipped
+        // default instead, prebuffer and all.
+        let config = JitterConfig {
+            prebuffer: false,
+            ..JitterConfig::default()
+        };
+        audio_loop_with_config(config, format, decoder, sink)
+    }
+
+    fn audio_loop_with_config(
+        config: JitterConfig,
+        format: AudioFormat,
+        decoder: Option<Box<dyn AudioDecode>>,
+        sink: Option<Box<dyn PcmSink>>,
+    ) -> AudioLoop {
+        AudioLoop {
+            jitter: AudioJitterBuffer::new(config),
+            decoder,
+            sink,
+            // Never `new_pcm_sink`: a re-open in a test must reach a double,
+            // for exactly the reason `format` is pre-set below.
+            open_sink: test_open_sink,
+            sink_retry_at_ms: None,
+            sink_backoff_ms: SINK_REOPEN_BACKOFF_MIN_MS,
+            // Pre-set, so `ensure_format` short-circuits and the real platform
+            // constructors are never reached.
+            format: Some(format),
+            drift: DriftCorrector::new(&config),
+            flush_pending: false,
+            drop_pending: false,
+            device_corrections: 0,
+            epoch: Instant::now(),
+            status: Arc::new(AudioStatus::default()),
+        }
+    }
+
+    /// One access unit, as it arrives from the transport.
+    fn au(seq: u32, format: AudioFormat) -> AudioFrame {
+        AudioFrame {
+            seq,
+            capture_ms: seq.wrapping_mul(21),
+            discontinuity: false,
+            format,
+            data: vec![0xDE, 0xAD],
+        }
+    }
+
+    #[test]
+    fn an_access_unit_flows_from_the_jitter_buffer_through_the_decoder_into_the_sink() {
+        let format = AudioFormat::Stereo48k;
+        let decoder = SharedNullDecoder::new(format);
+        let sink = SharedSink::new(format);
+        let mut audio = audio_loop_for_test(
+            format,
+            Some(Box::new(decoder.clone())),
+            Some(Box::new(sink.clone())),
+        );
+
+        audio.handle_frame_at(0, au(0, format));
+
+        assert_eq!(decoder.submits(), 1, "the popped unit reached the decoder");
+        let written = sink.written();
+        assert_eq!(
+            written.len(),
+            AAC_FRAME_SAMPLES * 2,
+            "one AAC frame of interleaved stereo PCM reached the endpoint"
+        );
+        assert!(
+            written.iter().any(|&s| s != 0),
+            "the decoder's ramp must arrive; a zeroed buffer would pass a \
+             length check while proving nothing was ever written"
+        );
+
+        let snap = audio.status.snapshot().expect("gauges are published");
+        assert_eq!(snap.packets_received, 1);
+        assert_eq!(snap.packets_delivered, 1);
+        assert_eq!(snap.lost, 0);
+        assert_eq!(snap.underruns, 0);
+        assert_eq!(snap.device_underruns, Some(0));
+
+        // And it keeps flowing: three more units, three more frames of PCM,
+        // appended in order rather than replacing what was there.
+        for seq in 1..4u32 {
+            audio.handle_frame_at(u64::from(seq) * 21, au(seq, format));
+        }
+        assert_eq!(decoder.submits(), 4);
+        assert_eq!(sink.written().len(), 4 * AAC_FRAME_SAMPLES * 2);
+        assert_eq!(
+            audio.status.snapshot().unwrap().packets_delivered,
+            4,
+            "every unit was delivered, none held or lost"
+        );
+    }
+
+    #[test]
+    fn a_discontinuity_flushes_the_decoder_before_the_next_access_unit() {
+        let format = AudioFormat::Stereo48k;
+        let decoder = SharedNullDecoder::new(format);
+        let sink = SharedSink::new(format);
+        let mut audio = audio_loop_for_test(
+            format,
+            Some(Box::new(decoder.clone())),
+            Some(Box::new(sink.clone())),
+        );
+
+        audio.handle_frame_at(0, au(0, format));
+        assert_eq!(decoder.flushes(), 0, "an ordinary packet must not flush");
+
+        // The host restarted capture: the stream we were following is gone, and
+        // the decoder still holds filterbank overlap from before the gap.
+        let mut gap = au(1, format);
+        gap.discontinuity = true;
+        audio.handle_frame_at(21, gap);
+
+        assert_eq!(
+            decoder.flushes(),
+            1,
+            "the pre-gap samples must be dropped, not played after the gap"
+        );
+        assert_eq!(
+            decoder.submits(),
+            2,
+            "and the post-gap unit is still decoded — AAC-LC frames are \
+             independently decodable, so there is no keyframe-style wait"
+        );
+
+        // Once, not on every packet that follows.
+        audio.handle_frame_at(42, au(2, format));
+        assert_eq!(decoder.flushes(), 1);
+        assert_eq!(decoder.submits(), 3);
+    }
+
+    #[test]
+    fn a_decoder_failure_degrades_to_silence_without_stopping_the_thread() {
+        let format = AudioFormat::Mono48k;
+        let submits = Arc::new(AtomicU64::new(0));
+        let sink = SharedSink::new(format);
+        let mut audio = audio_loop_for_test(
+            format,
+            Some(Box::new(FailingAudioDecoder {
+                format,
+                submits: submits.clone(),
+            })),
+            Some(Box::new(sink.clone())),
+        );
+
+        for seq in 0..8u32 {
+            audio.handle_frame_at(u64::from(seq) * 21, au(seq, format));
+        }
+
+        assert_eq!(
+            submits.load(Ordering::Relaxed),
+            8,
+            "every unit was still offered — the loop did not give up"
+        );
+        assert!(
+            sink.written().is_empty(),
+            "a failing decoder produces silence, never noise"
+        );
+        assert!(
+            audio.status.error().is_some(),
+            "and the failure is reported, not swallowed"
+        );
+        let snap = audio.status.snapshot().expect("gauges are published");
+        assert_eq!(snap.packets_received, 8, "the pump kept pumping");
+        assert_eq!(snap.packets_delivered, 8);
+
+        // The other failure shape — no decoder at all, as on a machine without
+        // Media Foundation — must behave identically rather than panic.
+        let quiet_sink = SharedSink::new(format);
+        let mut headless = audio_loop_for_test(format, None, Some(Box::new(quiet_sink.clone())));
+        for seq in 0..4u32 {
+            headless.handle_frame_at(u64::from(seq) * 21, au(seq, format));
+        }
+        assert!(quiet_sink.written().is_empty());
+        assert_eq!(headless.status.snapshot().unwrap().packets_delivered, 4);
+
+        // And with neither decoder nor endpoint the loop still runs and still
+        // publishes honest gauges: no endpoint means no number, not a zero.
+        let mut deaf = audio_loop_for_test(format, None, None);
+        deaf.handle_frame_at(0, au(0, format));
+        let snap = deaf.status.snapshot().unwrap();
+        assert_eq!(snap.device_underruns, None);
+        assert_eq!(snap.device_latency_ms, None);
+        assert_eq!(snap.packets_delivered, 1);
+    }
+
+    /// The judgment call in [`AudioLoop`]'s docs, pinned: the corrector reads
+    /// the *endpoint's* fill, not the jitter window's, and one excursion buys
+    /// exactly one dropped frame.
+    #[test]
+    fn a_deep_endpoint_buffer_drops_exactly_one_frame_of_audio() {
+        let format = AudioFormat::Stereo48k;
+        let decoder = SharedNullDecoder::new(format);
+        let sink = SharedSink::new(format);
+        sink.prefill(); // 400 ms queued, far past the deadband's deep edge
+
+        let mut audio = audio_loop_for_test(
+            format,
+            Some(Box::new(decoder.clone())),
+            Some(Box::new(sink.clone())),
+        );
+
+        // One sample is not evidence of drift: the first observation only seeds
+        // the average.
+        audio.handle_frame_at(0, au(0, format));
+        assert_eq!(decoder.submits(), 1);
+        assert_eq!(audio.status.snapshot().unwrap().drift_corrections, 0);
+
+        // Two seconds on, the corrector has its second sample and commands a
+        // drop — but this period's packet has already played.
+        audio.handle_frame_at(2_000, au(1, format));
+        assert_eq!(decoder.submits(), 2);
+        assert_eq!(audio.status.snapshot().unwrap().drift_corrections, 1);
+        assert_eq!(
+            audio.status.snapshot().unwrap().device_latency_ms,
+            Some(400),
+            "the latency is read from the endpoint, not modelled"
+        );
+
+        // The command lands on the next packet, which never reaches the decoder.
+        audio.handle_frame_at(2_021, au(2, format));
+        assert_eq!(
+            decoder.submits(),
+            2,
+            "one frame's worth of audio left the pipeline"
+        );
+
+        // Exactly one. The corrector cannot sample again for another two
+        // seconds, so the packets after it play normally.
+        audio.handle_frame_at(2_042, au(3, format));
+        assert_eq!(decoder.submits(), 3);
+        assert_eq!(audio.status.snapshot().unwrap().drift_corrections, 1);
+    }
+
+    /// The shipped `JitterConfig::default()` — prebuffer and all — through the
+    /// shipped packet-driven caller, on the arrival pattern
+    /// `system_audio_redundancy` puts on the wire.
+    ///
+    /// That combination had no coverage anywhere. Every other test in this
+    /// module turns the prebuffer off to keep the decode/play chain in focus,
+    /// and the jitter buffer's own long-run tests pop once per DAC tick, which
+    /// models a caller this codebase does not contain. The gap is what let
+    /// "zero client code — the reorder window already discards duplicates" be
+    /// true on paper while each duplicate still cost a `pop`: two pops per
+    /// period against one accepted push, a four-packet prebuffer drained in
+    /// ~85 ms, a starve, a refill in silence, and around again — audio chopped
+    /// several times a second by the feature that exists to repair a lossy
+    /// link, with nothing in the log to say why.
+    #[test]
+    fn a_redundant_stream_plays_straight_through_at_the_shipped_defaults() {
+        let cfg = JitterConfig::default();
+        let format = AudioFormat::Stereo48k;
+        let decoder = SharedNullDecoder::new(format);
+        let sink = SharedSink::new(format);
+        // Start the endpoint at the depth target so the device-domain corrector
+        // sits inside its deadband for the whole run; its behaviour has its own
+        // test and is not what this one is measuring.
+        sink.prefill_ms(cfg.target_start_ms);
+        let baseline = sink.written().len();
+
+        let mut audio = audio_loop_with_config(
+            cfg,
+            format,
+            Some(Box::new(decoder.clone())),
+            Some(Box::new(sink.clone())),
+        );
+
+        let count = 200u32; // ~4.2 s
+        for seq in 0..count {
+            let now = u64::from(seq) * 21;
+            let before = sink.written().len();
+            audio.handle_frame_at(now, au(seq, format));
+            if seq > 0 {
+                // "having sent packet N, send N-1 again behind it"
+                audio.handle_frame_at(now, au(seq - 1, format));
+            }
+            // The DAC plays exactly what it was handed this period, so the
+            // endpoint's depth stays at the prefill and the device-domain
+            // corrector stays idle. That corrector has its own test; letting it
+            // fire here would only add silence this test would have to account
+            // for, and would tell us nothing about the pacing under test.
+            let frames = (sink.written().len() - before) / 2; // stereo
+            sink.drain(frames as u32);
+        }
+
+        let snap = audio.status.snapshot().expect("gauges are published");
+        assert_eq!(
+            snap.underruns, 0,
+            "a duplicate is not a period of missing audio, so nothing may starve"
+        );
+        assert_eq!(snap.lost, 0);
+        assert_eq!(snap.late, 0);
+        assert_eq!(
+            snap.target_ms, cfg.target_start_ms,
+            "nothing starved, so the depth controller had no reason to move"
+        );
+        assert_eq!(
+            snap.packets_received,
+            u64::from(count * 2 - 1),
+            "every arrival, duplicates included, reached the buffer"
+        );
+        assert_eq!(
+            snap.packets_delivered,
+            u64::from(count - 3),
+            "each unique unit exactly once, with the prebuffer's worth still held"
+        );
+        assert!(
+            snap.buffered_ms <= cfg.target_start_ms,
+            "the window must sit at its target rather than draining away from \
+             it: {} ms against a {} ms target",
+            snap.buffered_ms,
+            cfg.target_start_ms
+        );
+        assert_eq!(
+            decoder.submits(),
+            snap.packets_delivered,
+            "every delivered unit was decoded, none swallowed by a correction"
+        );
+        assert_eq!(
+            sink.written().len() - baseline,
+            decoder.submits() as usize * AAC_FRAME_SAMPLES * 2,
+            "and every decoded frame reached the endpoint whole"
+        );
+        assert_eq!(
+            snap.drift_corrections, 0,
+            "the endpoint sat at its target throughout"
+        );
+    }
+
+    /// Plugging headphones into the *client* used to kill remote audio for the
+    /// rest of the session, silently.
+    ///
+    /// `AUDCLNT_E_DEVICE_INVALIDATED` and its relatives (see
+    /// `host::audio_capture::is_recoverable_hresult`) are what a device change
+    /// looks like from inside a live `IAudioClient`, and they are always
+    /// followed moments later by a perfectly good new default endpoint. The
+    /// host has always dropped its capture stream and built another. This loop
+    /// used to log `audio write failed` and keep writing into the dead handle —
+    /// about fifty warn lines a second — with `audio_error` still `None` and
+    /// the packet counters still climbing, so the diagnostics panel showed a
+    /// healthy stream playing to nobody.
+    #[test]
+    fn an_invalidated_endpoint_is_reported_retired_and_re_opened_behind_a_backoff() {
+        reset_open_sink_seam(0);
+        let format = AudioFormat::Mono48k;
+        let decoder = SharedNullDecoder::new(format);
+        let faulty = FaultingSink::new(format);
+        let mut audio = audio_loop_for_test(
+            format,
+            Some(Box::new(decoder.clone())),
+            Some(Box::new(faulty.clone())),
+        );
+
+        audio.handle_frame_at(0, au(0, format));
+        assert!(
+            audio.status.error().is_none(),
+            "a healthy endpoint reports nothing"
+        );
+
+        // The user plugs in headphones.
+        faulty.kill();
+        audio.handle_frame_at(21, au(1, format));
+
+        assert!(
+            audio.status.error().is_some(),
+            "the failure must reach the panel; `audio_error` staying None while \
+             the counters climb is the diagnostics lying about a dead stream"
+        );
+        assert!(
+            audio.sink.is_none(),
+            "the dead endpoint must be retired, not written to for the rest of \
+             the session"
+        );
+        assert_eq!(faulty.refusals(), 1, "one refusal, then no more attempts");
+        let snap = audio.status.snapshot().unwrap();
+        assert_eq!(
+            snap.device_latency_ms, None,
+            "and the device gauges go back to `None`, not to a stale number"
+        );
+        assert_eq!(snap.device_underruns, None);
+
+        // Packets keep arriving 21 ms apart. None of them may re-open anything:
+        // that is a COM activation, and doing it at packet rate is the obvious
+        // wrong fix.
+        for seq in 2..24u32 {
+            audio.handle_frame_at(u64::from(seq) * 21, au(seq, format));
+        }
+        assert_eq!(
+            faulty.refusals(),
+            1,
+            "nothing may be written to the retired endpoint"
+        );
+        assert_eq!(open_attempts(), 0, "no re-open before the backoff expires");
+        assert_eq!(
+            decoder.submits(),
+            24,
+            "audio still decodes throughout — the endpoint is gone, the loop is not"
+        );
+
+        // Once it expires, the very next packet re-opens. Once.
+        audio.handle_frame_at(21 + SINK_REOPEN_BACKOFF_MIN_MS, au(24, format));
+        assert_eq!(open_attempts(), 1);
+        assert_eq!(opened_sinks(), 1);
+        assert!(audio.sink.is_some());
+        assert_eq!(
+            audio.sink_backoff_ms, SINK_REOPEN_BACKOFF_MIN_MS,
+            "a successful re-open resets the backoff for the next fault"
+        );
+        assert!(
+            audio.status.error().is_none(),
+            "and a recovered endpoint clears the fault it reported"
+        );
+
+        // Audio really flows into the replacement, not just into `Some(_)`.
+        let fresh = opened_sink(0);
+        let before = fresh.written().len();
+        audio.handle_frame_at(42 + SINK_REOPEN_BACKOFF_MIN_MS, au(25, format));
+        assert_eq!(
+            fresh.written().len() - before,
+            AAC_FRAME_SAMPLES,
+            "one mono AAC frame of PCM into the new endpoint"
+        );
+    }
+
+    /// A client with no playback device at all must not spend the session
+    /// retrying, and one that gets a device back at minute two must start
+    /// working without a reconnect. Both come from the same doubling backoff.
+    #[test]
+    fn repeated_re_open_failures_widen_the_backoff_rather_than_retrying_forever() {
+        // Three failed opens, then a device: a laptop whose user plugs their
+        // headset in a few seconds into the call.
+        reset_open_sink_seam(3);
+        let format = AudioFormat::Mono48k;
+        let faulty = FaultingSink::new(format);
+        let mut audio = audio_loop_for_test(
+            format,
+            Some(Box::new(SharedNullDecoder::new(format))),
+            Some(Box::new(faulty.clone())),
+        );
+
+        audio.handle_frame_at(0, au(0, format));
+        faulty.kill();
+        audio.handle_frame_at(21, au(1, format));
+        assert_eq!(audio.sink_retry_at_ms, Some(521), "500 ms after the fault");
+        assert_eq!(audio.sink_backoff_ms, 1_000);
+
+        // A steady stream of packets across the whole first interval buys
+        // exactly one attempt, not one per packet.
+        for seq in 2..24u32 {
+            audio.handle_frame_at(u64::from(seq) * 21, au(seq, format));
+        }
+        assert_eq!(open_attempts(), 0);
+
+        for (attempt, (at_ms, next_due, next_backoff)) in [
+            (521u64, 1_521u64, 2_000u64),
+            (1_521, 3_521, 4_000),
+            (3_521, 7_521, 8_000),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            audio.handle_frame_at(at_ms, au(100 + attempt as u32, format));
+            assert_eq!(open_attempts(), attempt as u32 + 1);
+            assert!(audio.sink.is_none(), "attempt {attempt} must still fail");
+            assert_eq!(audio.sink_retry_at_ms, Some(next_due));
+            assert_eq!(audio.sink_backoff_ms, next_backoff);
+        }
+
+        // The device is finally there.
+        audio.handle_frame_at(7_521, au(200, format));
+        assert_eq!(open_attempts(), 4);
+        assert!(audio.sink.is_some());
+        assert_eq!(audio.sink_retry_at_ms, None);
+        assert_eq!(audio.sink_backoff_ms, SINK_REOPEN_BACKOFF_MIN_MS);
+        assert!(audio.status.error().is_none());
+    }
+
+    #[test]
+    fn the_audio_thread_stops_with_the_pipeline_and_measures_nothing_until_fed() {
+        let mut pipeline = Pipeline::new(
+            Arc::new(SourceStatus::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (tx, rx) = crossbeam_channel::bounded::<AudioFrame>(8);
+        pipeline.attach_audio_thread(rx);
+
+        // Nothing has been measured, so the panel gets `None` — never a row of
+        // zeros that would read as "audio is fine and perfectly silent". This
+        // also proves attaching alone opens no endpoint and builds no decoder:
+        // both are constructed from the first packet's format, and none arrived.
+        assert!(pipeline.audio_snapshot().is_none());
+        assert!(pipeline.audio_error().is_none());
+
+        // Shares the pipeline's stop flag, so this returns rather than hanging.
+        pipeline.shutdown();
+        drop(tx);
     }
 
     #[test]

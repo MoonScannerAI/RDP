@@ -20,6 +20,7 @@
 //! Nothing here ever blocks the UI thread or the hook procedure.
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use directdesk_shared::audio::AudioFrame;
 use directdesk_shared::protocol::{ControlMsg, InputMsg};
 use directdesk_shared::stats::{ConnStats, TransportRoute};
 use directdesk_shared::tiles::TileMsg;
@@ -38,6 +39,17 @@ pub const VIDEO_QUEUE_DEPTH: usize = 256;
 /// bounds the queue at a few MiB even if every message were incompressible.
 /// Overflow is dropped, never awaited — see `net::forward_tiles`.
 pub const TILE_QUEUE_DEPTH: usize = 256;
+/// System-audio access units buffered between transport and the audio thread.
+///
+/// Deliberately shallow. One packet is one AAC-LC access unit — ~21 ms — so 64
+/// is a little over 1.3 s of audio, and every millisecond sitting here is
+/// latency the jitter buffer downstream cannot see and the drift corrector
+/// cannot steer on. A deeper queue would not make audio smoother, only later:
+/// the elastic buffer that absorbs network variance is
+/// `directdesk_shared::audio::jitter::AudioJitterBuffer`, further down the same
+/// thread, and this channel exists only to get packets off the tokio runtime.
+/// Overflow is dropped, never awaited — see `net::forward_audio`.
+pub const AUDIO_QUEUE_DEPTH: usize = 64;
 /// Outbound input events. Deep enough that a stalled transport cannot make the
 /// UI thread block; overflow is dropped with a warning, never awaited.
 pub const INPUT_QUEUE_DEPTH: usize = 4096;
@@ -99,6 +111,16 @@ pub struct ClientSession {
     /// [`TransportEndpoints`] like every other one, and `net::run_client` only
     /// reads the stream when the host echoes `features::LOSSLESS_TILES`.
     pub tiles_rx: Receiver<TileMsg>,
+
+    /// Inbound system-audio access units. Drained by the pipeline's audio
+    /// thread, which is the only place an AAC frame is decoded or played.
+    ///
+    /// Wired exactly like [`ClientSession::tiles_rx`]: an ordinary inbound
+    /// channel whose sending half rides in [`TransportEndpoints`], fed only
+    /// when the host echoes `features::SYSTEM_AUDIO`. Nothing here knows
+    /// whether audio was negotiated — a session without it simply never sees a
+    /// packet, and the audio thread sits on an empty channel.
+    pub audio_rx: Receiver<AudioFrame>,
 }
 
 /// Transport-side channel endpoints. The transport wave plugs into exactly
@@ -112,6 +134,10 @@ pub struct TransportEndpoints {
     /// Refinement tiles, host -> UI. Bounded and lossy by design: a dropped
     /// tile only means that square keeps showing H.264 for another pass.
     pub tiles_tx: Sender<TileMsg>,
+    /// System audio, host -> UI. Bounded and lossy by design, like
+    /// [`TransportEndpoints::tiles_tx`]: a dropped access unit is a click, and
+    /// a click is cheaper than back-pressuring QUIC.
+    pub audio_tx: Sender<AudioFrame>,
     pub input_rx: mpsc::Receiver<InputMsg>,
     pub control_rx: mpsc::Receiver<ControlMsg>,
 }
@@ -125,6 +151,7 @@ impl ClientSession {
         let (state_tx, state_rx) = bounded(STATUS_QUEUE_DEPTH);
         let (ctl_in_tx, ctl_in_rx) = bounded(CONTROL_QUEUE_DEPTH);
         let (tiles_tx, tiles_rx) = bounded(TILE_QUEUE_DEPTH);
+        let (audio_tx, audio_rx) = bounded(AUDIO_QUEUE_DEPTH);
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_DEPTH);
         let (ctl_out_tx, ctl_out_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
 
@@ -138,6 +165,7 @@ impl ClientSession {
                 input_tx,
                 control_tx: ctl_out_tx,
                 tiles_rx,
+                audio_rx,
             },
             TransportEndpoints {
                 video_tx,
@@ -146,6 +174,7 @@ impl ClientSession {
                 state_tx,
                 control_tx: ctl_in_tx,
                 tiles_tx,
+                audio_tx,
                 input_rx,
                 control_rx: ctl_out_rx,
             },
@@ -269,6 +298,61 @@ mod tests {
             .tiles_tx
             .try_send(TileMsg::Revoke { ids: vec![1] })
             .is_err());
+    }
+
+    fn audio_frame(seq: u32) -> AudioFrame {
+        AudioFrame {
+            seq,
+            capture_ms: seq.wrapping_mul(21),
+            discontinuity: false,
+            format: directdesk_shared::audio::AudioFormat::Stereo48k,
+            data: vec![0xAA, 0x55],
+        }
+    }
+
+    /// The audio channel is wired exactly like the tile one, and for the same
+    /// reason: it must round trip, and it must *drop* rather than block when the
+    /// audio thread stalls. Blocking here would back-pressure QUIC on behalf of
+    /// a bonus layer.
+    #[test]
+    fn audio_channel_round_trips_and_drops_when_full() {
+        let (session, transport) = ClientSession::new();
+        transport.audio_tx.try_send(audio_frame(7)).unwrap();
+        let got = session.audio_rx.try_recv().unwrap();
+        assert_eq!(got.seq, 7);
+        assert_eq!(got.data, vec![0xAA, 0x55]);
+
+        for seq in 0..AUDIO_QUEUE_DEPTH as u32 {
+            transport.audio_tx.try_send(audio_frame(seq)).unwrap();
+        }
+        assert!(
+            transport.audio_tx.try_send(audio_frame(9_999)).is_err(),
+            "a full audio queue must refuse, so the transport can drop"
+        );
+    }
+
+    /// Audio must not be able to stall video. Both inbound channels are
+    /// independent crossbeam channels, so a wedged audio thread leaves the
+    /// picture untouched — the property the whole "audio is a bonus layer"
+    /// design rests on.
+    #[test]
+    fn a_full_audio_queue_leaves_the_video_channel_untouched() {
+        let (session, transport) = ClientSession::new();
+        for seq in 0..AUDIO_QUEUE_DEPTH as u32 {
+            transport.audio_tx.try_send(audio_frame(seq)).unwrap();
+        }
+        assert!(transport.audio_tx.try_send(audio_frame(1)).is_err());
+
+        transport
+            .video_tx
+            .send(EncodedFrame {
+                frame_id: 42,
+                keyframe: true,
+                timestamp_ms: 0,
+                data: vec![1],
+            })
+            .unwrap();
+        assert_eq!(session.video_rx.try_recv().unwrap().frame_id, 42);
     }
 
     #[test]

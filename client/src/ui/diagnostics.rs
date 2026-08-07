@@ -6,6 +6,7 @@
 
 use directdesk_shared::stats::{ConnStats, TransportRoute};
 
+use crate::pipeline::AudioSnapshot;
 use crate::renderer::Presenter;
 
 const DASH: &str = "—";
@@ -25,6 +26,14 @@ pub struct DiagnosticsInput<'a> {
     pub keys_forwarded: u64,
     pub moves_sent: u64,
     pub moves_coalesced: u64,
+    /// What the audio thread has measured, or `None` when it has measured
+    /// nothing — no session negotiated audio, or none has arrived yet. Under
+    /// the HONESTY RULE that is the whole audio section rendered as "—", never
+    /// a row of zeros that would read as "audio is running and perfectly
+    /// silent".
+    pub audio: Option<AudioSnapshot>,
+    /// The audio path degraded to silence, and why.
+    pub audio_error: Option<&'a str>,
     pub demo_mode: bool,
 }
 
@@ -162,6 +171,72 @@ fn body(ui: &mut egui::Ui, input: DiagnosticsInput<'_>) {
     }
 
     ui.add_space(8.0);
+    ui.heading("Audio");
+    egui::Grid::new("diag_audio")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| match input.audio {
+            Some(a) => {
+                // Two elastic buffers, reported separately on purpose: they are
+                // measured in different places and a single "latency" number
+                // would hide which one is misbehaving.
+                row(
+                    ui,
+                    "Jitter depth",
+                    format!("{} ms (target {} ms)", a.buffered_ms, a.target_ms),
+                );
+                row(
+                    ui,
+                    "Output latency",
+                    // `None` means no endpoint was opened; it is not zero.
+                    optional_ms(a.device_latency_ms),
+                );
+                row(
+                    ui,
+                    "Packets",
+                    format!("{} of {}", a.packets_delivered, a.packets_received),
+                );
+                row(ui, "Lost", a.lost.to_string());
+                // "Late" is the only counter that moves if the jitter buffer
+                // wedges on a wild forward `seq`: in that state nothing is
+                // delivered, `underruns` does NOT increment, and the depth
+                // target decays as though the stream were healthy. Without
+                // this row the failure is invisible at every log level.
+                row(ui, "Late", a.late.to_string());
+                row(ui, "Underruns (jitter)", a.underruns.to_string());
+                row(
+                    ui,
+                    "Underruns (device)",
+                    match a.device_underruns {
+                        Some(n) => n.to_string(),
+                        None => DASH.to_string(),
+                    },
+                );
+                row(ui, "Drift corrections", a.drift_corrections.to_string());
+            }
+            None => {
+                for name in [
+                    "Jitter depth",
+                    "Output latency",
+                    "Packets",
+                    "Lost",
+                    "Late",
+                    "Underruns (jitter)",
+                    "Underruns (device)",
+                    "Drift corrections",
+                ] {
+                    row(ui, name, DASH.to_string());
+                }
+            }
+        });
+    if let Some(err) = input.audio_error {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 90, 90),
+            format!("Audio error: {err}"),
+        );
+    }
+
+    ui.add_space(8.0);
     ui.heading("Input");
     egui::Grid::new("diag_input")
         .num_columns(2)
@@ -177,6 +252,18 @@ fn row(ui: &mut egui::Ui, label: &str, value: String) {
     ui.label(label);
     ui.label(egui::RichText::new(value).monospace());
     ui.end_row();
+}
+
+/// A millisecond figure that may not have been measured at all.
+///
+/// The HONESTY RULE in one function: `None` is "we never opened the thing that
+/// would tell us", which is a different fact from a measured zero and must not
+/// render as one.
+fn optional_ms(value: Option<u32>) -> String {
+    match value {
+        Some(ms) => format!("{ms} ms"),
+        None => DASH.to_string(),
+    }
 }
 
 /// The route label is the one thing that must never be invented.
@@ -218,6 +305,22 @@ mod tests {
         ] {
             assert_eq!(route_text(Some(route)), route.label());
         }
+    }
+
+    /// The HONESTY RULE applied to the audio section. An unopened endpoint has
+    /// no latency and no underrun count; both must render as "—", because a
+    /// zero there reads as "measured, and fine".
+    #[test]
+    fn an_unmeasured_audio_figure_renders_a_dash_never_a_zero() {
+        assert_eq!(optional_ms(None), DASH);
+        assert_eq!(optional_ms(Some(0)), "0 ms");
+        assert_eq!(optional_ms(Some(400)), "400 ms");
+
+        // A default snapshot is all zeros; it must stay distinguishable from
+        // "no snapshot at all", which is what `Option<AudioSnapshot>` buys.
+        let measured = AudioSnapshot::default();
+        assert_eq!(measured.device_underruns, None);
+        assert_eq!(measured.device_latency_ms, None);
     }
 
     #[test]

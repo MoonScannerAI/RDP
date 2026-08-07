@@ -170,6 +170,10 @@ fn pair_params(addr: SocketAddr, code: Option<&str>) -> ConnectParams {
         // empty and no stream is ever opened — which is exactly the property
         // the interop test should be exercising.
         lossless_tiles: true,
+        // Same reasoning for audio: the host defaults it off, so advertising it
+        // here exercises the "asked and refused" path — the client must connect
+        // and stream normally with no audio bridge spawned.
+        system_audio: true,
     }
 }
 
