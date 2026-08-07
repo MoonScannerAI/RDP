@@ -82,7 +82,6 @@ impl Default for StreamCaps {
 pub struct ConnectRequest {
     pub host: String,
     pub udp_port: u16,
-    pub tcp_port: u16,
     pub display_name: String,
     /// `Some` selects pairing mode (first contact); `None` is steady-state auth.
     pub pairing_code: Option<String>,
@@ -94,7 +93,6 @@ impl ConnectRequest {
         ConnectParams {
             host: self.host,
             udp_port: self.udp_port,
-            tcp_port: self.tcp_port,
             pairing_code: self.pairing_code,
             display_name: self.display_name,
             quality: self.quality,
@@ -290,7 +288,6 @@ mod tests {
             // reaching any real host, which is all these bookkeeping tests need.
             host: "127.0.0.1".into(),
             udp_port: 47990,
-            tcp_port: 47991,
             display_name: "test-client".into(),
             pairing_code: None,
             quality: QualityMode::Balanced,

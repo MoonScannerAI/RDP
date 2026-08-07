@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use directdesk_shared::protocol::{QualityMode, DEFAULT_TCP_PORT, DEFAULT_UDP_PORT};
+use directdesk_shared::protocol::{QualityMode, DEFAULT_UDP_PORT};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,7 +15,6 @@ pub struct ClientConfig {
     /// Last host address typed by the user (hostname or IP, no port).
     pub host_address: String,
     pub udp_port: u16,
-    pub tcp_port: u16,
     /// Friendly name this client presents to the host. Empty means "derive one
     /// from the machine name"; never holds a secret.
     #[serde(default)]
@@ -60,7 +59,6 @@ impl Default for ClientConfig {
         Self {
             host_address: String::new(),
             udp_port: DEFAULT_UDP_PORT,
-            tcp_port: DEFAULT_TCP_PORT,
             display_name: String::new(),
             // This is a remote *desktop*, so text is the primary workload. TextDesktop now carries
             // the highest bitrate ceiling because sharp glyph edges are high-frequency detail and
@@ -130,9 +128,6 @@ impl ClientConfig {
         if self.udp_port == 0 {
             self.udp_port = DEFAULT_UDP_PORT;
         }
-        if self.tcp_port == 0 {
-            self.tcp_port = DEFAULT_TCP_PORT;
-        }
         self.host_address.truncate(255);
         // 0 is the sentinel for "Auto" and must pass through untouched; any
         // other hand-edited value gets pulled into a sane range.
@@ -166,9 +161,7 @@ mod tests {
     fn defaults_use_contract_ports() {
         let c = ClientConfig::default();
         assert_eq!(c.udp_port, DEFAULT_UDP_PORT);
-        assert_eq!(c.tcp_port, DEFAULT_TCP_PORT);
         assert_eq!(c.udp_port, 47990);
-        assert_eq!(c.tcp_port, 47991);
     }
 
     #[test]
@@ -238,12 +231,10 @@ mod tests {
     fn zero_ports_are_repaired() {
         let c = ClientConfig {
             udp_port: 0,
-            tcp_port: 0,
             ..Default::default()
         }
         .sanitized();
         assert_eq!(c.udp_port, DEFAULT_UDP_PORT);
-        assert_eq!(c.tcp_port, DEFAULT_TCP_PORT);
     }
 
     #[test]
@@ -271,5 +262,37 @@ mod tests {
         }
         .sanitized();
         assert_eq!(high.preferred_fps, 240);
+    }
+
+    #[test]
+    fn old_config_with_tcp_port_still_loads() {
+        // A pre-removal client.json on a real machine has a `tcp_port` key that
+        // no field claims anymore. Struct-level `#[serde(default)]` with no
+        // `deny_unknown_fields` means serde_json silently ignores unknown keys
+        // rather than failing the whole parse — verify the entire rest of a
+        // realistic file still deserializes and survives sanitizing intact.
+        let json = r#"{
+            "host_address": "10.0.0.5",
+            "udp_port": 47990,
+            "tcp_port": 47991,
+            "display_name": "my-laptop",
+            "quality_mode": "Balanced",
+            "show_diagnostics": true,
+            "start_fullscreen": false,
+            "capture_in_background": true,
+            "preferred_fps": 30,
+            "auto_snap_scale": 2
+        }"#;
+        let back: ClientConfig = serde_json::from_str(json).unwrap();
+        let c = back.sanitized();
+        assert_eq!(c.host_address, "10.0.0.5");
+        assert_eq!(c.udp_port, 47990);
+        assert_eq!(c.display_name, "my-laptop");
+        assert_eq!(c.quality_mode, QualityMode::Balanced);
+        assert!(c.show_diagnostics);
+        assert!(!c.start_fullscreen);
+        assert!(c.capture_in_background);
+        assert_eq!(c.preferred_fps, 30);
+        assert_eq!(c.auto_snap_scale, 2);
     }
 }

@@ -60,12 +60,10 @@ pub fn is_pairing_mode(code_input: &str) -> bool {
 pub struct FormInputs<'a> {
     pub host: &'a str,
     pub udp_port: &'a str,
-    pub tcp_port: &'a str,
     pub pairing_code: &'a str,
     pub display_name: &'a str,
     pub quality: QualityMode,
     pub default_udp_port: u16,
-    pub default_tcp_port: u16,
 }
 
 /// Validate every field and assemble a [`ConnectRequest`], or return the first
@@ -77,14 +75,11 @@ pub fn build_request(form: FormInputs<'_>) -> Result<ConnectRequest, String> {
     }
     let udp_port =
         parse_port(form.udp_port, form.default_udp_port).map_err(|e| format!("UDP {e}"))?;
-    let tcp_port =
-        parse_port(form.tcp_port, form.default_tcp_port).map_err(|e| format!("TCP {e}"))?;
     let pairing_code = normalize_pairing_code(form.pairing_code)?;
 
     Ok(ConnectRequest {
         host: host.to_string(),
         udp_port,
-        tcp_port,
         display_name: form.display_name.to_string(),
         pairing_code,
         quality: form.quality,
@@ -141,17 +136,14 @@ mod tests {
         let req = build_request(FormInputs {
             host: " host.lan ",
             udp_port: "",
-            tcp_port: "5000",
             pairing_code: "1111 2222",
             display_name: "me",
             quality: QualityMode::Motion,
             default_udp_port: 47990,
-            default_tcp_port: 47991,
         })
         .unwrap();
         assert_eq!(req.host, "host.lan", "host is trimmed");
         assert_eq!(req.udp_port, 47990, "blank UDP falls back to default");
-        assert_eq!(req.tcp_port, 5000);
         assert_eq!(req.pairing_code.as_deref(), Some("11112222"));
         assert_eq!(req.quality, QualityMode::Motion);
     }
@@ -161,12 +153,10 @@ mod tests {
         let req = build_request(FormInputs {
             host: "10.0.0.9",
             udp_port: "47990",
-            tcp_port: "47991",
             pairing_code: "",
             display_name: "me",
             quality: QualityMode::Balanced,
             default_udp_port: 47990,
-            default_tcp_port: 47991,
         })
         .unwrap();
         assert_eq!(req.pairing_code, None, "blank code => steady-state auth");
@@ -177,12 +167,10 @@ mod tests {
         let err = build_request(FormInputs {
             host: "   ",
             udp_port: "",
-            tcp_port: "",
             pairing_code: "",
             display_name: "me",
             quality: QualityMode::Balanced,
             default_udp_port: 47990,
-            default_tcp_port: 47991,
         })
         .unwrap_err();
         assert!(err.contains("host"), "{err}");
@@ -193,12 +181,10 @@ mod tests {
         let err = build_request(FormInputs {
             host: "h",
             udp_port: "99999",
-            tcp_port: "",
             pairing_code: "",
             display_name: "me",
             quality: QualityMode::Balanced,
             default_udp_port: 47990,
-            default_tcp_port: 47991,
         })
         .unwrap_err();
         assert!(err.starts_with("UDP"), "{err}");

@@ -455,7 +455,6 @@ fn pair_params(addr: SocketAddr, code: &str) -> ConnectParams {
     ConnectParams {
         host: addr.ip().to_string(),
         udp_port: addr.port(),
-        tcp_port: 0,
         pairing_code: Some(code.to_string()),
         display_name: "e2e-client".into(),
         quality: protocol::QualityMode::Balanced,
@@ -739,7 +738,6 @@ async fn mismatched_spki_pin_is_rejected() {
     let params = ConnectParams {
         host: addr.ip().to_string(),
         udp_port: addr.port(),
-        tcp_port: 0,
         pairing_code: None,
         display_name: "e2e-client".into(),
         quality: protocol::QualityMode::Balanced,

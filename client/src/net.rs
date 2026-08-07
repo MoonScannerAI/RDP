@@ -115,7 +115,6 @@ pub struct ConnectParams {
     /// Host name or IP (no port).
     pub host: String,
     pub udp_port: u16,
-    pub tcp_port: u16,
     /// `Some(code)` selects pairing mode for the first connection.
     pub pairing_code: Option<String>,
     /// This client's friendly name, shown on the host after pairing.
@@ -1002,7 +1001,6 @@ mod tests {
         let p = ConnectParams {
             host: "h".into(),
             udp_port: 1,
-            tcp_port: 2,
             pairing_code: None,
             display_name: "n".into(),
             quality: QualityMode::Balanced,

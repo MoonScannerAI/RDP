@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //! ```text
-//! DirectDeskClient [--host <addr>] [--udp-port N] [--tcp-port N]
+//! DirectDeskClient [--host <addr>] [--udp-port N]
 //!                  [--loopback-demo] [--demo-fps N] [--decoder-selftest]
 //! ```
 //
@@ -25,7 +25,6 @@ DirectDeskClient — DirectDesk remote desktop client
 
   --host <addr>        host name or IP; when set, the client connects on launch
   --udp-port <n>       UDP/QUIC port (default 47990)
-  --tcp-port <n>       TCP fallback port (default 47991)
   --pair-code <8dig>   pair with the host using this one-time code (first run)
   --loopback-demo      feed the renderer synthetic frames; no network, no decode
   --demo-fps <n>       loopback demo frame rate (default 60)
@@ -43,7 +42,6 @@ DirectDeskClient — DirectDesk remote desktop client
 struct Args {
     host: Option<String>,
     udp_port: Option<u16>,
-    tcp_port: Option<u16>,
     pair_code: Option<String>,
     loopback_demo: bool,
     demo_fps: u32,
@@ -58,7 +56,6 @@ impl Default for Args {
         Self {
             host: None,
             udp_port: None,
-            tcp_port: None,
             pair_code: None,
             loopback_demo: false,
             demo_fps: 60,
@@ -89,10 +86,6 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--udp-port" => {
                 let raw = value_after(&argv, &mut i, "--udp-port")?;
                 args.udp_port = Some(raw.parse().map_err(|e| format!("--udp-port: {e}"))?);
-            }
-            "--tcp-port" => {
-                let raw = value_after(&argv, &mut i, "--tcp-port")?;
-                args.tcp_port = Some(raw.parse().map_err(|e| format!("--tcp-port: {e}"))?);
             }
             "--pair-code" => args.pair_code = Some(value_after(&argv, &mut i, "--pair-code")?),
             "--demo-fps" => {
@@ -144,9 +137,6 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(p) = args.udp_port {
         config.udp_port = p;
-    }
-    if let Some(p) = args.tcp_port {
-        config.tcp_port = p;
     }
 
     let (session, transport) = ClientSession::new();
@@ -358,8 +348,6 @@ mod tests {
             "10.0.0.2",
             "--udp-port",
             "1234",
-            "--tcp-port",
-            "5678",
             "--loopback-demo",
             "--demo-fps",
             "30",
@@ -367,7 +355,6 @@ mod tests {
         .unwrap();
         assert_eq!(a.host.as_deref(), Some("10.0.0.2"));
         assert_eq!(a.udp_port, Some(1234));
-        assert_eq!(a.tcp_port, Some(5678));
         assert!(a.loopback_demo);
         assert_eq!(a.demo_fps, 30);
     }

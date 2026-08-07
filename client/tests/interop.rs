@@ -159,7 +159,6 @@ fn pair_params(addr: SocketAddr, code: Option<&str>) -> ConnectParams {
     ConnectParams {
         host: addr.ip().to_string(),
         udp_port: addr.port(),
-        tcp_port: 0,
         pairing_code: code.map(|c| c.to_string()),
         display_name: "interop-client".into(),
         quality: QualityMode::Balanced,

@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use directdesk_shared::protocol::{QualityMode, DEFAULT_TCP_PORT, DEFAULT_UDP_PORT};
+use directdesk_shared::protocol::{QualityMode, DEFAULT_UDP_PORT};
 use serde::{Deserialize, Serialize};
 
 /// Directory under `%ProgramData%` shared with the DPAPI secret store.
@@ -70,8 +70,6 @@ pub struct HostConfig {
     pub remote_access_enabled: bool,
     /// UDP port for QUIC.
     pub udp_port: u16,
-    /// TCP port reserved for the fallback transport (not opened by this build).
-    pub tcp_port: u16,
     /// Friendly name sent to clients in `PairComplete` and shown in their UI.
     /// Only used the first time an identity is created; afterwards the stored
     /// identity keeps the name it was paired under.
@@ -173,7 +171,6 @@ impl Default for HostConfig {
         Self {
             remote_access_enabled: true,
             udp_port: DEFAULT_UDP_PORT,
-            tcp_port: DEFAULT_TCP_PORT,
             display_name: default_display_name(),
             quality_mode: QualityMode::Balanced,
             target_fps: 60,
@@ -309,9 +306,6 @@ impl HostConfig {
         if self.udp_port == 0 {
             self.udp_port = DEFAULT_UDP_PORT;
         }
-        if self.tcp_port == 0 {
-            self.tcp_port = DEFAULT_TCP_PORT;
-        }
         self.target_fps = self.target_fps.clamp(MIN_TARGET_FPS, MAX_TARGET_FPS);
         self.gop_seconds = self.gop_seconds.clamp(1, 30);
         // Migration: 33 ms was the old default — ~30 identical full frames a
@@ -402,7 +396,6 @@ mod tests {
         let c = HostConfig::default();
         assert_eq!(c.udp_port, DEFAULT_UDP_PORT);
         assert_eq!(c.udp_port, 47990);
-        assert_eq!(c.tcp_port, 47991);
         assert!(c.remote_access_enabled);
     }
 
@@ -424,7 +417,6 @@ mod tests {
     fn partial_json_falls_back_to_defaults() {
         let back: HostConfig = serde_json::from_str(r#"{"udp_port":50000}"#).unwrap();
         assert_eq!(back.udp_port, 50_000);
-        assert_eq!(back.tcp_port, DEFAULT_TCP_PORT);
         assert!(back.remote_access_enabled);
         assert_eq!(back.target_fps, 60);
     }
@@ -441,7 +433,6 @@ mod tests {
     fn sanitize_repairs_nonsense() {
         let c = HostConfig {
             udp_port: 0,
-            tcp_port: 0,
             target_fps: 0,
             gop_seconds: 9_999,
             bitrate_kbps: 1,
@@ -452,7 +443,6 @@ mod tests {
         }
         .sanitized();
         assert_eq!(c.udp_port, DEFAULT_UDP_PORT);
-        assert_eq!(c.tcp_port, DEFAULT_TCP_PORT);
         assert_eq!(c.target_fps, 1);
         assert_eq!(c.gop_seconds, 30);
         assert_eq!(c.bitrate_kbps, MIN_BITRATE_KBPS);
@@ -715,5 +705,62 @@ mod tests {
             crate::mf_encoder::DEFAULT_STATIC_REFINE_QUALITY
         );
         assert!(back.static_refine_quality > 0);
+    }
+
+    #[test]
+    fn old_config_with_tcp_port_still_loads() {
+        // A pre-removal host.json on the live remote machine has a `tcp_port`
+        // key that no field claims anymore. Struct-level `#[serde(default)]`
+        // with no `deny_unknown_fields` means serde_json silently ignores
+        // unknown keys rather than failing the whole parse — verify the entire
+        // rest of a realistic file still deserializes and survives sanitizing
+        // intact, so the deployed file keeps loading after this change ships.
+        let json = r#"{
+            "remote_access_enabled": true,
+            "udp_port": 47990,
+            "tcp_port": 47991,
+            "display_name": "office-host",
+            "quality_mode": "Balanced",
+            "target_fps": 60,
+            "bitrate_kbps": 12000,
+            "bitrate_cap_kbps": 20000,
+            "gop_seconds": 4,
+            "idle_repeat_ms": 250,
+            "static_settle_ms": 800,
+            "static_refine_quality": 70,
+            "lossless_tiles_enabled": false,
+            "lossless_tile_settle_ms": 900,
+            "lossless_tile_max_kbps": 8000,
+            "lossless_tile_deflate_level": 6,
+            "lossless_tile_lease_ms": 4000,
+            "lossless_tiles_per_pass": 32,
+            "start_minimized": false,
+            "uac_clickthrough": false,
+            "uac_arm_ttl_secs": 20,
+            "blank_wallpaper_during_session": true
+        }"#;
+        let back: HostConfig = serde_json::from_str(json).unwrap();
+        let c = back.sanitized();
+        assert!(c.remote_access_enabled);
+        assert_eq!(c.udp_port, 47990);
+        assert_eq!(c.display_name, "office-host");
+        assert_eq!(c.quality_mode, QualityMode::Balanced);
+        assert_eq!(c.target_fps, 60);
+        assert_eq!(c.bitrate_kbps, 12_000);
+        assert_eq!(c.bitrate_cap_kbps, Some(20_000));
+        assert_eq!(c.gop_seconds, 4);
+        assert_eq!(c.idle_repeat_ms, 250);
+        assert_eq!(c.static_settle_ms, 800);
+        assert_eq!(c.static_refine_quality, 70);
+        assert!(!c.lossless_tiles_enabled);
+        assert_eq!(c.lossless_tile_settle_ms, 900);
+        assert_eq!(c.lossless_tile_max_kbps, 8_000);
+        assert_eq!(c.lossless_tile_deflate_level, 6);
+        assert_eq!(c.lossless_tile_lease_ms, 4_000);
+        assert_eq!(c.lossless_tiles_per_pass, 32);
+        assert!(!c.start_minimized);
+        assert!(!c.uac_clickthrough);
+        assert_eq!(c.uac_arm_ttl_secs, 20);
+        assert!(c.blank_wallpaper_during_session);
     }
 }

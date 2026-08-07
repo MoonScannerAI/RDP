@@ -108,7 +108,6 @@ pub struct ClientApp {
 
     address_input: String,
     udp_port_input: String,
-    tcp_port_input: String,
     name_input: String,
     code_input: String,
     /// Set when the connect form fails validation; shown under the form.
@@ -206,7 +205,6 @@ impl ClientApp {
         Self {
             address_input: init.config.host_address.clone(),
             udp_port_input: init.config.udp_port.to_string(),
-            tcp_port_input: init.config.tcp_port.to_string(),
             name_input: init.display_name,
             code_input: init.initial_pair_code.unwrap_or_default(),
             form_error: None,
@@ -864,12 +862,6 @@ impl ClientApp {
                     );
                     ui.end_row();
 
-                    ui.label("TCP port");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.tcp_port_input).desired_width(90.0),
-                    );
-                    ui.end_row();
-
                     ui.label("Display name");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.name_input)
@@ -992,12 +984,10 @@ impl ClientApp {
         let request = match connect_form::build_request(connect_form::FormInputs {
             host: &self.address_input,
             udp_port: &self.udp_port_input,
-            tcp_port: &self.tcp_port_input,
             pairing_code: &self.code_input,
             display_name: &self.name_input,
             quality: self.config.quality_mode,
             default_udp_port: self.config.udp_port,
-            default_tcp_port: self.config.tcp_port,
         }) {
             Ok(r) => r,
             Err(e) => {
@@ -1010,11 +1000,9 @@ impl ClientApp {
         // Persist the reusable fields — host, ports, name — but never the code.
         self.config.host_address = request.host.clone();
         self.config.udp_port = request.udp_port;
-        self.config.tcp_port = request.tcp_port;
         self.config.display_name = request.display_name.clone();
         self.address_input = request.host.clone();
         self.udp_port_input = request.udp_port.to_string();
-        self.tcp_port_input = request.tcp_port.to_string();
         self.config.save();
 
         let Some(supervisor) = self.supervisor.as_mut() else {
@@ -1026,7 +1014,6 @@ impl ClientApp {
         tracing::info!(
             host = %request.host,
             udp = request.udp_port,
-            tcp = request.tcp_port,
             pairing = request.pairing_code.is_some(),
             "connect requested"
         );
