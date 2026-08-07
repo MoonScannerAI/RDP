@@ -382,7 +382,17 @@ impl HostSession {
             std::thread::Builder::new()
                 .name("dd-media".into())
                 .spawn(move || {
-                    media_thread(cfg, shared, frames_tx, tiles_tx, drop_rx, init_tx, ctl_tx)
+                    media_thread(
+                        cfg,
+                        shared,
+                        MediaChannels {
+                            frames_tx,
+                            tiles_tx,
+                            drop_rx,
+                            init_tx,
+                            ctl_tx,
+                        },
+                    )
                 })
                 .map_err(|e| Error::Other(format!("spawn media thread: {e}")))?
         };
@@ -600,21 +610,151 @@ impl Drop for HostSession {
 
 // ---- media thread ------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn media_thread(
-    cfg: SessionConfig,
-    shared: Arc<Shared>,
+/// How often the media loop publishes a statistics snapshot.
+///
+/// Also the *floor* on the window any published rate is measured over:
+/// [`maybe_report`] is a complete no-op below this, so a rate can never be a
+/// handful of frames divided by a near-zero elapsed. Sibling of
+/// [`TILE_REPORT_EVERY`], which does the same job for the tile log.
+const STATS_REPORT_EVERY: Duration = Duration::from_millis(500);
+
+/// The media thread's per-window capture and encode accounting.
+///
+/// Owns what used to be five loose `mut` locals in [`media_thread`]
+/// (`win_start`, `win_captured`, `win_encoded`, `win_bytes`,
+/// `win_pipeline_ms`). They belong to one type because [`maybe_report`]
+/// publishes and clears all five as a single indivisible step: a publish that
+/// reset four of the five would leave counts from a closed window being divided
+/// by the next window's seconds, and every rate after it would climb without
+/// bound — which the bitrate adaptor reads as "the link keeps getting faster".
+/// Holding them together is what makes writing that by accident impossible.
+///
+/// What gets published are per-second RATES, not window totals.
+struct StatsWindow {
+    /// When the window now accumulating began — the origin of the divisor.
+    start: Instant,
+    captured: u32,
+    encoded: u32,
+    bytes: u64,
+    /// Latency *weight*, not a mean: the sum of `iteration latency x frames
+    /// that iteration emitted`. Divided by `encoded` at publish time. See
+    /// [`StatsWindow::note_pipeline`] for why it is accumulated this way.
+    pipeline_ms: f32,
+}
+
+impl StatsWindow {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            captured: 0,
+            encoded: 0,
+            bytes: 0,
+            pipeline_ms: 0.0,
+        }
+    }
+
+    /// One frame came out of the capture.
+    fn note_capture(&mut self) {
+        self.captured += 1;
+    }
+
+    /// One frame came out of the encoder, `bytes` long.
+    fn note_encoded(&mut self, bytes: usize) {
+        self.encoded += 1;
+        self.bytes += bytes as u64;
+    }
+
+    /// Charge one loop iteration's latency to the frames that iteration emitted.
+    ///
+    /// `elapsed_ms` is taken as an argument rather than read from the clock here
+    /// for a load-bearing reason: the caller MUST sample it *before* the encoder
+    /// drain loop. The statistic is capture -> submit latency and deliberately
+    /// excludes drain and queue hand-off time; sampling it after the drain would
+    /// silently change what the published number means without failing anything.
+    ///
+    /// The weight is `elapsed x emitted`, so an iteration that drained two
+    /// frames out of the hardware encoder's pipeline contributes its latency
+    /// twice — the mean is over *frames*, not over loop iterations — and an
+    /// iteration that emitted nothing contributes nothing at all.
+    fn note_pipeline(&mut self, elapsed_ms: f32, emitted: u32) {
+        self.pipeline_ms += elapsed_ms * emitted as f32;
+    }
+
+    /// Throw the current window away and open a fresh one at this instant,
+    /// publishing nothing.
+    ///
+    /// This is the resume half of the secure-desktop pause. While the session is
+    /// paused the loop takes a `continue` arm that never reports, so `start`
+    /// goes on ageing across the whole UAC prompt while the counts stand still.
+    /// Without this reset the first report after recovery divides a handful of
+    /// fresh frames by a multi-second elapsed and hands the bitrate adaptor one
+    /// artificially low fps/bitrate sample — the link gets throttled just as the
+    /// user dismisses the prompt.
+    ///
+    /// Note what this deliberately does NOT do: publish. Reporting *during* the
+    /// pause instead would feed the adaptor 0 fps while the prompt is up and let
+    /// it cut the bitrate mid-prompt — the same harm from the other direction. A
+    /// pause must produce no misleading sample, not a differently misleading one.
+    fn restart(&mut self) {
+        self.start = Instant::now();
+        self.captured = 0;
+        self.encoded = 0;
+        self.bytes = 0;
+        self.pipeline_ms = 0.0;
+    }
+
+    /// Publish this window and open the next one, once [`STATS_REPORT_EVERY`]
+    /// has elapsed. A complete no-op before then — publishing early would divide
+    /// a handful of frames by a near-zero window, and resetting early would
+    /// throw away counts that were never reported at all.
+    ///
+    /// The arithmetic stays in the free [`maybe_report`] below rather than being
+    /// inlined here: that function, out-params and all, is the unit this file's
+    /// characterization tests drive directly, and they are the only coverage of
+    /// the publish-and-reset pair. It now has exactly one caller — this one.
+    fn maybe_report(&mut self, shared: &Arc<Shared>) {
+        maybe_report(
+            shared,
+            &mut self.start,
+            &mut self.captured,
+            &mut self.encoded,
+            &mut self.bytes,
+            &mut self.pipeline_ms,
+        );
+    }
+}
+
+/// Every channel endpoint the media thread holds.
+///
+/// Bundled so [`media_thread`]'s signature describes what the thread *is* — a
+/// config, the shared state, and its wiring — instead of growing one more
+/// positional argument every time a wire is added. Five same-shaped `Sender`s
+/// in a row is also a call site where two of them can be swapped and still
+/// compile.
+struct MediaChannels {
+    /// Encoded video out to the network thread.
     frames_tx: Sender<EncodedFrame>,
+    /// Lossless tile control and payloads out to the network thread.
     tiles_tx: Sender<TileMsg>,
+    /// The *receive* end of the very queue `frames_tx` feeds, held only so a
+    /// full queue can be relieved by evicting its oldest frame before the newest
+    /// is re-sent. See the `try_send` retry in the drain loop.
     drop_rx: Receiver<EncodedFrame>,
+    /// One-shot startup result back to [`HostSession::start`], which blocks on
+    /// it — so a pipeline that fails to build reports the real error rather than
+    /// hanging.
     init_tx: Sender<Result<SessionDescription>>,
+    /// Control out to the input thread: geometry at startup, `ReleaseAll` when a
+    /// pause begins.
     ctl_tx: Sender<InputCtl>,
-) {
+}
+
+fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
     lower_video_thread_priority("capture/encode");
     let _mf = match MfThread::enter() {
         Ok(g) => g,
         Err(e) => {
-            let _ = init_tx.send(Err(e));
+            let _ = chans.init_tx.send(Err(e));
             return;
         }
     };
@@ -624,19 +764,19 @@ fn media_thread(
         Ok(v) => v,
         Err(e) => {
             shared.set_state(SessionState::Failed(e.to_string()));
-            let _ = init_tx.send(Err(e));
+            let _ = chans.init_tx.send(Err(e));
             return;
         }
     };
 
     *shared.desc.lock() = Some(desc.clone());
     shared.set_state(SessionState::Running);
-    let _ = ctl_tx.send(InputCtl::Geometry {
+    let _ = chans.ctl_tx.send(InputCtl::Geometry {
         w: desc.width,
         h: desc.height,
         origin: desc.monitor_origin,
     });
-    if init_tx.send(Ok(desc.clone())).is_err() {
+    if chans.init_tx.send(Ok(desc.clone())).is_err() {
         return;
     }
 
@@ -649,11 +789,7 @@ fn media_thread(
     let mut gpu_convert_ok = converter.is_some();
     let gpu_texture_input = desc.gpu_encode_input;
 
-    let mut win_start = Instant::now();
-    let mut win_captured = 0u32;
-    let mut win_encoded = 0u32;
-    let mut win_bytes = 0u64;
-    let mut win_pipeline_ms = 0f32;
+    let mut stats = StatsWindow::new();
     let mut paused_since: Option<Instant> = None;
     // When the desktop last started being unchanged, and whether this idle
     // period has already had its one settle keyframe.
@@ -787,19 +923,20 @@ fn media_thread(
             Ok(Some(f)) => f,
             Ok(None) => {
                 if let Some(reason) = pause_reason(capture.state()) {
-                    enter_pause(&shared, &ctl_tx, &mut paused_since, reason);
+                    enter_pause(&shared, &chans.ctl_tx, &mut paused_since, reason);
                 } else if paused_since.is_some() {
                     paused_since = None;
                     shared.set_state(SessionState::Running);
+                    // Resume. This is the *second* way out of a pause, and it is
+                    // the one that reaches a report soonest: the pause may have
+                    // been entered from the `Err` arm below, which never reports,
+                    // so `stats.start` can be several seconds stale right here
+                    // while the counts are whatever they were before the prompt
+                    // went up. The `maybe_report` two lines down would publish
+                    // exactly that. Restarting first makes it a no-op instead.
+                    stats.restart();
                 }
-                maybe_report(
-                    &shared,
-                    &mut win_start,
-                    &mut win_captured,
-                    &mut win_encoded,
-                    &mut win_bytes,
-                    &mut win_pipeline_ms,
-                );
+                stats.maybe_report(&shared);
                 continue;
             }
             Err(e) => {
@@ -810,7 +947,7 @@ fn media_thread(
                 // `pause_reason`'s doc comment for why the error message
                 // itself must not be parsed for this.
                 if let Some(reason) = pause_reason(capture.state()) {
-                    enter_pause(&shared, &ctl_tx, &mut paused_since, reason);
+                    enter_pause(&shared, &chans.ctl_tx, &mut paused_since, reason);
                     std::thread::sleep(Duration::from_millis(100));
                 } else {
                     tracing::warn!("capture error: {e}");
@@ -820,15 +957,26 @@ fn media_thread(
             }
         };
 
+        // `take()` is the point, not `is_some()`: this both answers "were we
+        // paused?" and clears the flag, and every arm below keys off the answer.
         let resumed = paused_since.take().is_some();
         if resumed {
             shared.set_state(SessionState::Running);
             // The desktop we return to may differ wildly; force a fresh IDR.
             encoder.request_keyframe();
+            // Open a fresh statistics window before this frame is counted into
+            // it. The pause was almost certainly served by the `Err` arm above
+            // (the secure desktop makes `acquire` fail, it does not make it
+            // return nothing), and that arm reports nothing at all — so `start`
+            // has been ageing for the whole length of the UAC prompt while the
+            // counts stood still. Publishing that window would divide this one
+            // frame by several seconds and hand the bitrate adaptor a sample
+            // saying the link had collapsed. See [`StatsWindow::restart`].
+            stats.restart();
         }
 
         shared.counters.captured.fetch_add(1, Ordering::Relaxed);
-        win_captured += 1;
+        stats.note_capture();
         let ts = frame.timestamp_ms;
         let repeated = frame.repeated;
 
@@ -860,7 +1008,7 @@ fn media_thread(
             };
             if let Some(msg) = rearm {
                 tile_win.note_control(&msg);
-                match send_tile_control(&tiles_tx, msg) {
+                match send_tile_control(&chans.tiles_tx, msg) {
                     // A `Reset` is the maximal revoke: it retracts every tile
                     // the client holds, so anything still waiting in
                     // `revoke_retry` has just been superseded by something
@@ -905,7 +1053,7 @@ fn media_thread(
             // scroll costs one message on its first frame and nothing after.
             drain_revocations(
                 g,
-                &tiles_tx,
+                &chans.tiles_tx,
                 &mut tile_win,
                 &mut revoke_retry,
                 &shared.tiles_reset_req,
@@ -1028,13 +1176,18 @@ fn media_thread(
 
         // A hardware encoder is a pipeline: it may hand back zero frames now and
         // two later. Drain everything it has ready, or throughput silently halves.
+        //
+        // `elapsed` is sampled HERE, above the drain, and that placement is the
+        // definition of the `pipeline_ms` statistic: it measures capture ->
+        // submit and deliberately excludes the drain and the queue hand-off
+        // below. Moving this line under the loop would still compile, still look
+        // reasonable, and quietly publish a different number.
         let elapsed = tick.elapsed().as_secs_f32() * 1000.0;
         let mut emitted = 0u32;
         let mut ready = first;
         while let Some(ef) = ready.take() {
             emitted += 1;
-            win_encoded += 1;
-            win_bytes += ef.data.len() as u64;
+            stats.note_encoded(ef.data.len());
             shared.counters.encoded.fetch_add(1, Ordering::Relaxed);
             shared
                 .counters
@@ -1077,26 +1230,19 @@ fn media_thread(
                     }
                 }
             }
-            if let Err(full) = frames_tx.try_send(ef) {
+            if let Err(full) = chans.frames_tx.try_send(ef) {
                 // Queue full: evict the oldest so the consumer always gets the
                 // freshest picture, then re-send. Without the retry the *newest*
                 // frame is the one lost, which is exactly backwards.
-                let _ = drop_rx.try_recv();
+                let _ = chans.drop_rx.try_recv();
                 shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
-                let _ = frames_tx.try_send(full.into_inner());
+                let _ = chans.frames_tx.try_send(full.into_inner());
             }
             ready = encoder.poll_output();
         }
-        win_pipeline_ms += elapsed * emitted as f32;
+        stats.note_pipeline(elapsed, emitted);
 
-        maybe_report(
-            &shared,
-            &mut win_start,
-            &mut win_captured,
-            &mut win_encoded,
-            &mut win_bytes,
-            &mut win_pipeline_ms,
-        );
+        stats.maybe_report(&shared);
 
         // --- tile refinement pass ---------------------------------------------
         //
@@ -1125,7 +1271,7 @@ fn media_thread(
                     &mut capture,
                     &mut cpu_bgra,
                     bgra_is_current,
-                    &tiles_tx,
+                    &chans.tiles_tx,
                     &cfg,
                     ts,
                     tile_pass_bytes(
@@ -1705,6 +1851,33 @@ fn enter_pause(
     }
 }
 
+/// Publish one statistics window and open the next, or do nothing at all.
+///
+/// The state this operates on lives in [`StatsWindow`], which is the only
+/// caller — the out-params remain because this function, not the wrapper, is
+/// what the characterization tests drive, and they are the only coverage of the
+/// publish-and-reset pair.
+///
+/// Three properties a tidy-minded reader will be tempted to "fix", all of them
+/// deliberate and all of them pinned by tests:
+///
+/// * **Rates, not totals.** Every figure below is divided by the window's
+///   seconds. 60 captures in a 2 s window publishes 30, not 60.
+/// * **`pipeline_ms` is a mean over frames, not over loop iterations** — the
+///   caller weights each iteration's latency by the frames it emitted (see
+///   [`StatsWindow::note_pipeline`]) — and it reports `0.0` rather than dividing
+///   by no frames, because `validate_stats` rejects a non-finite value and the
+///   client would discard the whole snapshot, fps and bitrate included.
+/// * **`frames_dropped` and `keyframes_requested` are lifetime totals** read
+///   straight off the atomics and never reset, sitting in the same struct as
+///   per-window rates. That asymmetry is load-bearing: the counters also back
+///   the session summary, and anything wanting a rate out of them differences
+///   two snapshots itself. Making them "consistent" would silently change what
+///   the bitrate adaptor sees.
+///
+/// Publish and reset are one indivisible step. Resetting only some of the
+/// accumulators would leave a closed window's counts divided by the next
+/// window's seconds, and every rate afterwards would climb without bound.
 fn maybe_report(
     shared: &Arc<Shared>,
     win_start: &mut Instant,
@@ -1714,7 +1887,7 @@ fn maybe_report(
     pipeline_ms: &mut f32,
 ) {
     let elapsed = win_start.elapsed();
-    if elapsed < Duration::from_millis(500) {
+    if elapsed < STATS_REPORT_EVERY {
         return;
     }
     let secs = elapsed.as_secs_f32().max(f32::EPSILON);
@@ -2509,8 +2682,8 @@ mod tests {
 
     #[test]
     fn maybe_report_stays_silent_until_its_interval_has_elapsed() {
-        // The gate is a literal `Duration::from_millis(500)` at the top of
-        // `maybe_report` (there is no named constant for it). It has to be a
+        // The gate is `STATS_REPORT_EVERY` at the top of
+        // `maybe_report`. It has to be a
         // *complete* no-op below that: publishing early would divide a handful
         // of frames by a near-zero window, and resetting early would throw away
         // counts that were never reported at all.
@@ -2653,6 +2826,92 @@ mod tests {
         // Publishing must not consume them either — the counters back the
         // session summary as well as this snapshot.
         assert_eq!(shared.counters.dropped.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn the_window_accumulators_match_what_the_media_loop_used_to_do_by_hand() {
+        // The characterization tests above hand-write the arithmetic the media
+        // loop used to do inline (`win_pipeline_ms += elapsed * emitted`, and so
+        // on). This bridges them to the methods that now do it: if the two ever
+        // diverge, those tests keep passing while no longer describing the
+        // shipping code.
+        let mut w = StatsWindow::new();
+        w.note_capture();
+        w.note_capture();
+        w.note_encoded(1_000);
+        w.note_encoded(1_500);
+        w.note_pipeline(5.0, 2); // one iteration, two frames drained out of it
+        w.note_pipeline(9.0, 1);
+        // An iteration that emitted nothing charges nothing, however slow it
+        // was — the mean is over frames, not over loop iterations.
+        w.note_pipeline(250.0, 0);
+
+        assert_eq!((w.captured, w.encoded, w.bytes), (2, 2, 2_500));
+        assert_eq!(w.pipeline_ms, 5.0 * 2.0 + 9.0 * 1.0);
+    }
+
+    #[test]
+    fn resuming_from_a_pause_throws_the_pause_spanning_window_away() {
+        // A UAC prompt is served by `media_thread`'s `Err` capture arm, because
+        // the secure desktop makes `acquire` *fail* rather than return nothing —
+        // and that arm reports nothing at all. So across a multi-second prompt
+        // the window's `start` ages while its counts stand still, and the first
+        // report afterwards divides a handful of fresh frames by the whole
+        // length of the prompt.
+        //
+        // `StatsWindow::restart` is hooked to both places `paused_since` is
+        // cleared: the `Ok(None)` arm's recovery branch, and the `resumed` block
+        // after a successful acquire. Neither is reachable without a desktop, so
+        // what is pinned here is the discarding itself.
+
+        // The control — a resume WITHOUT the restart. 30 frames captured before
+        // a 4 s prompt, one after it, and the bitrate adaptor is handed a
+        // sample saying the link now manages about 8 fps. The bound is
+        // one-sided: measured elapsed can only exceed the 4 000 ms placed here.
+        let unfixed = quiet_shared();
+        let mut w = StatsWindow::new();
+        w.start = started_ms_ago(4_000);
+        w.captured = 30;
+        w.note_capture();
+        w.maybe_report(&unfixed);
+        let bad = unfixed.stats.lock().fps_capture;
+        assert!(
+            bad < 10.0,
+            "the control must show the bad sample, got {bad}"
+        );
+
+        // The fix — same state, restarted first, as a resume now does.
+        let shared = quiet_shared();
+        shared.stats.lock().fps_capture = 59.0; // what the pre-pause window left
+        let mut w = StatsWindow::new();
+        w.start = started_ms_ago(4_000);
+        w.captured = 30;
+        w.encoded = 28;
+        w.bytes = 900_000;
+        w.pipeline_ms = 224.0;
+
+        w.restart();
+        w.note_capture();
+        w.maybe_report(&shared);
+
+        // Nothing was published. That is the whole point: a pause must produce
+        // NO misleading sample, not a differently misleading one — publishing
+        // 0 fps during the prompt instead would let the adaptor cut the bitrate
+        // while the user is still reading the dialog. The last live figures
+        // standing until the first real post-resume window closes is intended.
+        assert_eq!(
+            shared.stats.lock().fps_capture,
+            59.0,
+            "published a window that spanned the pause"
+        );
+        // Every pre-pause count is gone, and the frame that resumed is counted
+        // into the new window rather than into the discarded one.
+        assert_eq!((w.captured, w.encoded, w.bytes), (1, 0, 0));
+        assert_eq!(w.pipeline_ms, 0.0);
+        assert!(
+            w.start.elapsed() < STATS_REPORT_EVERY,
+            "the new window must begin now, not 4 s ago"
+        );
     }
 
     // -- the two default configurations must stay one configuration ----------
