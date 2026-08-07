@@ -83,6 +83,34 @@ mod tests {
         assert!(TransportRoute::DirectTcp.is_direct());
     }
 
+    /// `TransportRoute` rides inside `ControlMsg::RouteReport`, and postcard
+    /// numbers enum variants **positionally** — the variant's index in the
+    /// declaration *is* the byte on the wire. Three of these five routes are
+    /// not produced by any binary today, which makes them look like dead code
+    /// worth deleting; deleting one silently renumbers every variant after it,
+    /// and a deployed peer then reads "Relayed" where the sender meant
+    /// "DirectTcp". Pin the bytes so that edit fails here instead of in the
+    /// field.
+    #[test]
+    fn route_discriminants_are_wire_pinned() {
+        for (route, byte) in [
+            (TransportRoute::DirectUdp, 0u8),
+            (TransportRoute::DirectIpv6, 1),
+            (TransportRoute::UdpHolePunched, 2),
+            (TransportRoute::DirectTcp, 3),
+            (TransportRoute::Relayed, 4),
+        ] {
+            assert_eq!(
+                postcard::to_stdvec(&route).unwrap(),
+                vec![byte],
+                "{route:?} must encode as {byte}. Variant order here is the wire \
+                 format: removing or reordering a variant — even an unused one — \
+                 renumbers the ones after it and makes every already-deployed peer \
+                 misparse RouteReport. Add new routes at the end only."
+            );
+        }
+    }
+
     #[test]
     fn stats_validation() {
         assert!(validate_stats(&ConnStats::default()));
