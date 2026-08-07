@@ -53,9 +53,9 @@
 //! Control and input ride [`QuicSession`], which already does framing,
 //! `Ping`/`Pong`, `Bye` and input validation. Video does **not**: the driver's
 //! queue drops the *newest* frame when it is full, which is exactly backwards
-//! for a live desktop. [`video_pump`] instead coalesces the encoder's backlog
-//! and sends only the freshest frame, then asks for an IDR because dropping a
-//! P-frame breaks the reference chain.
+//! for a live desktop. [`egress::video_pump`] instead coalesces the encoder's
+//! backlog and sends only the freshest frame, then asks for an IDR because
+//! dropping a P-frame breaks the reference chain.
 //!
 //! # Rules
 //!
@@ -73,7 +73,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use parking_lot::Mutex;
 use quinn::Connection;
@@ -86,28 +85,27 @@ use directdesk_shared::crypto::auth::{
 use directdesk_shared::crypto::pairing::PairingHost;
 use directdesk_shared::crypto::storage::SecretStore;
 use directdesk_shared::crypto::{fingerprint_short, HostIdentity};
-use directdesk_shared::input::{validate_event, InputEvent};
+use directdesk_shared::input::validate_event;
 use directdesk_shared::protocol::{
     AuthMsg, Channel, Codec, ControlMsg, Hello, InputMsg, QualityMode, MAX_AUTH_MSG,
     PROTOCOL_VERSION,
 };
 use directdesk_shared::stats::{ConnStats, TransportRoute};
-use directdesk_shared::svc_ipc::SvcResponse;
 use directdesk_shared::transport::quic::{self, QuicParams, SessionStreams};
 use directdesk_shared::transport::session::{
     QuicSession, Session, SessionConfig as DriverConfig, SessionEvent,
 };
-use directdesk_shared::video::{fragment_frame_fec, EncodedFrame};
 use directdesk_shared::{Error, Result};
 
-use crate::elevation::detect_consent_prompt;
-use crate::session::{
-    HostSession, SessionConfig as PipelineConfig, SessionDescription, SessionState,
-};
-use crate::uac_client::{ElevEffect, ElevationMachine, SvcControlClient, UacDataClient};
+use crate::session::{HostSession, SessionConfig as PipelineConfig, SessionState};
 
 mod adaptation;
+mod egress;
+mod elevation;
 mod pairing;
+
+use egress::{tile_pump, video_pump};
+use elevation::elevation_loop;
 
 // The public surface of this module is `directdesk_host::net::X`, and the
 // netsim baselines are pinned against exactly that list of names, so these
@@ -120,15 +118,12 @@ pub use adaptation::{
     OVERRUN_MIN_FRAMES, OVERRUN_WARMUP_INTERVALS, STATUS_INTERVAL_MS, TILE_CEILING_BACKOFF,
     TILE_CEILING_CREEP_KBPS, TILE_CEILING_MIN_KBPS, TILE_CEILING_STEP_KBPS,
 };
+pub use egress::{coalesce_latest, pace_plan, wire_size, KEYFRAME_MIN_INTERVAL_MS, MIN_PACE_SLEEP};
 pub use pairing::{
     AuthThrottle, PairingDisplay, PairingSlot, AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW_MS,
     AUTH_LOCKOUT_MS, HANDSHAKE_TIMEOUT_MS,
 };
 
-/// Floor on how often the video pump asks for an IDR *of its own accord*
-/// (coalesced frames, backpressure, a frame it could not fragment). These are
-/// self-inflicted requests on an already-struggling link, so they stay rare.
-pub const KEYFRAME_MIN_INTERVAL_MS: u64 = 500;
 /// Floor on how often a *client's* `RequestKeyframe` is honoured. The client
 /// only asks when its own decoder is stuck (a frame-id gap), and it rate-limits
 /// itself; gating that a second time at 500 ms is what made recovery from a
@@ -142,81 +137,6 @@ pub const CLOSE_CODE_DISCONNECT: u32 = 2;
 /// The route this build can offer. QUIC over UDP only; the TCP fallback and
 /// relay live in another wave and must never be claimed here.
 pub const HOST_ROUTE: TransportRoute = TransportRoute::DirectUdp;
-
-// ---------------------------------------------------------------------------
-// Frame drop policy
-// ---------------------------------------------------------------------------
-
-/// Bytes a frame will occupy in the datagram send buffer once fragmented.
-///
-/// [`fragment_frame`] splits the payload into `mtu - FRAG_HEADER_LEN` chunks
-/// and puts a header on each, so the data total is the payload plus one header
-/// per fragment. [`fragment_frame_fec`] then adds one XOR-parity fragment per
-/// `fec_block` data fragments, and a parity payload is always a *full* chunk
-/// wide — it is the XOR of chunk-padded pieces — so parity costs a header plus
-/// the whole chunk, not an average share of the payload. Counting it is what
-/// keeps the backpressure precheck from under-estimating ~10% and letting
-/// quinn evict the datagrams already in flight.
-///
-/// `fec_block == 0` (or a single data fragment) models the data-only
-/// fragmenter, which is exactly what [`fragment_frame_fec`] emits in that case.
-pub fn wire_size(frame: &EncodedFrame, mtu: usize, fec_block: u8) -> usize {
-    use directdesk_shared::video::FRAG_HEADER_LEN;
-    let chunk = mtu.saturating_sub(FRAG_HEADER_LEN).max(1);
-    let frags = frame.data.len().div_ceil(chunk);
-    let data = frame.data.len() + frags * FRAG_HEADER_LEN;
-    if fec_block == 0 || frags <= 1 {
-        return data;
-    }
-    let parity = frags.div_ceil(fec_block as usize);
-    data + parity * (FRAG_HEADER_LEN + chunk)
-}
-
-/// Shortest sleep Windows can actually honour, even with the 1 ms timer
-/// resolution the video sender holds. Asking for less does not pace the burst,
-/// it just rounds every gap up — which is how a 285-fragment scene-change frame
-/// turned a 10 ms pacing window into a 35–200 ms stall.
-pub const MIN_PACE_SLEEP: Duration = Duration::from_millis(1);
-
-/// How to spread `n` fragments of one frame across `pace_window`: how many
-/// datagrams go out back-to-back, and how long to sleep between those batches.
-///
-/// A zero gap means "no pacing, send the lot" — either the frame is small
-/// enough not to need smoothing, or the window is too short to be divided into
-/// sleeps the OS could honour. The batch count is capped at the window's whole
-/// milliseconds precisely so every gap this returns is one Windows can serve:
-/// a big frame is then paced *coarsely* instead of being paced into a stall.
-pub fn pace_plan(n: usize, pace_window: Duration) -> (usize, Duration) {
-    if n <= PACING_MIN_FRAGS {
-        return (n.max(1), Duration::ZERO);
-    }
-    let max_batches = pace_window.as_millis().max(1) as usize;
-    let batches = n.div_ceil(PACING_BATCH).clamp(1, max_batches);
-    let batch_len = n.div_ceil(batches).max(1);
-    let gap = pace_window / batches as u32;
-    if gap < MIN_PACE_SLEEP {
-        (n, Duration::ZERO)
-    } else {
-        (batch_len, gap)
-    }
-}
-
-/// Latest-wins: keep the newest frame the encoder has produced and report how
-/// many older ones were skipped.
-///
-/// The queue behind `rx` is the encoder's output. If we are keeping up it is
-/// empty and nothing is dropped. If we are behind — a slow link, a big IDR
-/// still being fragmented — every queued frame except the last is already
-/// stale, and sending it would only delay the one the user actually wants.
-pub fn coalesce_latest(first: EncodedFrame, rx: &CbReceiver<EncodedFrame>) -> (EncodedFrame, u32) {
-    let mut newest = first;
-    let mut dropped = 0u32;
-    while let Ok(next) = rx.try_recv() {
-        dropped += 1;
-        newest = next;
-    }
-    (newest, dropped)
-}
 
 // ---------------------------------------------------------------------------
 // Address discovery
@@ -1333,207 +1253,6 @@ async fn run_session(
     reason
 }
 
-/// Below this fragment count a frame is small enough to send in one go; pacing
-/// only matters for the big multi-datagram frames (keyframes, heavy motion)
-/// that otherwise hit the link as a loss-inducing burst.
-const PACING_MIN_FRAGS: usize = 8;
-/// Datagrams per paced sub-burst (one `send_datagram` batch between sleeps).
-const PACING_BATCH: usize = 4;
-/// FEC block size K: one XOR-parity fragment is appended per this many data
-/// fragments, so any single lost data fragment in a block is reconstructed by
-/// the receiver with no keyframe stall. `0` would disable FEC.
-const FEC_BLOCK_SIZE: u8 = 10;
-
-/// RAII: raise the Windows timer resolution to 1 ms for the video sender's
-/// lifetime so the sub-frame pacing sleeps are actually honoured — the default
-/// ~15 ms scheduler tick would round a 2 ms sleep up to 15 ms and wildly
-/// over-pace. Restored on drop.
-struct TimerResolution;
-impl TimerResolution {
-    fn acquire() -> Self {
-        // SAFETY: documented winmm call, paired with timeEndPeriod(1) in Drop.
-        unsafe {
-            let _ = windows::Win32::Media::timeBeginPeriod(1);
-        }
-        TimerResolution
-    }
-}
-impl Drop for TimerResolution {
-    fn drop(&mut self) {
-        // SAFETY: matches the timeBeginPeriod(1) from acquire().
-        unsafe {
-            let _ = windows::Win32::Media::timeEndPeriod(1);
-        }
-    }
-}
-
-/// Fragment encoded frames into datagrams, newest-first.
-fn video_pump(
-    conn: Connection,
-    frames: CbReceiver<EncodedFrame>,
-    pipeline: Arc<HostSession>,
-    streaming: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    counters: Arc<VideoCounters>,
-) {
-    crate::session::lower_video_thread_priority("video-tx");
-    let _timer = TimerResolution::acquire();
-    let start = Instant::now();
-    let mut idr = RateLimiter::new(KEYFRAME_MIN_INTERVAL_MS);
-
-    while !stop.load(Ordering::Relaxed) {
-        let frame = match frames.recv_timeout(Duration::from_millis(200)) {
-            Ok(f) => f,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        };
-        if !streaming.load(Ordering::Relaxed) {
-            // Not streaming: the frame is discarded here rather than left to
-            // rot in the queue, so the encoder's eviction stays meaningful.
-            continue;
-        }
-
-        let (frame, dropped) = coalesce_latest(frame, &frames);
-        if dropped > 0 {
-            counters
-                .coalesced
-                .fetch_add(dropped as u64, Ordering::Relaxed);
-            // Skipping a P-frame breaks the client's reference chain. Ask for
-            // an IDR, but not more than twice a second or a congested link
-            // turns into a keyframe storm.
-            if idr.allow(start.elapsed().as_millis() as u64) {
-                pipeline.request_keyframe();
-            }
-        }
-
-        // Spread a frame's fragments across ~60% of a frame interval so the next
-        // frame is still not due when we finish, i.e. pacing adds smoothing
-        // without adding steady-state latency. Recomputed per frame (one relaxed
-        // atomic load) because the frame rate is live: at 15 fps the window is
-        // 40 ms rather than 10 ms, which is exactly the extra smoothing a
-        // residential uplink needs to get a big IDR out without tail-dropping.
-        let pace_window =
-            Duration::from_micros(1_000_000 / pipeline.active_fps().max(1) as u64) * 3 / 5;
-
-        let mtu = match conn.max_datagram_size() {
-            Some(m) => m,
-            None => {
-                tracing::error!("peer stopped accepting datagrams; video cannot continue");
-                break;
-            }
-        };
-
-        // Do not offer a frame the connection cannot take whole.
-        //
-        // `send_datagram` never blocks and never refuses: when its buffer is
-        // full quinn silently evicts the *oldest* queued datagrams to make
-        // room. Offering more than fits therefore does not drop this frame, it
-        // shreds the one already in flight — and a frame missing one fragment
-        // is as useless as a frame that never arrived, so the result is two
-        // wasted frames instead of one. Skipping cleanly here costs one frame
-        // and keeps every frame that is sent decodable.
-        if conn.datagram_send_buffer_space() < wire_size(&frame, mtu, FEC_BLOCK_SIZE) {
-            counters.backpressured.fetch_add(1, Ordering::Relaxed);
-            if idr.allow(start.elapsed().as_millis() as u64) {
-                pipeline.request_keyframe();
-            }
-            continue;
-        }
-
-        // The precheck above covers the data fragments *and* their parity, so
-        // what follows fits whole: nothing this frame sends can displace the
-        // datagrams already queued for the previous one.
-        let frags = match fragment_frame_fec(&frame, mtu, FEC_BLOCK_SIZE) {
-            Ok(f) => f,
-            Err(e) => {
-                counters
-                    .frames_unfragmentable
-                    .fetch_add(1, Ordering::Relaxed);
-                if frame.keyframe {
-                    // A keyframe we cannot fragment is a hard freeze, not a
-                    // dropped frame: every later P-frame references an IDR the
-                    // client never received, and the IDR we are about to ask
-                    // for would be exactly as big. Latch it so the adaptor
-                    // treats this as full congestion and the next one is
-                    // smaller — that is the loop-termination guard.
-                    counters.oversized_keyframe.store(true, Ordering::Relaxed);
-                    tracing::error!(
-                        frame_id = frame.frame_id,
-                        bytes = frame.data.len(),
-                        keyframe = frame.keyframe,
-                        "cannot fragment keyframe ({e}); cutting bitrate so the next IDR fits"
-                    );
-                } else {
-                    tracing::warn!(
-                        frame_id = frame.frame_id,
-                        bytes = frame.data.len(),
-                        keyframe = frame.keyframe,
-                        "cannot fragment frame ({e}); dropping it"
-                    );
-                }
-                // Dropping a frame breaks the client's reference chain just as
-                // coalescing does, so it earns an IDR through the same limiter.
-                if idr.allow(start.elapsed().as_millis() as u64) {
-                    pipeline.request_keyframe();
-                }
-                continue;
-            }
-        };
-
-        let mut bytes = 0u64;
-        let mut failed = false;
-        let n = frags.len();
-        // Small frames go out immediately; large ones are spread so a keyframe
-        // burst can't tail-drop (which would make quinn evict older queued
-        // datagrams and shred an in-flight frame).
-        let (batch_len, gap) = pace_plan(n, pace_window);
-        // Pacing is smoothing, not a contract. A scene change makes one frame
-        // 6-18x normal size, and holding the sleeps for all of it is what backs
-        // the encoder queue up until frames are evicted — the freeze. Past
-        // twice the window we stop pacing and get the frame out: a burst costs
-        // some loss, a stall costs the picture.
-        let emit_start = Instant::now();
-        let deadline = emit_start + pace_window * 2;
-        let mut burst = false;
-        for (i, frag) in frags.into_iter().enumerate() {
-            if !gap.is_zero() && !burst && i > 0 && i % batch_len == 0 {
-                if Instant::now() + gap <= deadline {
-                    std::thread::sleep(gap);
-                } else {
-                    burst = true;
-                }
-            }
-            bytes += frag.len() as u64;
-            if let Err(e) = conn.send_datagram(Bytes::from(frag)) {
-                match e {
-                    quinn::SendDatagramError::ConnectionLost(_) => failed = true,
-                    other => tracing::warn!("datagram dropped: {other}"),
-                }
-                break;
-            }
-        }
-        let emit_ms = emit_start.elapsed().as_millis() as u64;
-        counters.emit_ms_max.fetch_max(emit_ms, Ordering::Relaxed);
-        if burst {
-            counters
-                .pace_deadline_bursts
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                frame_id = frame.frame_id,
-                frags = n,
-                emit_ms,
-                "pacing deadline passed; burst the rest of the frame"
-            );
-        }
-        if failed {
-            break;
-        }
-        counters.frames_sent.fetch_add(1, Ordering::Relaxed);
-        counters.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-    }
-    tracing::debug!("video sender finished");
-}
-
 /// Inbound input. The driver has already decoded and validated; validating
 /// again is cheap and keeps this the last line of defence before injection.
 async fn input_loop(mut rx: mpsc::Receiver<InputMsg>, pipeline: Arc<HostSession>) {
@@ -1680,12 +1399,6 @@ fn apply_bitrate(inner: &Arc<Inner>, pipeline: &Arc<HostSession>, kbps: u32) {
     inner.status_mut(|s| s.target_kbps = capped);
 }
 
-/// Periodic host → client status, and the adaptive bitrate loop.
-/// How long the pump sleeps when the tile queue is empty. Tiles are a
-/// background trickle, not a paced real-time stream, so a coarse poll costs
-/// nothing and keeps this an ordinary abortable tokio task.
-const TILE_POLL_MS: u64 = 15;
-
 #[derive(Default)]
 struct TileCounters {
     strips_sent: AtomicU64,
@@ -1693,89 +1406,7 @@ struct TileCounters {
     control_sent: AtomicU64,
 }
 
-/// Ship refinement messages to the client on the bulk unidirectional stream.
-///
-/// Lives in `tasks`, so it is aborted when the session ends. That is exactly
-/// right: an aborted pump simply stops renewing leases, every outstanding tile
-/// expires on the client, and the picture reverts to plain H.264. There is no
-/// cleanup to get wrong.
-///
-/// Failure policy throughout: **this task may degrade the picture, never the
-/// session.** Any stream error stops the pump and leaves the connection alive.
-/// Note what this task deliberately does **not** do: it never drops a message.
-///
-/// The budget is spent by the media thread *before* a strip is queued, because
-/// only the media thread owns the grid. If this task dropped a queued strip,
-/// the grid would already have recorded it as delivered (`commit_sent`), the
-/// hash guard would suppress every re-send, and that square of the screen would
-/// stay soft forever — the same class of bug as a reconnect inheriting a stale
-/// grid, and just as invisible in testing.
-///
-/// Congestion is therefore handled by *waiting*, not discarding: this task
-/// stalls, the bounded queue fills, and the media thread's `try_send` fails and
-/// calls `abandon`, which leaves the tile eligible for a later pass. Every link
-/// in that chain fails toward "send it again", never toward "assume it landed".
-async fn tile_pump(
-    conn: Connection,
-    tiles: CbReceiver<directdesk_shared::tiles::TileMsg>,
-    stop: Arc<AtomicBool>,
-    counters: Arc<TileCounters>,
-) {
-    use directdesk_shared::tiles::TileMsg;
-
-    let mut send = match quic::open_bulk(&conn).await {
-        Ok(s) => s,
-        Err(e) => {
-            // The client agreed to the feature but the stream would not open.
-            // Nothing else about the session is affected.
-            tracing::warn!("lossless tiles disabled for this session: {e}");
-            return;
-        }
-    };
-    tracing::info!("lossless tile stream open");
-
-    while !stop.load(Ordering::Relaxed) {
-        // Deliberately no congestion check here. Throttling happens twice
-        // already, both in places that can decline work rather than destroy it:
-        // `status_loop` zeroes the budget on any strain, and the media thread
-        // spends that budget before it plans a strip. A check *here* could only
-        // act on a message already dequeued — and dropping it would be the one
-        // failure this feature must not have. Congestion instead arrives as
-        // natural backpressure: `write_framed` awaits, this queue fills, and the
-        // media thread's `try_send` fails into `abandon`, which retries later.
-        let msg = match tiles.try_recv() {
-            Ok(m) => m,
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                tokio::time::sleep(Duration::from_millis(TILE_POLL_MS)).await;
-                continue;
-            }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-        };
-
-        match &msg {
-            TileMsg::Strip { data, .. } => {
-                counters.strips_sent.fetch_add(1, Ordering::Relaxed);
-                counters
-                    .bytes_sent
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-            }
-            _ => {
-                counters.control_sent.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        if let Err(e) = quic::write_framed(&mut send, &msg).await {
-            tracing::warn!("tile stream write failed, refinement off: {e}");
-            break;
-        }
-    }
-
-    // Best-effort tidy: a clean finish lets the client's reader end without
-    // logging an error. Failure here is irrelevant, the session owns the
-    // connection.
-    let _ = send.finish();
-}
-
+/// Periodic host → client status, and the adaptive bitrate loop.
 async fn status_loop(
     inner: Arc<Inner>,
     session: Arc<QuicSession>,
@@ -2017,180 +1648,6 @@ async fn event_loop(
     }
 }
 
-// ---------------------------------------------------------------------------
-// UAC click-through orchestration
-// ---------------------------------------------------------------------------
-
-/// How often the elevation loop polls for a consent prompt.
-const ELEVATION_POLL_MS: u64 = 200;
-
-/// A live SYSTEM-worker route: the forwarder thread draining the input route
-/// sink into the worker's data pipe.
-struct ActiveRoute {
-    forwarder: std::thread::JoinHandle<()>,
-}
-
-/// Detect a consent prompt, offer the client the click-through, and — once the
-/// operator arms — route input to a transient SYSTEM worker for the duration of
-/// the elevation. All Windows/pipe work is done off the runtime via
-/// `spawn_blocking`; the decision logic is the pure [`ElevationMachine`].
-async fn elevation_loop(
-    inner: Arc<Inner>,
-    session: Arc<QuicSession>,
-    pipeline: Arc<HostSession>,
-    mut arm_rx: mpsc::UnboundedReceiver<(bool, u32)>,
-    stop: Arc<AtomicBool>,
-) {
-    if !inner.cfg.uac_clickthrough {
-        // Opt-out: never detect, never offer, never spawn a SYSTEM worker.
-        return;
-    }
-    tracing::info!("UAC click-through enabled; watching for consent prompts");
-
-    let mut machine = ElevationMachine::new();
-    let mut active: Option<ActiveRoute> = None;
-    let mut ticker = tokio::time::interval(Duration::from_millis(ELEVATION_POLL_MS));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                if stop.load(Ordering::SeqCst) || session.is_closed() {
-                    break;
-                }
-                let prompt = detect_consent_prompt();
-                let effect = machine.observe(prompt.is_some(), Instant::now());
-                match effect {
-                    ElevEffect::None => {}
-                    ElevEffect::Notify => {
-                        let title = prompt.map(|p| p.title).unwrap_or_default();
-                        tracing::info!("consent prompt detected; offering click-through");
-                        let _ = session.send_control(ControlMsg::ElevationPrompt { title });
-                    }
-                    ElevEffect::BeginRoute => {
-                        let desc = pipeline.describe();
-                        let pl = pipeline.clone();
-                        match tokio::task::spawn_blocking(move || start_route(pl, desc)).await {
-                            Ok(Ok(route)) => {
-                                active = Some(route);
-                                tracing::info!("SYSTEM injector routing input for elevation");
-                            }
-                            Ok(Err(e)) => {
-                                tracing::error!("could not start SYSTEM injector: {e}");
-                                let _ = machine.cancel();
-                                let _ = session.send_control(ControlMsg::ElevationEnded);
-                            }
-                            Err(e) => {
-                                tracing::error!("start-route task failed: {e}");
-                                let _ = machine.cancel();
-                                let _ = session.send_control(ControlMsg::ElevationEnded);
-                            }
-                        }
-                    }
-                    ElevEffect::EndRoute => {
-                        if let Some(route) = active.take() {
-                            let pl = pipeline.clone();
-                            let _ = tokio::task::spawn_blocking(move || end_route(pl, route)).await;
-                        } else {
-                            pipeline.end_elevation_route();
-                        }
-                        tracing::info!("elevation ended; input back on the local injector");
-                        let _ = session.send_control(ControlMsg::ElevationEnded);
-                    }
-                    ElevEffect::Cleared => {
-                        let _ = session.send_control(ControlMsg::ElevationEnded);
-                    }
-                }
-            }
-            armed = arm_rx.recv() => {
-                match armed {
-                    Some((one_shot, ttl_secs)) => {
-                        // The host's config TTL is the ceiling; the client cannot
-                        // ask for longer than the operator configured.
-                        let ttl_secs = ttl_secs
-                            .clamp(crate::config::MIN_UAC_ARM_TTL_SECS, inner.cfg.uac_arm_ttl_secs);
-                        let accepted = machine.arm(one_shot, Duration::from_secs(ttl_secs as u64), Instant::now());
-                        if accepted {
-                            tracing::info!("elevation armed (one_shot={one_shot}, ttl={ttl_secs}s)");
-                        } else {
-                            tracing::warn!("arm ignored: no consent prompt currently on screen");
-                            let _ = session.send_control(ControlMsg::ElevationEnded);
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    // Cleanup: tear down any live worker and clear the input route.
-    if let Some(route) = active.take() {
-        let pl = pipeline.clone();
-        let _ = tokio::task::spawn_blocking(move || end_route(pl, route)).await;
-        let _ = session.send_control(ControlMsg::ElevationEnded);
-    }
-    tracing::debug!("elevation loop finished");
-}
-
-/// Start the SYSTEM worker, connect its data pipe, flip the session's input
-/// route to it, and spawn the forwarder that drains the route into the pipe.
-/// Blocking: runs on a `spawn_blocking` thread.
-fn start_route(pipeline: Arc<HostSession>, desc: SessionDescription) -> Result<ActiveRoute> {
-    let resp = SvcControlClient::start_uac_injector()?;
-    let (pipe_name, cap_token) = match resp {
-        SvcResponse::UacInjectorReady {
-            pipe_name,
-            cap_token,
-        } => (pipe_name, cap_token),
-        SvcResponse::Denied { reason } => {
-            return Err(Error::Other(format!(
-                "service denied UAC injector: {reason}"
-            )));
-        }
-        other => {
-            return Err(Error::Other(format!(
-                "unexpected service response to StartUacInjector: {other:?}"
-            )));
-        }
-    };
-
-    let client = UacDataClient::connect(&pipe_name, &cap_token)?;
-    client.send_geometry(desc.width, desc.height, desc.monitor_origin)?;
-
-    // The input thread owns the Sender; when the route ends it drops it, which
-    // disconnects this Receiver and unblocks the forwarder below.
-    let (tx, rx) = crossbeam_channel::unbounded::<InputEvent>();
-    pipeline.begin_elevation_route(tx);
-
-    let forwarder = std::thread::Builder::new()
-        .name("dd-uac-fwd".into())
-        .spawn(move || {
-            for ev in rx.iter() {
-                if let Err(e) = client.send_input(InputMsg::Event(ev)) {
-                    tracing::warn!("UAC forward failed; stopping forwarder: {e}");
-                    break;
-                }
-            }
-            // Dropping `client` here closes the pipe, so the worker sees the
-            // disconnect and self-exits (after releasing all held input).
-            tracing::debug!("UAC forwarder finished");
-        })
-        .map_err(|e| Error::Other(format!("spawn UAC forwarder: {e}")))?;
-
-    Ok(ActiveRoute { forwarder })
-}
-
-/// Leave the route: clear the session's elevation route (which drops the input
-/// thread's Sender and unblocks the forwarder), join the forwarder, then ask the
-/// service to stop the worker. Blocking.
-fn end_route(pipeline: Arc<HostSession>, route: ActiveRoute) {
-    pipeline.end_elevation_route();
-    let _ = route.forwarder.join();
-    if let Err(e) = SvcControlClient::stop_uac_injector() {
-        tracing::debug!("stop_uac_injector: {e}");
-    }
-}
-
 /// The channel tag the host expects each inbound stream to open with.
 ///
 /// Re-exported so the loopback test can assert the host and the shared crate
@@ -2202,175 +1659,6 @@ pub fn expected_channels() -> [Channel; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Data-only fragmenter: `wire_size` models exactly its output, so the tests
-    // that pin that relationship exercise it directly.
-    use directdesk_shared::video::fragment_frame;
-
-    // -- drop policy -------------------------------------------------------
-
-    fn frame(id: u32, keyframe: bool) -> EncodedFrame {
-        EncodedFrame {
-            frame_id: id,
-            keyframe,
-            timestamp_ms: id,
-            data: vec![0xAB; 32],
-        }
-    }
-
-    #[test]
-    fn coalesce_keeps_nothing_when_the_queue_is_empty() {
-        let (_tx, rx) = crossbeam_channel::unbounded::<EncodedFrame>();
-        let (kept, dropped) = coalesce_latest(frame(1, true), &rx);
-        assert_eq!(kept.frame_id, 1);
-        assert_eq!(dropped, 0);
-    }
-
-    #[test]
-    fn coalesce_drops_stale_frames_not_fresh_ones() {
-        let (tx, rx) = crossbeam_channel::unbounded::<EncodedFrame>();
-        for id in 2..=6 {
-            tx.send(frame(id, false)).unwrap();
-        }
-        let (kept, dropped) = coalesce_latest(frame(1, true), &rx);
-        assert_eq!(
-            kept.frame_id, 6,
-            "the newest frame is the one that survives"
-        );
-        assert_eq!(dropped, 5, "one taken plus four queued were skipped");
-        assert!(rx.is_empty());
-    }
-
-    #[test]
-    fn wire_size_matches_what_fragmenting_actually_produces() {
-        let mtu = 1_200;
-        for len in [1usize, 100, 1_186, 1_187, 5_000, 145_000] {
-            let f = EncodedFrame {
-                frame_id: 1,
-                keyframe: false,
-                timestamp_ms: 0,
-                data: vec![0u8; len],
-            };
-            let actual: usize = fragment_frame(&f, mtu)
-                .unwrap()
-                .iter()
-                .map(|d| d.len())
-                .sum();
-            assert_eq!(wire_size(&f, mtu, 0), actual, "len {len}");
-        }
-    }
-
-    #[test]
-    fn wire_size_counts_the_fec_parity_too() {
-        // Under-counting parity is what let quinn evict in-flight datagrams:
-        // the model must match what actually goes on the wire, byte for byte.
-        let mtu = 1_200;
-        for len in [1usize, 100, 1_186, 1_187, 5_000, 145_000] {
-            let f = EncodedFrame {
-                frame_id: 1,
-                keyframe: true,
-                timestamp_ms: 0,
-                data: vec![0u8; len],
-            };
-            let actual: usize = fragment_frame_fec(&f, mtu, FEC_BLOCK_SIZE)
-                .unwrap()
-                .iter()
-                .map(|d| d.len())
-                .sum();
-            assert_eq!(wire_size(&f, mtu, FEC_BLOCK_SIZE), actual, "len {len}");
-        }
-    }
-
-    #[test]
-    fn wire_size_never_underestimates() {
-        // The backpressure check must not be optimistic: an underestimate would
-        // let a frame in that displaces the one already in flight.
-        let f = EncodedFrame {
-            frame_id: 1,
-            keyframe: true,
-            timestamp_ms: 0,
-            data: vec![0u8; 50_000],
-        };
-        assert!(wire_size(&f, 1_200, 0) > f.data.len());
-        assert!(
-            wire_size(&f, 1_200, 0) > wire_size(&f, 1_400, 0),
-            "smaller MTU means more headers"
-        );
-        assert!(
-            wire_size(&f, 1_200, FEC_BLOCK_SIZE) > wire_size(&f, 1_200, 0),
-            "parity is not free"
-        );
-    }
-
-    // -- pacing ------------------------------------------------------------
-
-    #[test]
-    fn small_frames_are_not_paced() {
-        let (batch, gap) = pace_plan(4, Duration::from_millis(10));
-        assert_eq!(gap, Duration::ZERO, "a 4-fragment frame just goes out");
-        assert_eq!(batch, 4);
-    }
-
-    #[test]
-    fn ordinary_frames_keep_the_old_plan() {
-        // The behaviour this replaces: one batch per PACING_BATCH fragments,
-        // the window split evenly between them. Nothing normal-sized changes.
-        let (batch, gap) = pace_plan(16, Duration::from_millis(10));
-        assert_eq!(batch, PACING_BATCH);
-        assert_eq!(gap, Duration::from_micros(2_500));
-    }
-
-    #[test]
-    fn a_scene_change_frame_is_paced_coarsely_not_impossibly() {
-        // 285 fragments is a real minimise-to-desktop frame. The old plan asked
-        // for 72 gaps of 138us inside a 10ms window; Windows rounds each up and
-        // the frame takes 35-200ms. Fewer, honourable gaps instead.
-        let window = Duration::from_millis(10);
-        let (batch, gap) = pace_plan(285, window);
-        assert!(
-            gap >= MIN_PACE_SLEEP,
-            "{gap:?} is a sleep Windows can serve"
-        );
-        let batches = 285usize.div_ceil(batch);
-        assert!(
-            gap * batches as u32 <= window,
-            "pacing {batches} batches of {gap:?} must fit the window"
-        );
-        assert!(batch * batches >= 285, "every fragment must be covered");
-    }
-
-    #[test]
-    fn pace_plan_gaps_are_always_sleepable_and_fit_the_window() {
-        for fps in [30u32, 60, 120, 240] {
-            // Exactly how video_pump derives its window.
-            let window = Duration::from_micros(1_000_000 / fps as u64) * 3 / 5;
-            for n in 1..=512usize {
-                let (batch, gap) = pace_plan(n, window);
-                assert!(batch >= 1, "n {n} fps {fps}: empty batch");
-                assert!(
-                    gap.is_zero() || gap >= MIN_PACE_SLEEP,
-                    "n {n} fps {fps}: {gap:?} is below the sleep floor"
-                );
-                let batches = n.div_ceil(batch);
-                assert!(batch * batches >= n, "n {n} fps {fps}: fragments lost");
-                // Sleeps happen *between* batches, so the bound is generous.
-                assert!(
-                    gap * batches as u32 <= window,
-                    "n {n} fps {fps}: {batches} x {gap:?} overruns {window:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn coalesce_reports_enough_drops_to_trigger_an_idr() {
-        let (tx, rx) = crossbeam_channel::unbounded::<EncodedFrame>();
-        tx.send(frame(2, false)).unwrap();
-        let (_, dropped) = coalesce_latest(frame(1, false), &rx);
-        assert!(
-            dropped > 0,
-            "any drop must be visible so a keyframe can be requested"
-        );
-    }
 
     // -- addresses ---------------------------------------------------------
 
