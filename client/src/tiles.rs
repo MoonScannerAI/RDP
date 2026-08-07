@@ -50,12 +50,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use directdesk_shared::tiles::{
-    decompress_strip, tile_cols, tile_id, TileCodec, TileMsg, MAX_STRIP_W, TILE_EDGE,
+    decompress_strip, tile_cols, tile_id, TileCodec, TileMsg, FRAME_BPP, MAX_STRIP_W, TILE_EDGE,
 };
 use parking_lot::Mutex;
-
-/// Bytes per pixel in decoded frames and in tile payloads (RGBA).
-const FRAME_BPP: usize = 4;
 
 /// Hard ceiling on resident tile bytes, whatever the frame size implies.
 ///
@@ -178,44 +175,12 @@ fn unpack_lease(v: u64) -> (u32, u32) {
     ((v >> 32) as u32, v as u32)
 }
 
-/// Wrapping-safe lease test: is `frame_ts_ms` inside `[from, through]`?
-///
-/// Both endpoints and the probe are points on a wrapping `u32` capture clock,
-/// so `from <= now && now <= through` is simply wrong near the wrap: a lease
-/// issued at `u32::MAX - 10` and running 100 ms covers timestamp `50`, and a
-/// naive comparison would refuse it for ~49 days.
-///
-/// Instead measure the *distance* from the start of the window in wrapping
-/// arithmetic and compare it against the window's length. Both endpoints are
-/// inclusive.
-#[must_use]
-pub fn lease_covers(frame_ts_ms: u32, valid_from_ms: u32, valid_through_ms: u32) -> bool {
-    frame_ts_ms.wrapping_sub(valid_from_ms) <= valid_through_ms.wrapping_sub(valid_from_ms)
-}
-
-/// Has a lease's end passed, as of `frame_ts_ms`?
-///
-/// **Deliberately one-sided, and [`lease_covers`] must not be substituted for
-/// it.** "Not yet valid" and "no longer valid" are entirely different states,
-/// and only the second one justifies destroying a tile.
-///
-/// A freshly arrived tile is *routinely* not yet valid: the host stamps
-/// `valid_from_ms` with the capture timestamp of the frame the refinement pass
-/// ran on, while the client is still compositing an **earlier** frame — the
-/// encoder's pipeline depth, the outbound frame queue, pacing and the decoder's
-/// own latency all sit between them. So a brand-new tile normally arrives with
-/// its window starting slightly in the future. Evicting on the two-sided test
-/// would therefore delete almost every tile before it was ever painted, while
-/// the host — which has already recorded it as delivered and keeps renewing it
-/// — would never re-send it. The feature would spend bandwidth and refine
-/// nothing. Waiting is free; deleting is not.
-///
-/// Uses the signed-difference trick so it is correct across the `u32` wrap for
-/// any interval shorter than ~24.8 days.
-#[must_use]
-pub fn lease_ended(frame_ts_ms: u32, valid_through_ms: u32) -> bool {
-    (frame_ts_ms.wrapping_sub(valid_through_ms) as i32) > 0
-}
+// Both comparators live in `directdesk_shared::tiles`, next to the host's
+// `reached`, so the two ends of the feature cannot drift on how the wrap is
+// handled — and so the one-sidedness of `lease_ended` is pinned in one place.
+// Re-exported at the paths this module has always used, so every call site and
+// test here is unchanged.
+pub use directdesk_shared::tiles::{lease_covers, lease_ended};
 
 /// Capacity budget derived from the frame size: one full frame of tiles plus
 /// 25% headroom, capped at [`MAX_STORE_BYTES`].

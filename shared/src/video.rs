@@ -154,47 +154,16 @@ pub struct EncodedFrame {
 
 /// Split one encoded frame into datagram-sized fragments.
 /// `max_datagram` is the transport's current max datagram size.
+///
+/// This is precisely [`fragment_frame_fec`] with `block_size = 0`, which is how
+/// "no FEC" is spelled on the wire: identical chunking, identical caps,
+/// identical errors in the same order, and `block_size: 0, last_frag_len: 0` in
+/// every header. Delegating rather than keeping a second copy is what stops the
+/// two from drifting — the FEC path's *data* fragments are required to be
+/// byte-identical to these, so a header or cap change made in one place only
+/// would be a wire-format split with no compiler error.
 pub fn fragment_frame(frame: &EncodedFrame, max_datagram: usize) -> Result<Vec<Vec<u8>>> {
-    if frame.data.is_empty() {
-        return Err(Error::Invalid("empty frame".into()));
-    }
-    if frame.data.len() > MAX_FRAME_BYTES {
-        return Err(Error::Oversized {
-            got: frame.data.len(),
-            limit: MAX_FRAME_BYTES,
-        });
-    }
-    let chunk = max_datagram
-        .checked_sub(FRAG_HEADER_LEN)
-        .ok_or_else(|| Error::Invalid("max_datagram smaller than header".into()))?;
-    if chunk == 0 {
-        return Err(Error::Invalid("max_datagram too small".into()));
-    }
-    let count = frame.data.len().div_ceil(chunk);
-    if count > MAX_FRAGS_PER_FRAME as usize {
-        return Err(Error::Oversized {
-            got: count,
-            limit: MAX_FRAGS_PER_FRAME as usize,
-        });
-    }
-    let mut out = Vec::with_capacity(count);
-    for (i, piece) in frame.data.chunks(chunk).enumerate() {
-        let mut dgram = Vec::with_capacity(FRAG_HEADER_LEN + piece.len());
-        FragHeader {
-            frame_id: frame.frame_id,
-            frag_index: i as u16,
-            frag_count: count as u16,
-            keyframe: frame.keyframe,
-            parity: false,
-            block_size: 0,
-            last_frag_len: 0,
-            timestamp_ms: frame.timestamp_ms,
-        }
-        .encode(&mut dgram);
-        dgram.extend_from_slice(piece);
-        out.push(dgram);
-    }
-    Ok(out)
+    fragment_frame_fec(frame, max_datagram, 0)
 }
 
 /// Split one encoded frame into datagram-sized fragments **with XOR parity**.
@@ -383,6 +352,24 @@ mod tests {
         assert!(frags.iter().all(|f| f.len() <= 1200));
         let total: usize = frags.iter().map(|f| f.len() - FRAG_HEADER_LEN).sum();
         assert_eq!(total, 3000);
+    }
+
+    #[test]
+    fn fragment_frame_is_fec_with_no_parity() {
+        // `fragment_frame` delegates to `fragment_frame_fec(.., 0)`. Pin that
+        // the two are byte-identical over the shapes that could diverge: a
+        // single fragment, an exact multiple of the chunk size, a one-byte
+        // overflow into a second fragment, and a long short-tailed frame.
+        for len in [1usize, 500, 1186, 1187, 2372, 10_000] {
+            for mtu in [64usize, 300, 1200, 1500] {
+                let frame = mk(len);
+                assert_eq!(
+                    fragment_frame(&frame, mtu).unwrap(),
+                    fragment_frame_fec(&frame, mtu, 0).unwrap(),
+                    "len {len}, mtu {mtu}"
+                );
+            }
+        }
     }
 
     #[test]

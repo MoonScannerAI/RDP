@@ -69,11 +69,8 @@
 //! ```
 
 use directdesk_shared::tiles::{
-    tile_cols, tile_id, tile_rows, TileMsg, MAX_STRIP_TILES, TILE_EDGE,
+    tile_cols, tile_id, tile_rows, TileMsg, FRAME_BPP, MAX_STRIP_TILES, TILE_EDGE,
 };
-
-/// Bytes per pixel in a host capture buffer (BGRA).
-const FRAME_BPP: usize = 4;
 
 /// Maximum tiles in a strip, as a `usize` for array sizing.
 const STRIP_CAP: usize = MAX_STRIP_TILES as usize;
@@ -82,22 +79,11 @@ const STRIP_CAP: usize = MAX_STRIP_TILES as usize;
 // Wrapping clock
 // ---------------------------------------------------------------------------
 
-/// Has the wrapping-`u32` capture clock reached `deadline_ms` by `now_ms`?
-///
-/// The signed cast is the whole trick: `now - deadline` is computed modulo 2^32
-/// and reinterpreted as a signed offset, so "16 ms after the wrap" and "16 ms
-/// before the wrap" come out as `+16` and `-16` rather than as `16` and
-/// `4294967280`. Correct for any real interval up to 2^31 ms (~24.8 days) in
-/// either direction, which is far longer than any settle window or lease this
-/// module deals in.
-///
-/// Every time comparison in this module goes through here. There is deliberately
-/// no `elapsed = now - then` helper, because the subtraction is exactly the bug.
-#[must_use]
-#[inline]
-pub fn reached(deadline_ms: u32, now_ms: u32) -> bool {
-    (now_ms.wrapping_sub(deadline_ms) as i32) >= 0
-}
+// The predicate itself lives in `directdesk_shared::tiles`, next to the
+// client's lease comparators, so the two ends of the feature cannot drift on
+// how the wrap is handled. Re-exported at the path this module has always used,
+// so every call site and test here is unchanged.
+pub use directdesk_shared::tiles::reached;
 
 // ---------------------------------------------------------------------------
 // Input geometry

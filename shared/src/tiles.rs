@@ -25,6 +25,15 @@
 //!
 //! "Lossless" therefore means: every colour byte survives bit-exact. Alpha is
 //! defined to be opaque rather than transmitted.
+//!
+//! # Capture clock
+//!
+//! Every `*_ms` field below rides the host's **capture clock**: a `u32`
+//! millisecond count that wraps roughly every 49.7 days. The predicates that
+//! compare against it — [`reached`], [`lease_covers`] and [`lease_ended`] — are
+//! here too, because both ends need them and a disagreement about the wrap is a
+//! disagreement about the format. They are three functions rather than one on
+//! purpose; the section comment on them says why.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,8 +58,14 @@ pub const MAX_STRIP_W: u32 = TILE_EDGE * MAX_STRIP_TILES;
 /// Bytes per pixel on the wire (BGR, alpha dropped).
 const WIRE_BPP: usize = 3;
 
-/// Bytes per pixel in host capture buffers and client frame buffers (BGRA/RGBA).
-const FRAME_BPP: usize = 4;
+/// Bytes per pixel in an unpacked frame buffer, on either side of the link.
+///
+/// The host's capture buffers are **BGRA**; the client's decoded frames and its
+/// resident tile payloads are **RGBA**. Same four bytes, opposite channel order
+/// — see the colour contract above. It is one constant because what every caller
+/// actually wants it for is stride arithmetic, which is identical either way;
+/// the swap is the codec's business, not the stride's.
+pub const FRAME_BPP: usize = 4;
 
 /// Deflate's stored-block overhead: 5 bytes of header per 65535-byte block, and
 /// incompressible input is stored rather than expanded.
@@ -148,6 +163,82 @@ pub fn tile_cols(width: u32, edge: u32) -> u32 {
 #[must_use]
 pub fn tile_rows(height: u32, edge: u32) -> u32 {
     height.div_ceil(edge)
+}
+
+// ---------------------------------------------------------------------------
+// Wrapping capture clock
+// ---------------------------------------------------------------------------
+//
+// Every `*_ms` value in the tile feature is on the **host capture clock**: a
+// `u32` millisecond count that wraps roughly every 49.7 days. Host and client
+// both compare against it — the host to decide when a tile has settled or its
+// lease is due, the client to decide whether a tile may be painted or must be
+// evicted — so the three predicates live here, once, rather than being written
+// twice and drifting.
+//
+// They are NOT interchangeable and must not be "unified":
+//
+// * [`reached`] is inclusive (`>= 0`); [`lease_ended`] is strict (`> 0`). They
+//   differ at the `i32::MIN` boundary.
+// * [`lease_ended`] is deliberately ONE-SIDED. Expressing it via [`reached`] or
+//   [`lease_covers`] reintroduces the bug 9a1c90a fixed: a freshly arrived tile
+//   is routinely not *yet* valid, and a two-sided test reads that as expired and
+//   evicts it before it is ever painted.
+
+/// Has the wrapping-`u32` capture clock reached `deadline_ms` by `now_ms`?
+///
+/// The signed cast is the whole trick: `now - deadline` is computed modulo 2^32
+/// and reinterpreted as a signed offset, so "16 ms after the wrap" and "16 ms
+/// before the wrap" come out as `+16` and `-16` rather than as `16` and
+/// `4294967280`. Correct for any real interval up to 2^31 ms (~24.8 days) in
+/// either direction, which is far longer than any settle window or lease this
+/// module deals in.
+///
+/// Every time comparison in this module goes through here. There is deliberately
+/// no `elapsed = now - then` helper, because the subtraction is exactly the bug.
+#[must_use]
+#[inline]
+pub fn reached(deadline_ms: u32, now_ms: u32) -> bool {
+    (now_ms.wrapping_sub(deadline_ms) as i32) >= 0
+}
+
+/// Wrapping-safe lease test: is `frame_ts_ms` inside `[from, through]`?
+///
+/// Both endpoints and the probe are points on a wrapping `u32` capture clock,
+/// so `from <= now && now <= through` is simply wrong near the wrap: a lease
+/// issued at `u32::MAX - 10` and running 100 ms covers timestamp `50`, and a
+/// naive comparison would refuse it for ~49 days.
+///
+/// Instead measure the *distance* from the start of the window in wrapping
+/// arithmetic and compare it against the window's length. Both endpoints are
+/// inclusive.
+#[must_use]
+pub fn lease_covers(frame_ts_ms: u32, valid_from_ms: u32, valid_through_ms: u32) -> bool {
+    frame_ts_ms.wrapping_sub(valid_from_ms) <= valid_through_ms.wrapping_sub(valid_from_ms)
+}
+
+/// Has a lease's end passed, as of `frame_ts_ms`?
+///
+/// **Deliberately one-sided, and [`lease_covers`] must not be substituted for
+/// it.** "Not yet valid" and "no longer valid" are entirely different states,
+/// and only the second one justifies destroying a tile.
+///
+/// A freshly arrived tile is *routinely* not yet valid: the host stamps
+/// `valid_from_ms` with the capture timestamp of the frame the refinement pass
+/// ran on, while the client is still compositing an **earlier** frame — the
+/// encoder's pipeline depth, the outbound frame queue, pacing and the decoder's
+/// own latency all sit between them. So a brand-new tile normally arrives with
+/// its window starting slightly in the future. Evicting on the two-sided test
+/// would therefore delete almost every tile before it was ever painted, while
+/// the host — which has already recorded it as delivered and keeps renewing it
+/// — would never re-send it. The feature would spend bandwidth and refine
+/// nothing. Waiting is free; deleting is not.
+///
+/// Uses the signed-difference trick so it is correct across the `u32` wrap for
+/// any interval shorter than ~24.8 days.
+#[must_use]
+pub fn lease_ended(frame_ts_ms: u32, valid_through_ms: u32) -> bool {
+    (frame_ts_ms.wrapping_sub(valid_through_ms) as i32) > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +351,22 @@ fn residual_cost(buf: &[u8]) -> u64 {
 // Codec
 // ---------------------------------------------------------------------------
 
+/// A strip must be non-empty and no larger than one strip-width by one tile row.
+///
+/// Both ends of the codec check this, so it is one function: the encoder can
+/// then never emit an extent the decoder would refuse, and the decoder's bound
+/// on untrusted input is literally the same expression the encoder was held to.
+///
+/// Note this is the *constant* [`TILE_EDGE`], not the runtime grid edge a
+/// [`TileMsg::Reset`] announces — the store's own extent check is a different
+/// question and stays where it is.
+fn check_strip_extent(w: u32, h: u32) -> Result<()> {
+    if w == 0 || h == 0 || w > MAX_STRIP_W || h > TILE_EDGE {
+        return Err(Error::Invalid(format!("bad strip extent {w}x{h}")));
+    }
+    Ok(())
+}
+
 /// Compress a `w * h` rectangle at `(x, y)` out of a full-frame **BGRA** buffer.
 ///
 /// `stride` is the source buffer's row stride in bytes. Returns the codec that
@@ -273,9 +380,7 @@ pub fn compress_strip(
     h: u32,
     level: u8,
 ) -> Result<(TileCodec, Vec<u8>)> {
-    if w == 0 || h == 0 || w > MAX_STRIP_W || h > TILE_EDGE {
-        return Err(Error::Invalid(format!("bad strip extent {w}x{h}")));
-    }
+    check_strip_extent(w, h)?;
     let (xs, ys, ws, hs) = (x as usize, y as usize, w as usize, h as usize);
     // The last row we touch must be fully inside the buffer.
     let last = ys
@@ -359,9 +464,7 @@ pub fn decompress_strip(
     h: u32,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    if w == 0 || h == 0 || w > MAX_STRIP_W || h > TILE_EDGE {
-        return Err(Error::Invalid(format!("bad strip extent {w}x{h}")));
-    }
+    check_strip_extent(w, h)?;
     let (ws, hs) = (w as usize, h as usize);
     let row_bytes = ws * WIRE_BPP;
 
@@ -543,6 +646,23 @@ mod tests {
         }
         let (codec, data) = compress_strip(&bgra, stride, 0, 0, 256, 64, 6).unwrap();
         assert!(decompress_strip(codec, &data, 128, 64, &mut out).is_err());
+    }
+
+    /// The state 9a1c90a was about: a freshly arrived tile is routinely NOT YET
+    /// valid, and that must never be read as expired. `lease_covers` says "don't
+    /// paint"; `lease_ended` must still say "don't evict".
+    #[test]
+    fn not_yet_valid_is_not_expired() {
+        for (from, through, ts) in [
+            (1000u32, 5000u32, 900u32),
+            (u32::MAX - 10, 90, u32::MAX - 50),
+        ] {
+            assert!(!lease_covers(ts, from, through), "must not paint yet");
+            assert!(
+                !lease_ended(ts, through),
+                "must not evict — waiting is free, deleting is not"
+            );
+        }
     }
 
     #[test]
