@@ -29,7 +29,7 @@ use directdesk_shared::video::{EncodedFrame, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAM
 use directdesk_shared::{Error, Result};
 use parking_lot::Mutex;
 
-use crate::capture::{CaptureState, DdaCapture};
+use crate::capture::{pause_reason, DdaCapture};
 use crate::convert::{bgra_to_nv12, GpuConverter};
 use crate::input_inject::WinInjector;
 use crate::mf_encoder::{
@@ -786,8 +786,8 @@ fn media_thread(
         let frame = match acquired {
             Ok(Some(f)) => f,
             Ok(None) => {
-                if capture.state() == CaptureState::SecureDesktop {
-                    enter_pause(&shared, &ctl_tx, &mut paused_since, "secure desktop");
+                if let Some(reason) = pause_reason(capture.state()) {
+                    enter_pause(&shared, &ctl_tx, &mut paused_since, reason);
                 } else if paused_since.is_some() {
                     paused_since = None;
                     shared.set_state(SessionState::Running);
@@ -802,14 +802,20 @@ fn media_thread(
                 );
                 continue;
             }
-            Err(Error::Capture(msg)) if msg == "secure desktop" => {
-                enter_pause(&shared, &ctl_tx, &mut paused_since, "secure desktop");
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
             Err(e) => {
-                tracing::warn!("capture error: {e}");
-                std::thread::sleep(Duration::from_millis(50));
+                // `capture.state()` — not `e`'s text — is authoritative here:
+                // `acquire`/`recreate_duplication` always set `self.state`
+                // before returning an error, so `pause_reason` sees the same
+                // typed state the `Ok(None)` arm above does. See
+                // `pause_reason`'s doc comment for why the error message
+                // itself must not be parsed for this.
+                if let Some(reason) = pause_reason(capture.state()) {
+                    enter_pause(&shared, &ctl_tx, &mut paused_since, reason);
+                    std::thread::sleep(Duration::from_millis(100));
+                } else {
+                    tracing::warn!("capture error: {e}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 continue;
             }
         };

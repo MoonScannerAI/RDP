@@ -135,6 +135,34 @@ pub enum CaptureState {
     NeedsRecreate,
 }
 
+/// Whether the capture loop should be paused for `state`, and the label to
+/// pause it under.
+///
+/// This is the ONE definition of "does this `CaptureState` mean the session
+/// is paused, and what is it paused as." `session.rs` calls it from both the
+/// `Ok(None)` arm of `acquire` (where `capture.state()` is read directly) and
+/// the `Err(Error::Capture(_))` arm (where it is read the same way — `state`
+/// is always assigned before `acquire`/`recreate_duplication` return an
+/// error, so it is authoritative there too). Before this existed, the `Err`
+/// arm instead string-matched the error text for the literal `"secure
+/// desktop"`, which made a purely cosmetic rename of that error message
+/// capable of silently breaking pause/resume. Routing both arms through this
+/// function removes that trap: nothing outside here inspects error text to
+/// decide the pause reason, and the returned label is the one and only
+/// `"secure desktop"` constant, which downstream code (the `Paused` state,
+/// `ControlMsg::SecureDesktopActive`) still keys off exactly as before.
+///
+/// The match is written exhaustively, without a wildcard arm, so adding a
+/// future `CaptureState` variant forces a conscious decision here instead of
+/// silently falling through to "don't pause".
+#[must_use]
+pub fn pause_reason(state: CaptureState) -> Option<&'static str> {
+    match state {
+        CaptureState::SecureDesktop => Some("secure desktop"),
+        CaptureState::Running | CaptureState::NeedsRecreate => None,
+    }
+}
+
 pub struct DdaCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -306,7 +334,12 @@ impl DdaCapture {
                     CaptureState::NeedsRecreate
                 });
                 if self.state == CaptureState::SecureDesktop {
-                    return Err(Error::Capture("secure desktop".into()));
+                    // The exact wording here is no longer load-bearing: callers
+                    // decide the pause reason from `self.state` (already set
+                    // above) via `pause_reason`, not by parsing this string.
+                    return Err(Error::Capture(
+                        "AcquireNextFrame: access denied on the secure desktop".into(),
+                    ));
                 }
                 return Ok(None);
             }
@@ -479,7 +512,12 @@ impl DdaCapture {
                     CaptureState::NeedsRecreate
                 };
                 if self.state == CaptureState::SecureDesktop {
-                    Err(Error::Capture("secure desktop".into()))
+                    // Same non-load-bearing wording as the AcquireNextFrame
+                    // case above: callers read `self.state` via `pause_reason`,
+                    // never this string.
+                    Err(Error::Capture(
+                        "DuplicateOutput: access denied on the secure desktop".into(),
+                    ))
                 } else {
                     Err(Error::Capture("DuplicateOutput access denied".into()))
                 }
@@ -834,5 +872,29 @@ mod tests {
         let (low, high) = (0x1234_5678u32, 0x0000_0009i32);
         let packed = ((high as u64) << 32) | low as u64;
         assert_eq!(packed, 0x0000_0009_1234_5678);
+    }
+
+    // -- pause_reason: the one place that maps CaptureState to a pause label --
+
+    #[test]
+    fn pause_reason_secure_desktop_is_the_load_bearing_label() {
+        // session.rs's `Paused` state and `ControlMsg::SecureDesktopActive`
+        // both key off this exact string; it must never drift.
+        assert_eq!(
+            pause_reason(CaptureState::SecureDesktop),
+            Some("secure desktop")
+        );
+    }
+
+    #[test]
+    fn pause_reason_running_does_not_pause() {
+        assert_eq!(pause_reason(CaptureState::Running), None);
+    }
+
+    #[test]
+    fn pause_reason_needs_recreate_does_not_pause() {
+        // A duplication rebuild is transparent to the session; only the
+        // secure desktop pauses the loop.
+        assert_eq!(pause_reason(CaptureState::NeedsRecreate), None);
     }
 }
