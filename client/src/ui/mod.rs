@@ -638,114 +638,7 @@ impl ClientApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
 
-            // Host dims come from the most recent VideoConfig, falling back to
-            // whatever the presenter has actually decoded — so this works even
-            // before the first frame arrives.
-            let host_dims = self
-                .host_video
-                .map(|(w, h, _, _)| (w, h))
-                .or_else(|| self.presenter.frame_size());
-            let ppp = ctx.pixels_per_point();
-            // The question is whether the *monitor* can hold the host desktop
-            // 1:1, not whether the current window already does — so measure
-            // against the screen, not the viewport. `monitor_size` is already in
-            // egui points; the host dimensions are physical pixels. When the
-            // platform will not tell us the monitor size, let the user try.
-            let monitor = ctx.input(|i| i.viewport().monitor_size);
-            // The biggest integer scale the monitor can hold — the buttons
-            // below and the auto-snap preference all derive their fit from
-            // this one number, so they can never disagree with each other.
-            let max_scale = host_dims
-                .map(|dims| largest_fitting_scale(dims, monitor, ppp, self.chrome_points))
-                .unwrap_or(0);
-
-            // A pending auto-snap (opted into via the combo below) fires the
-            // moment we have both the host's dims and a fit — same guard the
-            // buttons themselves are enabled under, so auto and manual can't
-            // disagree.
-            if self.pending_auto_snap {
-                self.pending_auto_snap = false;
-                if let Some((w, h)) = host_dims {
-                    if self.auto_snap_scale != 0 && self.auto_snap_scale <= max_scale {
-                        self.resize_to_integer_scale(ctx, w, h, ppp, self.auto_snap_scale);
-                    }
-                }
-            }
-
-            let one_to_one = ui.add_enabled(
-                host_dims.is_some() && max_scale >= 1,
-                egui::Button::new("1:1"),
-            );
-            if host_dims.is_none() {
-                one_to_one.on_disabled_hover_text(
-                    "Waiting for the host's video format before this can size the window.",
-                );
-            } else if max_scale < 1 {
-                one_to_one.on_disabled_hover_text(
-                    "Your screen is too small to show the host desktop at one screen pixel \
-                     per host pixel without rescaling.",
-                );
-            } else if one_to_one
-                .on_hover_text(
-                    "Size the window so the host desktop renders at exactly one screen \
-                     pixel per host pixel — no rescaling, sharpest text.",
-                )
-                .clicked()
-            {
-                if let Some((w, h)) = host_dims {
-                    self.resize_to_integer_scale(ctx, w, h, ppp, 1);
-                }
-            }
-
-            let two_x = ui.add_enabled(
-                host_dims.is_some() && max_scale >= 2,
-                egui::Button::new("2x"),
-            );
-            if host_dims.is_none() {
-                two_x.on_disabled_hover_text(
-                    "Waiting for the host's video format before this can size the window.",
-                );
-            } else if max_scale < 2 {
-                two_x.on_disabled_hover_text(
-                    "Your screen is too small to show the host desktop doubled (every host \
-                     pixel drawn as a 2x2 block) without rescaling.",
-                );
-            } else if two_x
-                .on_hover_text(
-                    "Size the window so every host pixel is drawn as an exact 2x2 block of \
-                     screen pixels — twice the size of 1:1, still perfectly sharp, unlike \
-                     dragging the window to an arbitrary size, which blurs.",
-                )
-                .clicked()
-            {
-                if let Some((w, h)) = host_dims {
-                    self.resize_to_integer_scale(ctx, w, h, ppp, 2);
-                }
-            }
-
-            ui.label("Auto-snap");
-            let current_snap = self.auto_snap_scale;
-            let mut chosen_snap = current_snap;
-            let snap_combo = egui::ComboBox::from_id_salt("auto_snap_scale")
-                .selected_text(auto_snap_label(current_snap))
-                .show_ui(ui, |ui| {
-                    for scale in [0, 1, 2] {
-                        if ui
-                            .selectable_label(current_snap == scale, auto_snap_label(scale))
-                            .clicked()
-                        {
-                            chosen_snap = scale;
-                        }
-                    }
-                });
-            snap_combo.response.on_hover_text(
-                "When set to 1:1 or 2x, snap the window to that scale automatically the next \
-                 time a host connects. Persisted between launches. Off never resizes the \
-                 window without being asked.",
-            );
-            if chosen_snap != current_snap {
-                self.auto_snap_scale = chosen_snap;
-            }
+            let host_dims = self.toolbar_scaling(ui, ctx);
 
             // The diagnostic that answers "am I actually at a crisp scale?" —
             // unmissable rather than tucked into the diagnostics panel, since
@@ -841,6 +734,125 @@ impl ClientApp {
                 ui.weak(note);
             }
         });
+    }
+
+    /// Draws the integer-scale controls (1:1 / 2x buttons and the auto-snap
+    /// combo) and performs any pending auto-snap resize. All three widgets
+    /// derive their fit from the same `max_scale`, computed once here, so
+    /// they can never disagree with each other. Returns the host's current
+    /// video dimensions, in physical pixels, for the scale readout drawn
+    /// immediately after this call in `toolbar`.
+    fn toolbar_scaling(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<(u32, u32)> {
+        // Host dims come from the most recent VideoConfig, falling back to
+        // whatever the presenter has actually decoded — so this works even
+        // before the first frame arrives.
+        let host_dims = self
+            .host_video
+            .map(|(w, h, _, _)| (w, h))
+            .or_else(|| self.presenter.frame_size());
+        let ppp = ctx.pixels_per_point();
+        // The question is whether the *monitor* can hold the host desktop
+        // 1:1, not whether the current window already does — so measure
+        // against the screen, not the viewport. `monitor_size` is already in
+        // egui points; the host dimensions are physical pixels. When the
+        // platform will not tell us the monitor size, let the user try.
+        let monitor = ctx.input(|i| i.viewport().monitor_size);
+        // The biggest integer scale the monitor can hold — the buttons
+        // below and the auto-snap preference all derive their fit from
+        // this one number, so they can never disagree with each other.
+        let max_scale = host_dims
+            .map(|dims| largest_fitting_scale(dims, monitor, ppp, self.chrome_points))
+            .unwrap_or(0);
+
+        // A pending auto-snap (opted into via the combo below) fires the
+        // moment we have both the host's dims and a fit — same guard the
+        // buttons themselves are enabled under, so auto and manual can't
+        // disagree.
+        if self.pending_auto_snap {
+            self.pending_auto_snap = false;
+            if let Some((w, h)) = host_dims {
+                if self.auto_snap_scale != 0 && self.auto_snap_scale <= max_scale {
+                    self.resize_to_integer_scale(ctx, w, h, ppp, self.auto_snap_scale);
+                }
+            }
+        }
+
+        let one_to_one = ui.add_enabled(
+            host_dims.is_some() && max_scale >= 1,
+            egui::Button::new("1:1"),
+        );
+        if host_dims.is_none() {
+            one_to_one.on_disabled_hover_text(
+                "Waiting for the host's video format before this can size the window.",
+            );
+        } else if max_scale < 1 {
+            one_to_one.on_disabled_hover_text(
+                "Your screen is too small to show the host desktop at one screen pixel \
+                 per host pixel without rescaling.",
+            );
+        } else if one_to_one
+            .on_hover_text(
+                "Size the window so the host desktop renders at exactly one screen \
+                 pixel per host pixel — no rescaling, sharpest text.",
+            )
+            .clicked()
+        {
+            if let Some((w, h)) = host_dims {
+                self.resize_to_integer_scale(ctx, w, h, ppp, 1);
+            }
+        }
+
+        let two_x = ui.add_enabled(
+            host_dims.is_some() && max_scale >= 2,
+            egui::Button::new("2x"),
+        );
+        if host_dims.is_none() {
+            two_x.on_disabled_hover_text(
+                "Waiting for the host's video format before this can size the window.",
+            );
+        } else if max_scale < 2 {
+            two_x.on_disabled_hover_text(
+                "Your screen is too small to show the host desktop doubled (every host \
+                 pixel drawn as a 2x2 block) without rescaling.",
+            );
+        } else if two_x
+            .on_hover_text(
+                "Size the window so every host pixel is drawn as an exact 2x2 block of \
+                 screen pixels — twice the size of 1:1, still perfectly sharp, unlike \
+                 dragging the window to an arbitrary size, which blurs.",
+            )
+            .clicked()
+        {
+            if let Some((w, h)) = host_dims {
+                self.resize_to_integer_scale(ctx, w, h, ppp, 2);
+            }
+        }
+
+        ui.label("Auto-snap");
+        let current_snap = self.auto_snap_scale;
+        let mut chosen_snap = current_snap;
+        let snap_combo = egui::ComboBox::from_id_salt("auto_snap_scale")
+            .selected_text(auto_snap_label(current_snap))
+            .show_ui(ui, |ui| {
+                for scale in [0, 1, 2] {
+                    if ui
+                        .selectable_label(current_snap == scale, auto_snap_label(scale))
+                        .clicked()
+                    {
+                        chosen_snap = scale;
+                    }
+                }
+            });
+        snap_combo.response.on_hover_text(
+            "When set to 1:1 or 2x, snap the window to that scale automatically the next \
+             time a host connects. Persisted between launches. Off never resizes the \
+             window without being asked.",
+        );
+        if chosen_snap != current_snap {
+            self.auto_snap_scale = chosen_snap;
+        }
+
+        host_dims
     }
 
     fn connect_screen(&mut self, ui: &mut egui::Ui) {
