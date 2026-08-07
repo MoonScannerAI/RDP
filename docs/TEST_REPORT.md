@@ -426,7 +426,7 @@ real hardware.
 | f32→i16 conversion clamps out-of-range samples, survives NaN/infinity, rounds rather than truncates | `audio_capture::tests::f32_to_i16_*` | PASS | 2026-08-07 |
 | `AudioSpecificConfig` bytes pinned for all 4 formats and independently re-derived bit-for-bit | `audio_encoder::tests::asc_*`, `asc_decodes_back_to_its_fields`, `asc_distinguishes_all_four_formats` | PASS | 2026-08-07 |
 | AAC output-type selection picks the lowest documented offer at/above target, falls back to the highest offer rather than refusing, ignores offers with no declared bitrate | `audio_encoder::tests::output_type_*` | PASS | 2026-08-07 |
-| Real WASAPI loopback capture and real MF AAC-LC encode against actual audio hardware | none — needs a real machine with a playback device | NOT RUN | — |
+| Real WASAPI loopback capture and real MF AAC-LC encode against actual audio hardware | Ohio host, live session. Log: `AAC-LC encoder ready (48000 Hz stereo, 96 kbps) asc="11 90"` then `system audio streaming: WASAPI loopback — 48000 Hz stereo (F32), silent keep-alive on / MF AAC-LC — 48000 Hz stereo at 96 kbps`. The `(F32)` confirms the mandatory float→i16 conversion is on the live path, and `silent keep-alive on` confirms the idle-loopback counterweight is running | **PASS** | 2026-08-07 |
 
 ### Client decode and render (`client/src/audio_decoder.rs`, `client/src/audio_render.rs`)
 
@@ -434,7 +434,7 @@ real hardware.
 |---|---|---|---|
 | `AudioSpecificConfig` and `HEAACWAVEINFO` tail bytes pinned and independently re-derived (must agree byte-for-byte with the host's encoder-side pins) | `audio_decoder::tests::audio_specific_config_matches_the_pinned_bytes`, `heaac_tail_layout_is_pinned`, `user_data_is_the_tail_then_the_config` | PASS | 2026-08-07 |
 | `NullAudioDecoder` / `RecordingSink` test doubles enforce the same whole-frame and admission rules as the real MFT/WASAPI paths | `audio_decoder::tests::null_audio_decoder_*`, `audio_render::tests::recording_sink_*`, `writable_frames_never_exceeds_the_space_or_the_offer` | PASS | 2026-08-07 |
-| Real MF AAC-LC decode and real WASAPI shared-mode render against actual audio hardware | `audio_decoder::self_test`, `audio_render::self_test` (self-test binaries, need a real device) | NOT RUN | — |
+| Real MF AAC-LC decode and real WASAPI shared-mode render against actual audio hardware | Philippines client, live session. Log: `Media Foundation AAC-LC decoder ready: 48000 Hz, 2 ch` and `WASAPI render open: 48000 Hz 2 ch, buffer 19200 frames (400 ms), endpoint mix 48000 Hz 2 ch 32-bit`. The decoder accepted the host's runtime `asc="11 90"`, so the pinned constant, both independent derivations and real Media Foundation all agree | **PASS** | 2026-08-07 |
 
 ### Host send path and playback loop, end to end with test doubles (`host/src/net/audio.rs`, `client/src/pipeline.rs`)
 
@@ -464,7 +464,7 @@ endpoint. 4 scenarios, 0 failed.
 
 | Feature | How tested | Result | Date |
 |---|---|---|---|
-| End-to-end: real host captures real system audio, real client plays it audibly | two machines, real audio hardware on both | NOT RUN | — |
+| End-to-end: real host captures real system audio, real client plays it audibly | Philippines ↔ Ohio, real WAN (258 ms RTT, direct), both ends on real hardware. Operator confirmed the audio is audible and good. Host: `audio_status=Streaming audio_packets=3550 audio_kbytes=923`. **`audio_backpressured=0`** — the audio-yields-to-video reserve never starved audio on a real link, which loopback could not establish. **`audio_silent_suppressed=4376`** against 3550 sent, so a quiet desktop genuinely costs nothing. Video unaffected: host `backpressured=0`, adaptor climbing normally (`overrun 0.0%: encoder 3796, link carried 5021, video offered 4729`) | **PASS** | 2026-08-07 |
 | A 5.1 or 96 kHz playback endpoint on a real host: session runs with no audio, rest of the session (video/input) unaffected | real hardware with a non-standard default endpoint | NOT RUN | — |
 | Redundancy mode (`system_audio_redundancy`) measurably reduces audible loss on a lossy real or netsim link | netsim or real lossy link | NOT RUN | — |
 | Secure desktop / lock screen mutes audio within one status interval, unmutes on return | interactive session with a real UAC prompt or lock screen | NOT RUN | — |
@@ -480,4 +480,4 @@ happens, the same way the tiles rollout was.
 | Step | What it means | Result | Date |
 |---|---|---|---|
 | Step 1: ship the code inert | Deploy with `system_audio_enabled: false`. The host never offers `features::SYSTEM_AUDIO` (`host/src/net.rs`), so the negotiated intersection with any client — old or new — is empty, no audio thread spawns, and no audio datagram is ever sent; the deployed build's on-wire behavior for video/control is unchanged. This is the same property the tiles rollout's step 1 established for `lossless_tiles_enabled: false`. | NOT RUN | — |
-| Step 2: flip the flag on the remote host | Set `system_audio_enabled: true` on the Ohio host and confirm audio negotiates and streams over the real link, the way tiles' step-2-equivalent activation was confirmed on 2026-08-07. | NOT RUN | — |
+| Step 2: flip the flag on the remote host | Set `system_audio_enabled: true` on the Ohio host and confirm audio negotiates and streams over the real link, the way tiles' step-2-equivalent activation was confirmed on 2026-08-07. | **DONE** — host binary `A1F7A8E980910071` deployed, `system_audio_enabled: true` written BOM-free and reparsed, client logged `host accepted system audio`, audio streamed and was audible | 2026-08-07 |
