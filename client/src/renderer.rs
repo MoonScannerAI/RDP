@@ -76,7 +76,9 @@ fn video_texture_options(scale: f32) -> egui::TextureOptions {
 /// near-zero minification scale "exact" just because it happens to round
 /// to 0.0 within tolerance — there is no such thing as an exact 0x.
 pub fn is_exact_scale(scale: f32) -> bool {
-    scale.is_finite() && scale.round() >= 1.0 && (scale - scale.round()).abs() <= EXACT_SCALE_TOLERANCE
+    scale.is_finite()
+        && scale.round() >= 1.0
+        && (scale - scale.round()).abs() <= EXACT_SCALE_TOLERANCE
 }
 
 /// Formats the current draw scale for the toolbar/diagnostics: "1:1 exact" at

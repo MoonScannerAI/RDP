@@ -59,7 +59,10 @@ pub fn encode(msg: &UacWireMsg) -> Result<Vec<u8>> {
 /// contract the network decoder enforces.
 pub fn decode_frame(frame: &[u8]) -> Result<UacWireMsg> {
     if frame.len() < 4 {
-        return Err(Error::Invalid(format!("short UAC frame: {} bytes", frame.len())));
+        return Err(Error::Invalid(format!(
+            "short UAC frame: {} bytes",
+            frame.len()
+        )));
     }
     let prefix: [u8; 4] = frame[..4].try_into().expect("checked length");
     let declared = parse_frame_len(prefix, MAX_UAC_MSG)?;
@@ -261,7 +264,13 @@ mod tests {
         };
         use directdesk_shared::geometry::{from_norm, to_norm};
         // Top-left corner of the frame is far outside the dialog.
-        let (cx, cy) = clamp_norm_to_rect(to_norm(0, frame.0), to_norm(0, frame.1), frame, origin, rect);
+        let (cx, cy) = clamp_norm_to_rect(
+            to_norm(0, frame.0),
+            to_norm(0, frame.1),
+            frame,
+            origin,
+            rect,
+        );
         let px = from_norm(cx, frame.0) as i32;
         let py = from_norm(cy, frame.1) as i32;
         assert!((rect.left..rect.right).contains(&px), "x {px} not in rect");
@@ -280,7 +289,13 @@ mod tests {
             bottom: 680,
         };
         use directdesk_shared::geometry::{from_norm, to_norm};
-        let (cx, cy) = clamp_norm_to_rect(to_norm(0, frame.0), to_norm(0, frame.1), frame, origin, rect);
+        let (cx, cy) = clamp_norm_to_rect(
+            to_norm(0, frame.0),
+            to_norm(0, frame.1),
+            frame,
+            origin,
+            rect,
+        );
         let vx = origin.0 + from_norm(cx, frame.0) as i32;
         let vy = origin.1 + from_norm(cy, frame.1) as i32;
         assert!((rect.left..rect.right).contains(&vx), "vx {vx}");

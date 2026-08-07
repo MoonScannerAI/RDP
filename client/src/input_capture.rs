@@ -276,6 +276,12 @@ pub fn is_release_chord(key: egui::Key, m: egui::Modifiers) -> bool {
 /// Returns `None` for keys egui does not model (skipped). The nav cluster and
 /// arrows are `extended` (E0-prefixed). Layout note: we send the physical key's
 /// scan code and synthesize modifiers, so the host reproduces the same glyph.
+///
+/// `rustfmt::skip` is deliberate: this is a hardware lookup table, and it is
+/// read by comparing a key against its scan code. rustfmt would give each arm
+/// its own line — ~80 lines — which loses the row grouping (letters, number
+/// row, punctuation, nav cluster) that makes a missing or wrong code visible.
+#[rustfmt::skip]
 pub fn egui_key_to_scancode(key: egui::Key) -> Option<(u16, bool)> {
     use egui::Key::*;
     let sc: (u16, bool) = match key {

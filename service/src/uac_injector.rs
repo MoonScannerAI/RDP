@@ -35,8 +35,8 @@ use rand::Rng;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_SUCCESS, HANDLE, LUID};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, DuplicateTokenEx, LookupPrivilegeValueW, SetTokenInformation,
-    SecurityImpersonation, TokenPrimary, TokenSessionId, SE_PRIVILEGE_ENABLED, SE_TCB_NAME,
+    AdjustTokenPrivileges, DuplicateTokenEx, LookupPrivilegeValueW, SecurityImpersonation,
+    SetTokenInformation, TokenPrimary, TokenSessionId, SE_PRIVILEGE_ENABLED, SE_TCB_NAME,
     TOKEN_ACCESS_MASK, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
     TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
@@ -459,7 +459,10 @@ mod tests {
         for empty in [Vec::<u16>::new(), vec![0u16], vec![0u16, 0u16]] {
             let built = build_env_block(&empty, &[(CAP_ENV_VAR, "abc123")]);
             let entries = parse(&built);
-            assert_eq!(entries, vec![(CAP_ENV_VAR.to_string(), "abc123".to_string())]);
+            assert_eq!(
+                entries,
+                vec![(CAP_ENV_VAR.to_string(), "abc123".to_string())]
+            );
         }
     }
 
@@ -499,7 +502,10 @@ mod tests {
         // Unelevated / non-SYSTEM this must be a tidy error, never a panic. The
         // SID lookup (or the token retarget) fails long before any process is
         // created, so nothing is spawned here.
-        let inj = UacInjector::new(true, PathBuf::from(r"C:\nonexistent\DirectDeskUacInjector.exe"));
+        let inj = UacInjector::new(
+            true,
+            PathBuf::from(r"C:\nonexistent\DirectDeskUacInjector.exe"),
+        );
         match inj.start() {
             Ok(ready) => eprintln!(
                 "[uac] worker launched (running as SYSTEM): pipe={}",
@@ -514,7 +520,10 @@ mod tests {
         // If there is an interactive session and we can resolve the console SID
         // (i.e. running as SYSTEM), a missing worker exe is the failure. If not,
         // an earlier clean error is fine — either way, no panic, no spawn.
-        let inj = UacInjector::new(true, PathBuf::from(r"C:\nonexistent\DirectDeskUacInjector.exe"));
+        let inj = UacInjector::new(
+            true,
+            PathBuf::from(r"C:\nonexistent\DirectDeskUacInjector.exe"),
+        );
         let _ = inj.start();
     }
 }

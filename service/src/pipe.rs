@@ -912,10 +912,7 @@ mod tests {
             r"c:\program files\directdesk\directdeskhost.exe"
         );
         // Forward slashes and surrounding whitespace are normalized too.
-        assert_eq!(
-            normalize_image_path("  C:/X/Host.EXE  "),
-            r"c:\x\host.exe"
-        );
+        assert_eq!(normalize_image_path("  C:/X/Host.EXE  "), r"c:\x\host.exe");
     }
 
     #[test]
@@ -931,10 +928,7 @@ mod tests {
             r"C:/NoSuchDir_ZZZ/DirectDeskHost.exe",
             &expected
         ));
-        assert!(!image_paths_equal(
-            r"C:\NoSuchDir_ZZZ\evil.exe",
-            &expected
-        ));
+        assert!(!image_paths_equal(r"C:\NoSuchDir_ZZZ\evil.exe", &expected));
     }
 
     #[test]

@@ -203,7 +203,6 @@ impl ClientApp {
         let tiles = pipeline.tiles();
         pipeline.attach_tile_thread(init.session.tiles_rx.clone());
 
-
         Self {
             address_input: init.config.host_address.clone(),
             udp_port_input: init.config.udp_port.to_string(),
@@ -393,12 +392,8 @@ impl ClientApp {
                 // silently reverted by an auto-reconnect. Re-assert it here,
                 // rate-limited so this can't loop.
                 let now = Instant::now();
-                if should_reassert_fps(
-                    self.config.preferred_fps,
-                    fps,
-                    self.last_fps_reassert,
-                    now,
-                ) {
+                if should_reassert_fps(self.config.preferred_fps, fps, self.last_fps_reassert, now)
+                {
                     self.apply_preferred_fps();
                     self.last_fps_reassert = Some(now);
                 }
@@ -672,7 +667,10 @@ impl ClientApp {
                 }
             }
 
-            let one_to_one = ui.add_enabled(host_dims.is_some() && max_scale >= 1, egui::Button::new("1:1"));
+            let one_to_one = ui.add_enabled(
+                host_dims.is_some() && max_scale >= 1,
+                egui::Button::new("1:1"),
+            );
             if host_dims.is_none() {
                 one_to_one.on_disabled_hover_text(
                     "Waiting for the host's video format before this can size the window.",
@@ -694,7 +692,10 @@ impl ClientApp {
                 }
             }
 
-            let two_x = ui.add_enabled(host_dims.is_some() && max_scale >= 2, egui::Button::new("2x"));
+            let two_x = ui.add_enabled(
+                host_dims.is_some() && max_scale >= 2,
+                egui::Button::new("2x"),
+            );
             if host_dims.is_none() {
                 two_x.on_disabled_hover_text(
                     "Waiting for the host's video format before this can size the window.",
@@ -811,7 +812,9 @@ impl ClientApp {
                     false,
                     egui::Button::new("Background capture").selected(true),
                 )
-                .on_disabled_hover_text(format!("{BACKGROUND_HOVER}\nForced on by --hold-capture."));
+                .on_disabled_hover_text(format!(
+                    "{BACKGROUND_HOVER}\nForced on by --hold-capture."
+                ));
             } else {
                 ui.toggle_value(&mut self.config.capture_in_background, "Background capture")
                     .on_hover_text(BACKGROUND_HOVER);
@@ -1060,7 +1063,14 @@ impl ClientApp {
     /// pixels per host pixel (1 = the original 1:1 behaviour, 2 = pixel
     /// doubling, ...). Shared by the 1:1/2x buttons and the auto-snap
     /// preference so those paths can never drift apart.
-    fn resize_to_integer_scale(&mut self, ctx: &egui::Context, w: u32, h: u32, ppp: f32, scale: u32) {
+    fn resize_to_integer_scale(
+        &mut self,
+        ctx: &egui::Context,
+        w: u32,
+        h: u32,
+        ppp: f32,
+        scale: u32,
+    ) {
         if self.fullscreen {
             // A resize while fullscreen does nothing: drop out first.
             self.fullscreen = false;
@@ -1189,7 +1199,10 @@ impl ClientApp {
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(90, 62, 10))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(230, 170, 60)))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(230, 170, 60),
+                    ))
                     .corner_radius(6.0)
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
@@ -1297,13 +1310,12 @@ impl ClientApp {
 
                         ui.label("Screen covered");
                         ui.label(
-                            egui::RichText::new(match covered_percent(
-                                self.tiles.covered_pixels(),
-                                (sw, sh),
-                            ) {
-                                Some(pct) => format!("{pct:.1} %"),
-                                None => "—".to_string(),
-                            })
+                            egui::RichText::new(
+                                match covered_percent(self.tiles.covered_pixels(), (sw, sh)) {
+                                    Some(pct) => format!("{pct:.1} %"),
+                                    None => "—".to_string(),
+                                },
+                            )
                             .monospace(),
                         );
                         ui.end_row();
@@ -1423,8 +1435,7 @@ impl eframe::App for ClientApp {
         self.pointer = ctx.input(|i| i.pointer.latest_pos());
         // Route capture by focus: when we're foreground the egui key path owns
         // it and the low-level hook passes through; when not, the hook forwards.
-        self.input
-            .set_window_foreground(ctx.input(|i| i.focused));
+        self.input.set_window_foreground(ctx.input(|i| i.focused));
         // Mirrored per frame rather than at the transition sites, because
         // `self.state` is assigned from several places (drain, Bye, connect,
         // disconnect) and the hook must never read a stale gate.
@@ -1549,7 +1560,8 @@ pub fn fits_integer_scale(
     let (w, h) = host_dims;
     let scale = scale as f32;
     monitor_points.is_none_or(|monitor| {
-        (w as f32 * scale / ppp) <= monitor.x && (h as f32 * scale / ppp + chrome_points) <= monitor.y
+        (w as f32 * scale / ppp) <= monitor.x
+            && (h as f32 * scale / ppp + chrome_points) <= monitor.y
     })
 }
 
@@ -1625,7 +1637,12 @@ pub fn tiles_invalidated_by_config(
 /// have not just asked. Never re-asserts upward: the host's configured fps is
 /// a ceiling we cannot raise, so `desired >= reported` is already the final
 /// answer and asking again would loop forever.
-pub fn should_reassert_fps(desired: u32, reported: u32, last: Option<Instant>, now: Instant) -> bool {
+pub fn should_reassert_fps(
+    desired: u32,
+    reported: u32,
+    last: Option<Instant>,
+    now: Instant,
+) -> bool {
     desired != 0
         && desired < reported
         && last.is_none_or(|t| now.duration_since(t) > Duration::from_secs(2))
@@ -1703,7 +1720,13 @@ mod tests {
     #[test]
     fn fits_integer_scale_checks_width() {
         let monitor = egui::vec2(1000.0, 2000.0);
-        assert!(!fits_integer_scale((1920, 1080), Some(monitor), 1.0, 40.0, 1));
+        assert!(!fits_integer_scale(
+            (1920, 1080),
+            Some(monitor),
+            1.0,
+            40.0,
+            1
+        ));
     }
 
     #[test]
@@ -1713,7 +1736,13 @@ mod tests {
         // is added to the height — the old width-only check would have said
         // "fits" here and produced a window Windows had to clamp.
         let monitor = egui::vec2(1920.0, 1080.0);
-        assert!(!fits_integer_scale((1920, 1080), Some(monitor), 1.0, 40.0, 1));
+        assert!(!fits_integer_scale(
+            (1920, 1080),
+            Some(monitor),
+            1.0,
+            40.0,
+            1
+        ));
         // Same desktop, a monitor with enough headroom for the chrome: fits.
         let taller_monitor = egui::vec2(1920.0, 1130.0);
         assert!(fits_integer_scale(
@@ -1731,7 +1760,13 @@ mod tests {
         // 1707x1067-point monitor at 150% scaling, comfortably fits a
         // 1280x720-point window plus chrome at 1:1.
         let monitor = egui::vec2(1707.0, 1067.0);
-        assert!(fits_integer_scale((1920, 1080), Some(monitor), 1.5, 40.0, 1));
+        assert!(fits_integer_scale(
+            (1920, 1080),
+            Some(monitor),
+            1.5,
+            40.0,
+            1
+        ));
     }
 
     #[test]
@@ -1740,7 +1775,13 @@ mod tests {
         // 2560x1440-point window plus chrome — this monitor (1707x1067
         // points) cannot hold that, even though 1:1 fits comfortably.
         let monitor = egui::vec2(1707.0, 1067.0);
-        assert!(!fits_integer_scale((1920, 1080), Some(monitor), 1.5, 40.0, 2));
+        assert!(!fits_integer_scale(
+            (1920, 1080),
+            Some(monitor),
+            1.5,
+            40.0,
+            2
+        ));
 
         // The task's other worked example: a 1280x720 host at 2x is
         // 2560x1440 physical, which fits a 2560x1600-physical /

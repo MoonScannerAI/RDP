@@ -32,13 +32,20 @@ pub enum SvcResponse {
     Pong,
     Status(SvcStatus),
     Ok,
-    Denied { reason: String },
-    Failed { reason: String },
+    Denied {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
     /// A SYSTEM injector worker is up. The host connects to `pipe_name` and
     /// presents `cap_token` as the first frame; the token is single-use and was
     /// minted by the service, never supplied by the caller. This is response
     /// (egress) data only — the request that triggered it carried no parameters.
-    UacInjectorReady { pipe_name: String, cap_token: String },
+    UacInjectorReady {
+        pipe_name: String,
+        cap_token: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

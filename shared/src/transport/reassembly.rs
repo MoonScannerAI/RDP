@@ -906,9 +906,7 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video::{
-        fragment_frame, fragment_frame_fec, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME,
-    };
+    use crate::video::{fragment_frame, fragment_frame_fec, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME};
 
     /// Deterministic payload of `len` bytes.
     fn payload(len: usize) -> Vec<u8> {
@@ -953,14 +951,7 @@ mod tests {
 
     /// Fragments for one synthetic frame *with* FEC parity, via the real
     /// `fragment_frame_fec`.
-    fn frags_fec(
-        id: u32,
-        keyframe: bool,
-        ts: u32,
-        len: usize,
-        mtu: usize,
-        k: u8,
-    ) -> Vec<Vec<u8>> {
+    fn frags_fec(id: u32, keyframe: bool, ts: u32, len: usize, mtu: usize, k: u8) -> Vec<Vec<u8>> {
         let frame = EncodedFrame {
             frame_id: id,
             keyframe,
@@ -1818,7 +1809,10 @@ mod tests {
                 let lo = b * k as usize;
                 pos += hi - lo;
                 let (h, _) = FragHeader::decode(&f[pos]).unwrap();
-                assert!(h.parity && h.frag_index as usize == b, "block {b} parity out of place");
+                assert!(
+                    h.parity && h.frag_index as usize == b,
+                    "block {b} parity out of place"
+                );
                 pos += 1;
             }
         }
@@ -1911,7 +1905,10 @@ mod tests {
         let done = r.push(&f[parity_pos[0]], 0).expect("push parity");
         assert!(!done, "parity for a completed frame does nothing");
         assert_eq!(r.stats().fec_parity_received, before.fec_parity_received);
-        assert_eq!(r.stats().fragments_duplicate, before.fragments_duplicate + 1);
+        assert_eq!(
+            r.stats().fragments_duplicate,
+            before.fragments_duplicate + 1
+        );
     }
 
     /// The push partition must still hold with parity fragments, recovery,

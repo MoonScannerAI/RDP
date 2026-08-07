@@ -273,9 +273,7 @@ pub fn spawn_decode_thread(
                                 // full control queue already has a keyframe
                                 // request pending.
                                 decoder.flush();
-                                if let Err(err) =
-                                    control_tx.try_send(ControlMsg::RequestKeyframe)
-                                {
+                                if let Err(err) = control_tx.try_send(ControlMsg::RequestKeyframe) {
                                     tracing::warn!("keyframe request dropped: {err}");
                                 }
                             }
@@ -577,7 +575,10 @@ mod tests {
         let mut frame = rgba_frame(128, 64, 100);
         let stats = composite_onto(&mut frame, &store, &mut scratch, false).unwrap();
         assert_eq!(stats.painted, 1);
-        assert_eq!(stats.covered_px, u64::from(TILE_EDGE) * u64::from(TILE_EDGE));
+        assert_eq!(
+            stats.covered_px,
+            u64::from(TILE_EDGE) * u64::from(TILE_EDGE)
+        );
         // Inside the tile is the lossless colour; outside is the frame's own.
         assert_eq!(&frame.data[0..4], &[200, 200, 200, 255]);
         assert_eq!(frame.data[(64 * 4) as usize], 7);
@@ -590,7 +591,11 @@ mod tests {
             composite_onto(&mut next, &store, &mut scratch, false).unwrap();
         }
         assert_eq!(scratch.len(), 1);
-        assert_eq!(scratch.capacity(), capacity, "steady state must not allocate");
+        assert_eq!(
+            scratch.capacity(),
+            capacity,
+            "steady state must not allocate"
+        );
     }
 
     #[test]

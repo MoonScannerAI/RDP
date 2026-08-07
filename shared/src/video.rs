@@ -100,7 +100,9 @@ impl FragHeader {
             // `last_frag_len`. A parity fragment without a block size is
             // meaningless.
             if block_size < 1 {
-                return Err(Error::Invalid("parity fragment with zero block_size".into()));
+                return Err(Error::Invalid(
+                    "parity fragment with zero block_size".into(),
+                ));
             }
             let last_frag_len = u16::from_le_bytes(buf[10..12].try_into().unwrap());
             let num_blocks = frag_count.div_ceil(block_size as u16);
@@ -450,7 +452,10 @@ mod tests {
                 pos += 1;
             }
             let (h, _) = FragHeader::decode(&frags[pos]).unwrap();
-            assert!(h.parity, "expected block {b}'s parity fragment at position {pos}");
+            assert!(
+                h.parity,
+                "expected block {b}'s parity fragment at position {pos}"
+            );
             assert_eq!(h.frag_index as usize, b);
             pos += 1;
         }
@@ -496,7 +501,9 @@ mod tests {
         let frame = mk(10_000);
         // K=0 and single-fragment frames both skip parity entirely.
         let no_k = fragment_frame_fec(&frame, 1200, 0).unwrap();
-        assert!(no_k.iter().all(|f| !FragHeader::decode(f).unwrap().0.parity));
+        assert!(no_k
+            .iter()
+            .all(|f| !FragHeader::decode(f).unwrap().0.parity));
         let tiny = fragment_frame_fec(&mk(50), 1200, 10).unwrap();
         assert_eq!(tiny.len(), 1);
         assert!(!FragHeader::decode(&tiny[0]).unwrap().0.parity);

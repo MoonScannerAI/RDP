@@ -136,7 +136,10 @@ impl SimHost {
     /// that did not configure tiles.
     #[must_use]
     pub fn tile_stats(&self) -> TileStats {
-        self.tiles.as_ref().map(TileEngine::stats).unwrap_or_default()
+        self.tiles
+            .as_ref()
+            .map(TileEngine::stats)
+            .unwrap_or_default()
     }
 
     /// Every host status window this run closed, in order. Empty unless

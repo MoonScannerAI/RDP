@@ -972,8 +972,7 @@ mod tests {
     /// client that never asked, both end up with tiles off.
     #[test]
     fn tiles_are_armed_only_by_the_hosts_echoed_bit() {
-        let armed =
-            |features: u64| features & protocol::features::LOSSLESS_TILES != 0;
+        let armed = |features: u64| features & protocol::features::LOSSLESS_TILES != 0;
         assert!(armed(protocol::features::LOSSLESS_TILES));
         assert!(armed(
             protocol::features::LOSSLESS_TILES | protocol::features::CLIPBOARD_TEXT

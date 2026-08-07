@@ -1720,7 +1720,11 @@ mod tests {
 
         // The client is compositing a frame captured 30 ms BEFORE this tile's
         // window opens. It must survive, unpainted, and then be painted.
-        assert_eq!(store.sweep_expired(100), 0, "a not-yet-valid tile must live");
+        assert_eq!(
+            store.sweep_expired(100),
+            0,
+            "a not-yet-valid tile must live"
+        );
         assert_eq!(store.resident_tiles(), 1);
 
         let mut tiles = Vec::new();

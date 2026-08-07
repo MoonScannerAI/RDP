@@ -425,7 +425,10 @@ pub fn decompress_strip(
                 unfilter_row(filter, cur, prior);
             }
 
-            for (dst, src) in out.chunks_exact_mut(FRAME_BPP).zip(bgr.chunks_exact(WIRE_BPP)) {
+            for (dst, src) in out
+                .chunks_exact_mut(FRAME_BPP)
+                .zip(bgr.chunks_exact(WIRE_BPP))
+            {
                 dst[0] = src[2];
                 dst[1] = src[1];
                 dst[2] = src[0];

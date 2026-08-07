@@ -65,11 +65,12 @@ pub fn is_consent_path(full_path: &str, system_root: &str) -> bool {
 mod imp {
     use super::ConsentPrompt;
     use crate::winpipe::OwnedHandle;
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Foundation::{HWND, MAX_PATH};
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
         GetWindowThreadProcessId,
@@ -211,7 +212,9 @@ mod tests {
         assert!(is_consent_image(r"C:\Windows\System32\consent.exe"));
         assert!(is_consent_image(r"C:\Windows\System32\Consent.EXE"));
         assert!(is_consent_image("consent.exe"));
-        assert!(is_consent_image(r"C:\Windows\System32\CredentialUIBroker.exe"));
+        assert!(is_consent_image(
+            r"C:\Windows\System32\CredentialUIBroker.exe"
+        ));
     }
 
     #[test]
@@ -240,7 +243,10 @@ mod tests {
             r"C:\Windows\"
         ));
         // A non-default SystemRoot is honored.
-        assert!(is_consent_path(r"D:\WinDir\System32\consent.exe", r"D:\WinDir"));
+        assert!(is_consent_path(
+            r"D:\WinDir\System32\consent.exe",
+            r"D:\WinDir"
+        ));
     }
 
     #[test]
@@ -256,7 +262,10 @@ mod tests {
         // Right directory, wrong (unrelated) binary.
         assert!(!is_consent_path(r"C:\Windows\System32\cmd.exe", root));
         // A different SystemRoot must not accept the C:\Windows copy.
-        assert!(!is_consent_path(r"C:\Windows\System32\consent.exe", r"D:\WinDir"));
+        assert!(!is_consent_path(
+            r"C:\Windows\System32\consent.exe",
+            r"D:\WinDir"
+        ));
         assert!(!is_consent_path("", root));
     }
 

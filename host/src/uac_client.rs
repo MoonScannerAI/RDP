@@ -494,7 +494,7 @@ mod tests {
         m.observe(true, t0 + secs(1));
         m.observe(false, t0 + secs(2)); // EndRoute -> Ended
         m.observe(false, t0 + secs(3)); // -> Idle
-        // A brand-new prompt starts the cycle over.
+                                        // A brand-new prompt starts the cycle over.
         assert_eq!(m.observe(true, t0 + secs(10)), ElevEffect::Notify);
         assert_eq!(m.phase(), ElevPhase::Prompted);
     }

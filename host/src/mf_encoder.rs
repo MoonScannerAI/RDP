@@ -1823,7 +1823,10 @@ mod tests {
             assert!(s.max_qp >= s.min_qp, "q={q}");
             assert!(s.max_qp <= TEXT_QUALITY_FLOOR_MAX_QP, "q={q}");
         }
-        assert_eq!(refine_settings(MAX_STATIC_REFINE_QUALITY).min_qp, REFINE_QP_FLOOR);
+        assert_eq!(
+            refine_settings(MAX_STATIC_REFINE_QUALITY).min_qp,
+            REFINE_QP_FLOOR
+        );
         assert_eq!(
             refine_settings(MIN_STATIC_REFINE_QUALITY).min_qp,
             REFINE_QP_CEILING

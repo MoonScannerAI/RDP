@@ -92,8 +92,8 @@ use directdesk_shared::protocol::{
     AuthMsg, Channel, Codec, ControlMsg, Hello, InputMsg, QualityMode, MAX_AUTH_MSG,
     PROTOCOL_VERSION,
 };
-use directdesk_shared::svc_ipc::SvcResponse;
 use directdesk_shared::stats::{ConnStats, TransportRoute};
+use directdesk_shared::svc_ipc::SvcResponse;
 use directdesk_shared::transport::quic::{self, QuicParams, SessionStreams};
 use directdesk_shared::transport::session::{
     QuicSession, Session, SessionConfig as DriverConfig, SessionEvent,
@@ -102,7 +102,9 @@ use directdesk_shared::video::{fragment_frame_fec, EncodedFrame};
 use directdesk_shared::{Error, Result};
 
 use crate::elevation::detect_consent_prompt;
-use crate::session::{HostSession, SessionConfig as PipelineConfig, SessionDescription, SessionState};
+use crate::session::{
+    HostSession, SessionConfig as PipelineConfig, SessionDescription, SessionState,
+};
 use crate::uac_client::{ElevEffect, ElevationMachine, SvcControlClient, UacDataClient};
 
 /// Wall-clock budget for everything from `accept_streams` to `AuthOk`.
@@ -1795,7 +1797,8 @@ async fn run_session(
     // return covers all of them — success, error, timeout, disconnect). A
     // no-op guard when the config flag is off. Scoped to the session rather
     // than the pipeline because the pipeline outlives a single client.
-    let _wallpaper = crate::wallpaper::WallpaperGuard::new(inner.cfg.blank_wallpaper_during_session);
+    let _wallpaper =
+        crate::wallpaper::WallpaperGuard::new(inner.cfg.blank_wallpaper_during_session);
 
     let driver_cfg = DriverConfig {
         heartbeat_ms: 2_000,
@@ -2530,7 +2533,11 @@ async fn status_loop(
         // this should keep climbing as the client types (proving input is not
         // starved by encode). It stalling while frames_sent races is the
         // signature of the input-priority bug.
-        tracing::info!(input_injected = injected, frames_sent = sent, "host input diag");
+        tracing::info!(
+            input_injected = injected,
+            frames_sent = sent,
+            "host input diag"
+        );
 
         // Refill the refinement allowance from this window's measurements. Done
         // here because every input is already computed once per second and
@@ -2736,7 +2743,9 @@ fn start_route(pipeline: Arc<HostSession>, desc: SessionDescription) -> Result<A
             cap_token,
         } => (pipe_name, cap_token),
         SvcResponse::Denied { reason } => {
-            return Err(Error::Other(format!("service denied UAC injector: {reason}")));
+            return Err(Error::Other(format!(
+                "service denied UAC injector: {reason}"
+            )));
         }
         other => {
             return Err(Error::Other(format!(
@@ -3143,7 +3152,10 @@ mod tests {
         // the frame takes 35-200ms. Fewer, honourable gaps instead.
         let window = Duration::from_millis(10);
         let (batch, gap) = pace_plan(285, window);
-        assert!(gap >= MIN_PACE_SLEEP, "{gap:?} is a sleep Windows can serve");
+        assert!(
+            gap >= MIN_PACE_SLEEP,
+            "{gap:?} is a sleep Windows can serve"
+        );
         let batches = 285usize.div_ceil(batch);
         assert!(
             gap * batches as u32 <= window,
@@ -3243,7 +3255,10 @@ mod tests {
         assert_eq!(host_hello(0, LOSSLESS_TILES).features, 0);
         // A client advertising bits this host has never heard of must not cause
         // the host to echo them back as if it understood.
-        assert_eq!(host_hello(u64::MAX, LOSSLESS_TILES).features, LOSSLESS_TILES);
+        assert_eq!(
+            host_hello(u64::MAX, LOSSLESS_TILES).features,
+            LOSSLESS_TILES
+        );
     }
 
     #[test]
@@ -3251,10 +3266,19 @@ mod tests {
         // Every strain signal must zero the budget outright, not scale it.
         // These are the exact inputs that would otherwise make the adaptor cut
         // video bitrate and leave no trace of why.
-        assert_eq!(tile_budget_kbps(20_000, 2_000, 0.01, 0.0, false, true, 0), 0);
-        assert_eq!(tile_budget_kbps(20_000, 2_000, 0.0, 0.05, false, true, 0), 0);
+        assert_eq!(
+            tile_budget_kbps(20_000, 2_000, 0.01, 0.0, false, true, 0),
+            0
+        );
+        assert_eq!(
+            tile_budget_kbps(20_000, 2_000, 0.0, 0.05, false, true, 0),
+            0
+        );
         assert_eq!(tile_budget_kbps(20_000, 2_000, 0.0, 0.0, true, true, 0), 0);
-        assert_eq!(tile_budget_kbps(20_000, 2_000, 0.0, 0.0, false, false, 0), 0);
+        assert_eq!(
+            tile_budget_kbps(20_000, 2_000, 0.0, 0.0, false, false, 0),
+            0
+        );
     }
 
     #[test]
@@ -3274,8 +3298,14 @@ mod tests {
     #[test]
     fn the_configured_ceiling_narrows_but_never_widens() {
         // Same idiom as `effective_cap`: a cap may only lower the figure.
-        assert_eq!(tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 1_000), 1_000);
-        assert_eq!(tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 99_000), 5_000);
+        assert_eq!(
+            tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 1_000),
+            1_000
+        );
+        assert_eq!(
+            tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 99_000),
+            5_000
+        );
         // 0 means "no explicit ceiling" — it must not mean "no bandwidth".
         assert_eq!(tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 0), 5_000);
     }
@@ -3516,7 +3546,16 @@ mod tests {
         let mut t = TileThrottle::new();
         let mut grant = 0;
         for _ in 0..200 {
-            grant = t.observe(spend(grant, 100_000), 28_000, 0, 0.0, 0.0, false, true, 1_500);
+            grant = t.observe(
+                spend(grant, 100_000),
+                28_000,
+                0,
+                0.0,
+                0.0,
+                false,
+                true,
+                1_500,
+            );
         }
         assert_eq!(grant, 1_500, "the configured cap must still bind");
     }
@@ -3631,7 +3670,8 @@ mod tests {
     fn offered_features_follow_config() {
         use directdesk_shared::protocol::features::LOSSLESS_TILES;
 
-        let mut cfg = NetConfig::from_host_config(&crate::config::HostConfig::default().sanitized());
+        let mut cfg =
+            NetConfig::from_host_config(&crate::config::HostConfig::default().sanitized());
         assert_eq!(
             offered_features(&cfg) & LOSSLESS_TILES,
             0,

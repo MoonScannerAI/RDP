@@ -31,12 +31,12 @@ use parking_lot::Mutex;
 
 use crate::capture::{CaptureState, DdaCapture};
 use crate::convert::{bgra_to_nv12, GpuConverter};
-use crate::tiles::{hash_plan_tiles, DirtyRect, GridStats, MoveRect, TileGrid};
 use crate::input_inject::WinInjector;
 use crate::mf_encoder::{
     EncoderConfig, FrameInput, MfH264Encoder, MAX_STATIC_REFINE_QUALITY, MIN_STATIC_REFINE_QUALITY,
 };
 use crate::mfinit::MfThread;
+use crate::tiles::{hash_plan_tiles, DirtyRect, GridStats, MoveRect, TileGrid};
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -301,7 +301,11 @@ impl Shared {
 
 /// Messages the input thread understands beyond raw events.
 enum InputCtl {
-    Geometry { w: u32, h: u32, origin: (i32, i32) },
+    Geometry {
+        w: u32,
+        h: u32,
+        origin: (i32, i32),
+    },
     ReleaseAll,
     /// Enter (`Some`) or leave (`None`) the exclusive elevation route. While a
     /// sink is installed, input events are forwarded to it and NOT injected
@@ -365,8 +369,7 @@ impl HostSession {
         });
 
         let (frames_tx, frames_rx) = bounded::<EncodedFrame>(cfg.frame_queue_depth.max(1));
-        let (tiles_tx, tiles_rx) =
-            bounded::<directdesk_shared::tiles::TileMsg>(TILE_QUEUE_DEPTH);
+        let (tiles_tx, tiles_rx) = bounded::<directdesk_shared::tiles::TileMsg>(TILE_QUEUE_DEPTH);
         let (init_tx, init_rx) = bounded::<Result<SessionDescription>>(1);
         let (input_tx, input_rx) = unbounded::<InputEvent>();
         let (ctl_tx, ctl_rx) = unbounded::<InputCtl>();
@@ -449,9 +452,7 @@ impl HostSession {
     /// Publish the bandwidth (kbps) refinement may spend, measured by the
     /// network layer's status tick. `0` stops refinement entirely.
     pub fn set_tile_budget_kbps(&self, kbps: u32) {
-        self.shared
-            .tile_budget_kbps
-            .store(kbps, Ordering::Relaxed);
+        self.shared.tile_budget_kbps.store(kbps, Ordering::Relaxed);
     }
 
     /// Bytes of tile payload allowed per refinement pass at the current budget.
@@ -483,10 +484,7 @@ impl HostSession {
     ///
     /// [`set_bitrate`]: HostSession::set_bitrate
     pub fn set_fps(&self, fps: u32) {
-        let want = fps.clamp(
-            crate::config::MIN_TARGET_FPS,
-            crate::config::MAX_TARGET_FPS,
-        );
+        let want = fps.clamp(crate::config::MIN_TARGET_FPS, crate::config::MAX_TARGET_FPS);
         self.shared.fps_req.store(want, Ordering::Relaxed);
     }
 
@@ -774,7 +772,9 @@ fn media_thread(
                         tracing::info!("encoder rebuilt at {cur_fps} fps");
                     }
                 }
-                Err(e) => tracing::warn!("could not rebuild the encoder at {want_fps} fps ({e}); staying at {cur_fps}"),
+                Err(e) => tracing::warn!(
+                    "could not rebuild the encoder at {want_fps} fps ({e}); staying at {cur_fps}"
+                ),
             }
         }
 
@@ -1587,15 +1587,15 @@ fn tile_refine_pass(
             grid.abandon(plan);
             continue;
         };
-        let (codec, data) = match compress_strip(bgra, stride, plan.x, plan.y, plan.w, plan.h, level)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("tile strip compress failed: {e}");
-                grid.abandon(plan);
-                continue;
-            }
-        };
+        let (codec, data) =
+            match compress_strip(bgra, stride, plan.x, plan.y, plan.w, plan.h, level) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("tile strip compress failed: {e}");
+                    grid.abandon(plan);
+                    continue;
+                }
+            };
         let wire = data.len() as u64;
         // Spend the bandwidth budget here, BEFORE queueing — the only point at
         // which a strip can still be declined safely. Past `try_send` the grid
@@ -2171,7 +2171,10 @@ mod tests {
         // `Sender::capacity` answers `None` for an unbounded channel; the call
         // site substitutes `usize::MAX`, which must degrade to "the per-pass
         // budget is the only limit" rather than overflow.
-        assert_eq!(strip_budget(32, 0, usize::MAX, TILE_QUEUE_REVOKE_RESERVE), 32);
+        assert_eq!(
+            strip_budget(32, 0, usize::MAX, TILE_QUEUE_REVOKE_RESERVE),
+            32
+        );
     }
 
     #[test]
@@ -2260,9 +2263,7 @@ mod tests {
             height: 1080,
             edge: 64,
         });
-        w.note_control(&TileMsg::Revoke {
-            ids: vec![1, 2, 3],
-        });
+        w.note_control(&TileMsg::Revoke { ids: vec![1, 2, 3] });
         assert_eq!((w.resets, w.revoked), (1, 3));
         assert!(!w.is_quiet());
     }
@@ -2310,7 +2311,10 @@ mod tests {
         drain_revocations(&mut g, &tx, &mut win, &mut retry, &reset_req, 10);
         assert_eq!(g.stats().pending_revokes, 0, "the grid gave it up");
         assert_eq!(retry, vec![1], "so it must have been kept here");
-        assert!(!reset_req.load(Ordering::Relaxed), "a revoke is not a reset");
+        assert!(
+            !reset_req.load(Ordering::Relaxed),
+            "a revoke is not a reset"
+        );
 
         // Make room: the next pass sends it even though the grid itself now has
         // nothing pending at all.

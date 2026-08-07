@@ -358,10 +358,7 @@ fn refinement_actually_ran() -> Result<()> {
             on.host().tile_stats().tile_bytes_sent
         );
         assert!(
-            on.host()
-                .tile_windows()
-                .iter()
-                .any(|w| w.budget_kbps > 0),
+            on.host().tile_windows().iter().any(|w| w.budget_kbps > 0),
             "{}: the throttle never granted a budget at all",
             cond.label
         );
@@ -435,8 +432,7 @@ fn a_lossy_link_gets_almost_no_refinement() -> Result<()> {
         );
     }
     assert!(
-        lossy.host().tile_stats().tile_bytes_sent * 8
-            < clean.host().tile_stats().tile_bytes_sent,
+        lossy.host().tile_stats().tile_bytes_sent * 8 < clean.host().tile_stats().tile_bytes_sent,
         "a 3% link refined {} bytes against the clean link's {}",
         lossy.host().tile_stats().tile_bytes_sent,
         clean.host().tile_stats().tile_bytes_sent
@@ -548,7 +544,12 @@ fn a_lossy_link_gets_almost_no_refinement() -> Result<()> {
     for bytes in [1_024u64, 2_048, 4_096] {
         let mut tiles = TileSim::on(CONDITIONS[1].link_kbps);
         tiles.tile_strip_bytes = bytes;
-        volumes.push(run(&CONDITIONS[1], tiles)?.host().tile_stats().tile_bytes_sent);
+        volumes.push(
+            run(&CONDITIONS[1], tiles)?
+                .host()
+                .tile_stats()
+                .tile_bytes_sent,
+        );
     }
     let (lo, hi) = (
         *volumes.iter().min().expect("swept"),
@@ -871,7 +872,8 @@ fn constrained_link_headroom_estimate_overshoots() -> Result<()> {
             entering
         };
         assert_eq!(
-            next.ceiling_kbps, expected,
+            next.ceiling_kbps,
+            expected,
             "at {} ms the ceiling moved {entering} → {} over a clean window \
              (binding={was_binding}, judgeable={judgeable}, \
              used_its_grant={used_its_grant}, safe={safe}, gap={}, spent={})",
@@ -1253,7 +1255,16 @@ fn a_revoked_window_does_not_stall_the_ceiling() {
 
     // A clean window that spent its grant grows the ceiling by one step, because
     // nothing is known to hurt yet and the ramp is therefore the fast one.
-    let granted = t.observe(TILE_CEILING_MIN_KBPS, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
+    let granted = t.observe(
+        TILE_CEILING_MIN_KBPS,
+        TARGET,
+        MEDIA,
+        0.0,
+        0.0,
+        false,
+        true,
+        0,
+    );
     let grown = TILE_CEILING_MIN_KBPS + TILE_CEILING_STEP_KBPS;
     assert_eq!(t.ceiling(), grown, "a spent grant is evidence");
     assert_eq!(granted, grown);
@@ -1274,7 +1285,10 @@ fn a_revoked_window_does_not_stall_the_ceiling() {
     // window before it granted nothing, so `spent_kbps` is zero — but that is
     // not a refusal and must not be read as one.
     let gap = (TARGET - MEDIA) / 4;
-    assert!(backed_off < gap, "the ceiling is the binding constraint here");
+    assert!(
+        backed_off < gap,
+        "the ceiling is the binding constraint here"
+    );
     let after = t.observe(0, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
     assert_eq!(
         t.ceiling(),
@@ -1320,10 +1334,23 @@ fn a_recovery_window_buys_a_creep_not_a_step() {
     // the ceiling is untouched and `safe` is never set, so the ceiling is still
     // in nominal fast-ramp territory.
     assert_eq!(
-        t.observe(TILE_CEILING_MIN_KBPS, TARGET, MEDIA, 0.0, 0.05, false, true, 0),
+        t.observe(
+            TILE_CEILING_MIN_KBPS,
+            TARGET,
+            MEDIA,
+            0.0,
+            0.05,
+            false,
+            true,
+            0
+        ),
         0
     );
-    assert_eq!(t.ceiling(), TILE_CEILING_MIN_KBPS, "loss alone must not learn");
+    assert_eq!(
+        t.ceiling(),
+        TILE_CEILING_MIN_KBPS,
+        "loss alone must not learn"
+    );
 
     // The recovery window. It binds, and it is unjudgeable, so it grows — by a
     // creep, because "you had no chance to prove yourself" is a concession and
@@ -1339,7 +1366,16 @@ fn a_recovery_window_buys_a_creep_not_a_step() {
     // Whereas a window that did spend its grant, on the same untouched `safe`,
     // takes the step: the fast ramp is still available, it just has to be earned.
     let mut u = TileThrottle::new();
-    u.observe(TILE_CEILING_MIN_KBPS, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
+    u.observe(
+        TILE_CEILING_MIN_KBPS,
+        TARGET,
+        MEDIA,
+        0.0,
+        0.0,
+        false,
+        true,
+        0,
+    );
     assert_eq!(
         u.ceiling(),
         TILE_CEILING_MIN_KBPS + TILE_CEILING_STEP_KBPS,
@@ -1367,12 +1403,24 @@ fn loss_without_backpressure_does_not_lower_the_ceiling() {
     let mut t = TileThrottle::new();
 
     // Ramp the ceiling up over a few clean windows.
-    let mut grant = t.observe(TILE_CEILING_MIN_KBPS, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
+    let mut grant = t.observe(
+        TILE_CEILING_MIN_KBPS,
+        TARGET,
+        MEDIA,
+        0.0,
+        0.0,
+        false,
+        true,
+        0,
+    );
     for _ in 0..2 {
         grant = t.observe(grant, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
     }
     let learned = t.ceiling();
-    assert!(learned > TILE_CEILING_MIN_KBPS, "nothing was learned to keep");
+    assert!(
+        learned > TILE_CEILING_MIN_KBPS,
+        "nothing was learned to keep"
+    );
 
     // 5% loss, zero backpressure: the budget goes, the ceiling stays.
     let revoked = t.observe(grant, TARGET, MEDIA, 0.0, 0.05, false, true, 0);
@@ -1387,7 +1435,16 @@ fn loss_without_backpressure_does_not_lower_the_ceiling() {
     // The same spend with backpressure instead does lower it, so the assertion
     // above is about the signal and not about the throttle having gone inert.
     let mut u = TileThrottle::new();
-    let mut grant = u.observe(TILE_CEILING_MIN_KBPS, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
+    let mut grant = u.observe(
+        TILE_CEILING_MIN_KBPS,
+        TARGET,
+        MEDIA,
+        0.0,
+        0.0,
+        false,
+        true,
+        0,
+    );
     for _ in 0..2 {
         grant = u.observe(grant, TARGET, MEDIA, 0.0, 0.0, false, true, 0);
     }
@@ -1590,7 +1647,10 @@ fn tile_budget_collapses_on_backpressure_and_rearms_only_when_clean() {
     // 1. Backpressure with no loss at all still zeroes the budget outright.
     //    This is the hazard signature and the single most important line here.
     for i in BACKPRESSURE {
-        assert_eq!(budgets[i], 0, "window {i} granted a budget under backpressure");
+        assert_eq!(
+            budgets[i], 0,
+            "window {i} granted a budget under backpressure"
+        );
     }
     // 2. So does loss over the cutoff, with no backpressure at all.
     for i in LOSSY {
@@ -1734,8 +1794,8 @@ fn matrix_summary() -> Result<()> {
             windows.iter().filter(|w| w.pressure > 0.0).count(),
         );
         for (i, w) in windows.iter().enumerate() {
-            let safe = safe_before(windows, i)
-                .map_or_else(|| "  none".to_string(), |s| format!("{s:>6}"));
+            let safe =
+                safe_before(windows, i).map_or_else(|| "  none".to_string(), |s| format!("{s:>6}"));
             eprintln!(
                 "    t={:>5} pressure={:.3} loss={:.3} media={:>5} adaptor={:>6} \
                  spent={:>5} gap={:>6} safe={safe} ceiling={:>6} budget={:>5}",

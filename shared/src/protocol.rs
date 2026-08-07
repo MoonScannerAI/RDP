@@ -147,10 +147,15 @@ pub enum ControlMsg {
     /// normal-integrity host cannot click through UIPI. Offers the operator a
     /// one-shot opt-in to have a SYSTEM worker perform the click. `title` is the
     /// consent window caption for the operator to eyeball what they're approving.
-    ElevationPrompt { title: String },
+    ElevationPrompt {
+        title: String,
+    },
     /// Client → host: operator opts in to respond to the *current* prompt. The
     /// host arms the SYSTEM injector for one elevation (or a short TTL) only.
-    ArmElevation { one_shot: bool, ttl_secs: u32 },
+    ArmElevation {
+        one_shot: bool,
+        ttl_secs: u32,
+    },
     /// Host → client: elevation handling ended (prompt gone / TTL expired /
     /// stopped). The client clears any "arm?" affordance.
     ElevationEnded,
@@ -320,7 +325,10 @@ mod tests {
             agent: "d".into(),
         };
         // version(u16 varint)=01, features(u64 varint)=00, agent len=01 'd'=64
-        assert_eq!(postcard::to_stdvec(&h).unwrap(), vec![0x01, 0x00, 0x01, 0x64]);
+        assert_eq!(
+            postcard::to_stdvec(&h).unwrap(),
+            vec![0x01, 0x00, 0x01, 0x64]
+        );
 
         // Setting a feature bit must change only the features byte(s) — proof
         // that negotiation costs no structural change.
@@ -328,7 +336,10 @@ mod tests {
             features: features::LOSSLESS_TILES,
             ..h
         };
-        assert_eq!(postcard::to_stdvec(&h2).unwrap(), vec![0x01, 0x08, 0x01, 0x64]);
+        assert_eq!(
+            postcard::to_stdvec(&h2).unwrap(),
+            vec![0x01, 0x08, 0x01, 0x64]
+        );
     }
 
     /// Adding a `ConnStats` field breaks every already-deployed peer.
@@ -395,16 +406,24 @@ mod tests {
         let cases: [(ControlMsg, u8); 6] = [
             (ControlMsg::StopStream, 1),
             (ControlMsg::RequestKeyframe, 2),
-            (ControlMsg::Bye { reason: String::new() }, 13),
+            (
+                ControlMsg::Bye {
+                    reason: String::new(),
+                },
+                13,
+            ),
             (ControlMsg::Ping { token: 0 }, 14),
             (ControlMsg::Pong { token: 0 }, 15),
             (ControlMsg::ElevationEnded, 12),
         ];
         for (msg, want) in cases {
             let got = postcard::to_stdvec(&msg).unwrap()[0];
-            assert_eq!(got, want, "discriminant moved for {msg:?} — a variant was \
+            assert_eq!(
+                got, want,
+                "discriminant moved for {msg:?} — a variant was \
                  inserted rather than appended; old peers will misparse every \
-                 later variant");
+                 later variant"
+            );
         }
     }
 

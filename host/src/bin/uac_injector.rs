@@ -41,7 +41,9 @@ use std::time::{Duration, Instant};
 
 use directdesk_host::elevation::foreground_consent_rect;
 use directdesk_host::input_inject::WinInjector;
-use directdesk_host::uac_proto::{clamp_norm_to_rect, decode_frame, tokens_match, UacWireMsg, MAX_UAC_MSG};
+use directdesk_host::uac_proto::{
+    clamp_norm_to_rect, decode_frame, tokens_match, UacWireMsg, MAX_UAC_MSG,
+};
 use directdesk_host::winpipe::{pcwstr, wide, Event, OwnedHandle};
 use directdesk_shared::input::InputEvent;
 use directdesk_shared::protocol::InputMsg;
@@ -202,7 +204,10 @@ fn serve(pipe: &OwnedHandle, buf: &mut [u8]) -> i32 {
         if foreground_consent_rect().is_some() {
             consent_last_seen = Instant::now();
         } else if consent_last_seen.elapsed() > CONSENT_GONE_TIMEOUT {
-            tracing::info!("consent window gone for >{:?}; exiting", CONSENT_GONE_TIMEOUT);
+            tracing::info!(
+                "consent window gone for >{:?}; exiting",
+                CONSENT_GONE_TIMEOUT
+            );
             break;
         }
 
@@ -233,7 +238,9 @@ fn serve(pipe: &OwnedHandle, buf: &mut [u8]) -> i32 {
                                     Some(WinInjector::new(width, height, (origin_x, origin_y)))
                             }
                         }
-                        tracing::info!("geometry set to {width}x{height} @ ({origin_x},{origin_y})");
+                        tracing::info!(
+                            "geometry set to {width}x{height} @ ({origin_x},{origin_y})"
+                        );
                     }
                     UacWireMsg::Input(input) => {
                         last_input = Instant::now();
