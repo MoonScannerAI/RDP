@@ -83,6 +83,24 @@ pub mod features {
     /// whole reason this is a feature bit rather than a `PROTOCOL_VERSION` bump
     /// or a new `ControlMsg` variant. See the wire-stability tests below.
     pub const LOSSLESS_TILES: u64 = 1 << 3;
+    /// System audio capture on the host, streamed host→client as AAC-LC in
+    /// QUIC datagrams (see [`crate::audio`]).
+    ///
+    /// Negotiated as an intersection, exactly like [`LOSSLESS_TILES`]: the
+    /// client sets the bit in its `Hello` to say it can decode and play the
+    /// stream, and the host echoes it only if it too supports and is configured
+    /// for capture. The host sends its first audio datagram **only** when the
+    /// bit is mutual, so a peer that predates this feature never sees one —
+    /// which matters more here than for tiles, because audio shares the media
+    /// datagram path with video rather than getting a stream of its own. An old
+    /// client handed an audio datagram would route it into the video
+    /// reassembler; [`crate::video::FLAG_AUDIO`] documents why that is
+    /// survivable, but "never sent" is the guarantee we actually rely on.
+    ///
+    /// This is a feature bit rather than a `PROTOCOL_VERSION` bump or a new
+    /// `ControlMsg` variant for the reason the wire-stability tests below spell
+    /// out: both of those brick an already-deployed remote host.
+    pub const SYSTEM_AUDIO: u64 = 1 << 4;
 }
 
 /// Pairing + steady-state authentication messages.
@@ -433,6 +451,22 @@ mod tests {
             postcard::to_stdvec(&h2).unwrap(),
             vec![0x01, 0x08, 0x01, 0x64]
         );
+
+        // Same again for the audio bit, added when system audio landed. Each
+        // new feature bit gets a line here on purpose: it costs one assertion
+        // to prove that the bit is still just a *value* in the existing u64 —
+        // 16 fits in a single postcard varint byte, so the frame stays four
+        // bytes long and an old peer parses it unchanged. The day this
+        // assertion needs a fifth byte or a shifted `agent` field, the change
+        // in front of it is a structural one and must not ship.
+        let h3 = Hello {
+            features: features::SYSTEM_AUDIO,
+            ..h2
+        };
+        assert_eq!(
+            postcard::to_stdvec(&h3).unwrap(),
+            vec![0x01, 0x10, 0x01, 0x64]
+        );
     }
 
     /// Adding a `ConnStats` field breaks every already-deployed peer.
@@ -529,6 +563,7 @@ mod tests {
             features::CURSOR_METADATA,
             features::ADAPTIVE_BITRATE,
             features::LOSSLESS_TILES,
+            features::SYSTEM_AUDIO,
         ];
         for (i, a) in bits.iter().enumerate() {
             assert!(a.count_ones() == 1, "feature bits must be single bits");

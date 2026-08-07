@@ -5,6 +5,7 @@
 //! [`protocol::PROTOCOL_VERSION`] on any wire-visible change.
 
 pub mod adapt;
+pub mod audio;
 pub mod crypto;
 pub mod error;
 pub mod geometry;

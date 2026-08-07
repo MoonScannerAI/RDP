@@ -6,7 +6,9 @@
 //! 0      4    frame_id     (u32, wraps)
 //! 4      2    frag_index   (u16)      DATA: fragment index; PARITY: block index
 //! 6      2    frag_count   (u16, >= 1) number of DATA fragments (N)
-//! 8      1    flags        (bit0 = keyframe, bit1 = parity)
+//! 8      1    flags        (bit0 = keyframe, bit1 = parity, bit2 = AUDIO —
+//!                          never set by this module, and rejected on decode;
+//!                          see [`FLAG_AUDIO`] and [`crate::audio`])
 //! 9      1    block_size   (K, FEC block size; 0 = no FEC)
 //! 10     4    DATA: timestamp_ms (u32); PARITY: last_frag_len (u16) then 0 (u16)
 //! ```
@@ -27,9 +29,42 @@
 use crate::error::{Error, Result};
 
 pub const FRAG_HEADER_LEN: usize = 14;
+/// Byte offset of the flags field in a fragment header.
+///
+/// Named rather than spelled `8` inline because [`crate::audio`] pins its own
+/// flags byte to the same offset, with a `const` assertion that the two agree.
+/// That shared offset is what lets the datagram demux be a single byte compare
+/// against a slice of unknown provenance, before any header is parsed.
+pub const FRAG_FLAGS_OFFSET: usize = 8;
 pub const FLAG_KEYFRAME: u8 = 0b0000_0001;
 /// Set on parity fragments; clear on data fragments.
 pub const FLAG_PARITY: u8 = 0b0000_0010;
+/// Marks a datagram as AUDIO, not a video fragment.
+///
+/// It lives in the *video* flag space, at the video flags offset, because that
+/// is the only way one byte can separate the two kinds of media datagram: see
+/// [`crate::audio`] for the demux itself. Nothing in this module ever sets it —
+/// [`FragHeader::encode`] writes only [`FLAG_KEYFRAME`] and [`FLAG_PARITY`] —
+/// and, more importantly:
+///
+/// **[`FragHeader::decode`]'s allowed mask must stay
+/// `!(FLAG_KEYFRAME | FLAG_PARITY)`, i.e. it must go on REJECTING this bit.**
+/// Widening the mask to tolerate `FLAG_AUDIO` looks like harmless forward
+/// compatibility and is not. That rejection is the backstop that keeps an audio
+/// datagram from ever reaching the reassembler's `accept_frame_id`: an audio
+/// packet's bytes 0..4 are a *sequence number*, which is a completely unrelated
+/// number line from the video `frame_id`, so eight consecutive audio datagrams
+/// leaking into the video path would look like eight consecutive out-of-window
+/// frame ids that agree with each other — precisely the signature of a
+/// legitimate encoder renumbering. The reassembler would then call
+/// `adopt_numbering`, which clears every live slot and every ready frame and
+/// demands a keyframe. The visible symptom is a video stall with no error, on a
+/// session whose only fault was that audio and video share a datagram path.
+///
+/// `is_audio_datagram` is the routing decision; this rejection is the safety
+/// net for the day some future caller forgets to consult it. Keep both.
+/// `video_decode_still_rejects_the_audio_flag` in the tests below pins it.
+pub const FLAG_AUDIO: u8 = 0b0000_0100;
 /// Sanity cap: no encoded frame may exceed this many fragments.
 pub const MAX_FRAGS_PER_FRAME: u16 = 512;
 /// Sanity cap on a single reassembled frame (2 MiB is generous for 1080p H.264).
@@ -82,9 +117,11 @@ impl FragHeader {
         let frame_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let frag_index = u16::from_le_bytes(buf[4..6].try_into().unwrap());
         let frag_count = u16::from_le_bytes(buf[6..8].try_into().unwrap());
-        let flags = buf[8];
+        let flags = buf[FRAG_FLAGS_OFFSET];
         let block_size = buf[9];
 
+        // Deliberately narrow: `FLAG_AUDIO` is NOT in this mask and must not be
+        // added to it. See `FLAG_AUDIO`'s docs for what widening it costs.
         if flags & !(FLAG_KEYFRAME | FLAG_PARITY) != 0 {
             return Err(Error::Invalid(format!("unknown flags {flags:#x}")));
         }
@@ -480,6 +517,66 @@ mod tests {
                 }
             }
             assert!(acc.iter().all(|&x| x == 0), "block {b} parity mismatch");
+        }
+    }
+
+    /// The audio bit must stay OUTSIDE `decode`'s allowed mask.
+    ///
+    /// This is not a test of a behaviour anyone wants; it is a tripwire on a
+    /// tempting "cleanup". A maintainer adding audio support may reasonably
+    /// think the video decoder should tolerate the audio flag it now knows
+    /// about, and widen the mask to `!(FLAG_KEYFRAME | FLAG_PARITY |
+    /// FLAG_AUDIO)`. Doing that makes an audio datagram decode as a *video
+    /// fragment*, whose `frame_id` is really an audio sequence number from an
+    /// unrelated number line. Eight of those in a row read to the reassembler
+    /// as eight consecutive, mutually-agreeing out-of-window ids — its exact
+    /// signature for a legitimate encoder renumbering — so it calls
+    /// `adopt_numbering`, drops every live slot and every ready frame, and
+    /// demands a keyframe. Video stalls, and nothing logs an error.
+    ///
+    /// The assertion below therefore checks not just "an error" but that it is
+    /// specifically the unknown-flags rejection, so that a mask widened by hand
+    /// cannot be papered over by some other check happening to fail instead.
+    #[test]
+    fn video_decode_still_rejects_the_audio_flag() {
+        // A header that is valid in every other respect, so the only thing the
+        // decoder can object to is the flag itself.
+        let mut buf = Vec::new();
+        FragHeader {
+            frame_id: 42,
+            frag_index: 0,
+            frag_count: 1,
+            keyframe: true,
+            parity: false,
+            block_size: 0,
+            last_frag_len: 0,
+            timestamp_ms: 1234,
+        }
+        .encode(&mut buf);
+        buf.push(0xFF); // one payload byte
+
+        // Sanity: it decodes cleanly before the audio bit is set, so the
+        // rejection below is attributable to that bit and nothing else.
+        assert!(
+            FragHeader::decode(&buf).is_ok(),
+            "the fixture must be a valid fragment before FLAG_AUDIO is set"
+        );
+
+        buf[FRAG_FLAGS_OFFSET] |= FLAG_AUDIO;
+        let err = FragHeader::decode(&buf).expect_err(
+            "FragHeader::decode must REJECT the audio flag. If you just widened \
+             decode's allowed mask to accept FLAG_AUDIO: undo it. That mask is \
+             the backstop that keeps an audio datagram out of the reassembler, \
+             where its sequence number would be read as a video frame_id and, \
+             after 8 in a row, trigger adopt_numbering — wiping every live \
+             video slot. Route audio with audio::is_audio_datagram instead.",
+        );
+        match err {
+            Error::Invalid(msg) => assert!(
+                msg.contains("unknown flags"),
+                "expected the unknown-flags rejection, got: {msg}"
+            ),
+            other => panic!("expected Error::Invalid(unknown flags), got: {other}"),
         }
     }
 
