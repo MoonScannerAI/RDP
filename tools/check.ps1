@@ -38,7 +38,14 @@ try {
         Write-Host "==> $Name" -ForegroundColor Cyan
         Write-Host ("    cargo " + ($ArgList -join " "))
 
-        & cargo @ArgList
+        # `| Out-Host` is load-bearing, not decoration. A bare `& cargo @ArgList`
+        # writes cargo's stdout into THIS FUNCTION's pipeline output, so the
+        # `return` below appends the boolean to a few hundred lines of build
+        # chatter. The caller's `$ok = Run-Check ...` then holds an array, every
+        # non-empty array is truthy, `-not $ok` is always false, and the script
+        # reported OVERALL: PASS with a failing test suite and exit 0. Out-Host
+        # writes straight to the console and contributes nothing to the pipeline.
+        & cargo @ArgList | Out-Host
         $exitCode = $LASTEXITCODE
 
         if ($exitCode -eq 0) {
