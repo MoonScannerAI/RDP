@@ -12,7 +12,7 @@ pub mod connect_form;
 pub mod diagnostics;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use directdesk_shared::protocol::{ControlMsg, QualityMode};
 use directdesk_shared::stats::{validate_stats, ConnStats, TransportRoute};
@@ -23,7 +23,7 @@ use crate::input_capture::{
     is_release_chord, wheel_delta, CaptureLoss, InputCapture, RELEASE_CHORD,
 };
 use crate::pipeline::Pipeline;
-use crate::renderer::{FrameSlot, Presenter, VideoView};
+use crate::renderer::{describe_scale, is_exact_scale, FrameSlot, Presenter, VideoView};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
 
 /// An outstanding UAC prompt on the remote host, awaiting an operator
@@ -128,6 +128,35 @@ pub struct ClientApp {
     /// capture again — without it, every release was undone on the next frame.
     /// Deliberately not persisted: each launch starts willing to capture.
     user_released: bool,
+
+    /// Host dims/fps/bitrate from the most recent `VideoConfig`, kept
+    /// separately from `Presenter::frame_size()` so the 1:1 button works
+    /// before the first frame has decoded.
+    host_video: Option<(u32, u32, u32, u32)>,
+    /// Measured toolbar chrome height, in egui points: the gap between the
+    /// window's full content height and the video viewport. Measured rather
+    /// than hardcoded so it survives style and font changes.
+    chrome_points: f32,
+    /// fps the host most recently reported via `VideoConfig`; shown next to
+    /// the FPS control as the only in-app confirmation the host actually
+    /// honoured a request.
+    host_reported_fps: Option<u32>,
+    /// When we last re-sent `StartStream` to reassert a lower fps after a
+    /// reconnect silently reverted it. Rate-limits `should_reassert_fps`.
+    last_fps_reassert: Option<Instant>,
+
+    /// Snap to a fixed integer scale automatically the first time the host's
+    /// video format is learned on a connection. `0` = off, `1` = snap to 1:1,
+    /// `2` = snap to 2x. Loaded from and persisted to
+    /// `ClientConfig::auto_snap_scale` (see `ClientApp::new` and `persist`).
+    /// Defaults off: auto-resizing a user's window without being asked is a
+    /// bigger surprise than leaving them at a fractional scale.
+    auto_snap_scale: u32,
+    /// Set when `auto_snap_scale` is nonzero and a fresh `VideoConfig` just
+    /// taught us the host's dims for the first time this connection. Consumed
+    /// (and cleared) by `toolbar`, which is where `ctx` and `chrome_points`
+    /// are available to actually resize the window.
+    pending_auto_snap: bool,
 }
 
 impl ClientApp {
@@ -138,10 +167,19 @@ impl ClientApp {
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         let input = InputCapture::new(init.session.input_tx.clone());
         let show_diagnostics = init.config.show_diagnostics;
+        let auto_snap_scale = init.config.auto_snap_scale;
         let fullscreen = init.config.start_fullscreen;
         if fullscreen {
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
+        // The supervisor is built with `StreamCaps::default()` before the
+        // persisted config is known; seed the persisted fps choice into it
+        // now so the *first* connect carries it too, not just ones made after
+        // the toolbar combo is touched.
+        let mut supervisor = init.supervisor;
+        if let Some(sup) = supervisor.as_mut() {
+            sup.set_preferred_fps(init.config.preferred_fps);
         }
         Self {
             address_input: init.config.host_address.clone(),
@@ -159,7 +197,7 @@ impl ClientApp {
             presenter: Presenter::new(),
             input,
             mode: init.mode,
-            supervisor: init.supervisor,
+            supervisor,
             state: if init.mode == SourceMode::LoopbackDemo {
                 ConnectionState::Connected
             } else {
@@ -179,6 +217,12 @@ impl ClientApp {
             capture_on_start: init.capture_on_start || init.hold_capture,
             hold_capture: init.hold_capture,
             user_released: false,
+            host_video: None,
+            chrome_points: 0.0,
+            host_reported_fps: None,
+            last_fps_reassert: None,
+            auto_snap_scale,
+            pending_auto_snap: false,
         }
     }
 
@@ -214,6 +258,23 @@ impl ClientApp {
             host_injected = self.stats.map(|s| s.input_injected).unwrap_or(0),
             "client metrics"
         );
+
+        // Log presentation geometry separately: scale, resolution, and ppp are
+        // the key diagnostics to determine whether the video is being drawn 1:1
+        // or at a blurry fractional scale. Logged only when host dims are known.
+        let scale = self.presenter.last_scale();
+        let ppp = ctx.pixels_per_point();
+        if let Some((w, h, _, _)) = self.host_video {
+            tracing::info!(
+                "presentation: host {}x{}, scale {:.2}x ({}), ppp {:.2}, chrome {:.1}pt",
+                w,
+                h,
+                scale,
+                describe_scale(scale),
+                ppp,
+                self.chrome_points
+            );
+        }
     }
 
     fn streaming(&self) -> bool {
@@ -275,6 +336,32 @@ impl ClientApp {
                 tracing::info!(
                     "host video config: {width}x{height} @{fps} {bitrate_kbps}kbps {codec:?}"
                 );
+                // First format learned this connection, so this is the moment
+                // "auto 1:1" (if the user opted in) should fire.
+                let first_config = self.host_video.is_none();
+                // Retain the host's own dims/fps so the 1:1 button and the fps
+                // diagnostics work even before a frame has decoded.
+                self.host_video = Some((width, height, fps, bitrate_kbps));
+                self.host_reported_fps = Some(fps);
+                if first_config && self.auto_snap_scale != 0 {
+                    self.pending_auto_snap = true;
+                }
+
+                // `run_client` reconnects internally using the connect-time
+                // params, so a mid-session fps choice would otherwise be
+                // silently reverted by an auto-reconnect. Re-assert it here,
+                // rate-limited so this can't loop.
+                let now = Instant::now();
+                if should_reassert_fps(
+                    self.config.preferred_fps,
+                    fps,
+                    self.last_fps_reassert,
+                    now,
+                ) {
+                    self.apply_preferred_fps();
+                    self.last_fps_reassert = Some(now);
+                }
+
                 // A format change invalidates decoder state; the decode thread
                 // recovers on the next keyframe, so ask for one now.
                 self.session.send_control(ControlMsg::RequestKeyframe);
@@ -326,6 +413,22 @@ impl ClientApp {
     /// the run.
     fn effective_background_capture(&self) -> bool {
         self.config.capture_in_background || self.hold_capture
+    }
+
+    /// Re-send `StartStream` on the live connection to apply the current
+    /// preferred fps (and quality mode) without a wire change or a
+    /// reconnect. Safe and sufficient because `StartStream` is idempotent
+    /// host-side: it re-applies the quality mode (`BitrateAdaptor::set_mode`
+    /// preserves `current_kbps`, so no bitrate reset), forces a keyframe, and
+    /// elicits a fresh `VideoConfig`. Reusing it is what keeps this feature
+    /// free of any wire change — an older host simply logs and ignores it.
+    fn apply_preferred_fps(&mut self) {
+        self.session.send_control(ControlMsg::StartStream {
+            max_width: 3840,
+            max_height: 2160,
+            preferred_fps: self.config.preferred_fps,
+            quality_mode: self.config.quality_mode,
+        });
     }
 
     /// Runs first every frame: latch any capture loss the hook reported
@@ -488,7 +591,168 @@ impl ClientApp {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
+
+            // Host dims come from the most recent VideoConfig, falling back to
+            // whatever the presenter has actually decoded — so this works even
+            // before the first frame arrives.
+            let host_dims = self
+                .host_video
+                .map(|(w, h, _, _)| (w, h))
+                .or_else(|| self.presenter.frame_size());
+            let ppp = ctx.pixels_per_point();
+            // The question is whether the *monitor* can hold the host desktop
+            // 1:1, not whether the current window already does — so measure
+            // against the screen, not the viewport. `monitor_size` is already in
+            // egui points; the host dimensions are physical pixels. When the
+            // platform will not tell us the monitor size, let the user try.
+            let monitor = ctx.input(|i| i.viewport().monitor_size);
+            // The biggest integer scale the monitor can hold — the buttons
+            // below and the auto-snap preference all derive their fit from
+            // this one number, so they can never disagree with each other.
+            let max_scale = host_dims
+                .map(|dims| largest_fitting_scale(dims, monitor, ppp, self.chrome_points))
+                .unwrap_or(0);
+
+            // A pending auto-snap (opted into via the combo below) fires the
+            // moment we have both the host's dims and a fit — same guard the
+            // buttons themselves are enabled under, so auto and manual can't
+            // disagree.
+            if self.pending_auto_snap {
+                self.pending_auto_snap = false;
+                if let Some((w, h)) = host_dims {
+                    if self.auto_snap_scale != 0 && self.auto_snap_scale <= max_scale {
+                        self.resize_to_integer_scale(ctx, w, h, ppp, self.auto_snap_scale);
+                    }
+                }
+            }
+
+            let one_to_one = ui.add_enabled(host_dims.is_some() && max_scale >= 1, egui::Button::new("1:1"));
+            if host_dims.is_none() {
+                one_to_one.on_disabled_hover_text(
+                    "Waiting for the host's video format before this can size the window.",
+                );
+            } else if max_scale < 1 {
+                one_to_one.on_disabled_hover_text(
+                    "Your screen is too small to show the host desktop at one screen pixel \
+                     per host pixel without rescaling.",
+                );
+            } else if one_to_one
+                .on_hover_text(
+                    "Size the window so the host desktop renders at exactly one screen \
+                     pixel per host pixel — no rescaling, sharpest text.",
+                )
+                .clicked()
+            {
+                if let Some((w, h)) = host_dims {
+                    self.resize_to_integer_scale(ctx, w, h, ppp, 1);
+                }
+            }
+
+            let two_x = ui.add_enabled(host_dims.is_some() && max_scale >= 2, egui::Button::new("2x"));
+            if host_dims.is_none() {
+                two_x.on_disabled_hover_text(
+                    "Waiting for the host's video format before this can size the window.",
+                );
+            } else if max_scale < 2 {
+                two_x.on_disabled_hover_text(
+                    "Your screen is too small to show the host desktop doubled (every host \
+                     pixel drawn as a 2x2 block) without rescaling.",
+                );
+            } else if two_x
+                .on_hover_text(
+                    "Size the window so every host pixel is drawn as an exact 2x2 block of \
+                     screen pixels — twice the size of 1:1, still perfectly sharp, unlike \
+                     dragging the window to an arbitrary size, which blurs.",
+                )
+                .clicked()
+            {
+                if let Some((w, h)) = host_dims {
+                    self.resize_to_integer_scale(ctx, w, h, ppp, 2);
+                }
+            }
+
+            ui.label("Auto-snap");
+            let current_snap = self.auto_snap_scale;
+            let mut chosen_snap = current_snap;
+            let snap_combo = egui::ComboBox::from_id_salt("auto_snap_scale")
+                .selected_text(auto_snap_label(current_snap))
+                .show_ui(ui, |ui| {
+                    for scale in [0, 1, 2] {
+                        if ui
+                            .selectable_label(current_snap == scale, auto_snap_label(scale))
+                            .clicked()
+                        {
+                            chosen_snap = scale;
+                        }
+                    }
+                });
+            snap_combo.response.on_hover_text(
+                "When set to 1:1 or 2x, snap the window to that scale automatically the next \
+                 time a host connects. Persisted between launches. Off never resizes the \
+                 window without being asked.",
+            );
+            if chosen_snap != current_snap {
+                self.auto_snap_scale = chosen_snap;
+            }
+
+            // The diagnostic that answers "am I actually at a crisp scale?" —
+            // unmissable rather than tucked into the diagnostics panel, since
+            // it's the signal for whether any encoder work even matters here.
+            if let Some((w, h)) = host_dims {
+                let scale = self.presenter.last_scale();
+                let color = if is_exact_scale(scale) {
+                    egui::Color32::from_rgb(90, 200, 120)
+                } else {
+                    egui::Color32::from_rgb(230, 170, 60)
+                };
+                ui.separator();
+                ui.colored_label(
+                    color,
+                    egui::RichText::new(format!("{w}x{h} @ {}", describe_scale(scale))).strong(),
+                )
+                .on_hover_text(
+                    "The host's resolution and the scale the video is currently drawn at. \
+                     Anything other than an exact 1:1/2x/3x scale means the video is being \
+                     resampled, which is what makes small text blurry.",
+                );
+            }
+
             ui.toggle_value(&mut self.show_diagnostics, "Diagnostics");
+
+            // Lowering fps at a fixed bitrate puts more bits in each frame,
+            // sharpening still text. 0 means "Auto" — the host decides, which
+            // is today's behaviour.
+            ui.separator();
+            ui.label("FPS");
+            let current_fps = self.config.preferred_fps;
+            let mut chosen_fps = current_fps;
+            let combo = egui::ComboBox::from_id_salt("preferred_fps")
+                .selected_text(fps_label(current_fps))
+                .show_ui(ui, |ui| {
+                    for fps in [0, 60, 45, 30, 24, 20, 15, 10] {
+                        if ui
+                            .selectable_label(current_fps == fps, fps_label(fps))
+                            .clicked()
+                        {
+                            chosen_fps = fps;
+                        }
+                    }
+                });
+            combo.response.on_hover_text(
+                "Fewer frames per second at the same bitrate means more bits in each \
+                 frame — sharper still text over a slow link. Auto follows the host.",
+            );
+            if chosen_fps != current_fps {
+                self.config.preferred_fps = chosen_fps;
+                self.config.save();
+                if let Some(supervisor) = self.supervisor.as_mut() {
+                    supervisor.set_preferred_fps(chosen_fps);
+                }
+                self.apply_preferred_fps();
+            }
+            if let Some(host_fps) = self.host_reported_fps {
+                ui.weak(format!("(host: {host_fps} fps)"));
+            }
 
             // Security-relevant opt-in, so it says plainly what it does. Off
             // (the default) means switching to a local app gives that app the
@@ -738,10 +1002,41 @@ impl ClientApp {
         self.route = None;
         self.elevation = None;
         self.state = ConnectionState::Disconnected;
+        // Forget the host's dims too: "auto 1:1" is meant to fire again on the
+        // *next* connect's first `VideoConfig`, and a stale value here would
+        // otherwise make that a one-time-per-process behaviour.
+        self.host_video = None;
+        self.pending_auto_snap = false;
+    }
+
+    /// Resize the window so the host video renders at exactly `scale` screen
+    /// pixels per host pixel (1 = the original 1:1 behaviour, 2 = pixel
+    /// doubling, ...). Shared by the 1:1/2x buttons and the auto-snap
+    /// preference so those paths can never drift apart.
+    fn resize_to_integer_scale(&mut self, ctx: &egui::Context, w: u32, h: u32, ppp: f32, scale: u32) {
+        if self.fullscreen {
+            // A resize while fullscreen does nothing: drop out first.
+            self.fullscreen = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        // InnerSize wants egui points; the host dims are physical pixels,
+        // hence the `* scale / ppp`. Add the measured chrome back in so the
+        // *video*, not the whole window, lands at the requested scale.
+        let scale = scale as f32;
+        let size = egui::vec2(
+            w as f32 * scale / ppp,
+            h as f32 * scale / ppp + self.chrome_points,
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
 
     fn streaming_view(&mut self, ui: &mut egui::Ui) {
         let (viewport, view) = self.presenter.draw(ui);
+
+        // Measured, not hardcoded, so it survives style and font changes: the
+        // gap between the full window and the video viewport is whatever the
+        // toolbar (and any other chrome) actually took up this frame.
+        self.chrome_points = ui.ctx().content_rect().height() - viewport.height();
 
         let Some(view) = view else {
             ui.painter_at(viewport).text(
@@ -913,6 +1208,7 @@ impl ClientApp {
     fn persist(&mut self) {
         self.config.show_diagnostics = self.show_diagnostics;
         self.config.start_fullscreen = self.fullscreen;
+        self.config.auto_snap_scale = self.auto_snap_scale;
         self.config.save();
     }
 }
@@ -1064,6 +1360,82 @@ pub fn quality_label(mode: QualityMode) -> &'static str {
     }
 }
 
+/// Kept free of egui so it's unit-testable without a context.
+pub fn fps_label(fps: u32) -> String {
+    if fps == 0 {
+        "Auto (host)".to_string()
+    } else {
+        format!("{fps} fps")
+    }
+}
+
+/// Label for the auto-snap combo. Kept free of egui so it's unit-testable
+/// without a context. Any value this build does not know about (a
+/// hand-edited or future-written config) reads as "Off" rather than panicking
+/// or showing a raw number — `ClientConfig::sanitized` already resets such
+/// values to 0, but the UI stays defensive too.
+pub fn auto_snap_label(scale: u32) -> &'static str {
+    match scale {
+        1 => "1:1",
+        2 => "2x",
+        _ => "Off",
+    }
+}
+
+/// Whether the monitor can show the host desktop at exactly `scale` screen
+/// pixels per host pixel, toolbar chrome included. `scale = 1` is the
+/// original 1:1 check; `scale = 2` is pixel-doubled, and so on.
+///
+/// `host_dims` are physical pixels; `monitor_points` and `chrome_points` are
+/// already in egui points (the `monitor_size` idiom and `chrome_points` both
+/// come that way), hence dividing the scaled host dims by `ppp` before
+/// comparing. Both axes matter: a monitor that is wide enough but not tall
+/// enough (or vice versa) still cannot fit the window, and skipping either
+/// check is exactly what let this button previously request a window taller
+/// than the screen and get silently clamped by Windows. `None` monitor size
+/// (the platform won't say) lets the user try anyway rather than blocking
+/// them.
+pub fn fits_integer_scale(
+    host_dims: (u32, u32),
+    monitor_points: Option<egui::Vec2>,
+    ppp: f32,
+    chrome_points: f32,
+    scale: u32,
+) -> bool {
+    let (w, h) = host_dims;
+    let scale = scale as f32;
+    monitor_points.is_none_or(|monitor| {
+        (w as f32 * scale / ppp) <= monitor.x && (h as f32 * scale / ppp + chrome_points) <= monitor.y
+    })
+}
+
+/// The largest integer scale (capped at 3x — there is no realistic use for
+/// more) that `fits_integer_scale` allows, or 0 if even 1:1 does not fit.
+/// `fits_integer_scale` only gets harder to satisfy as `scale` grows, so a
+/// simple top-down search is enough — no need to check every scale below the
+/// first one that fits.
+fn largest_fitting_scale(
+    host_dims: (u32, u32),
+    monitor_points: Option<egui::Vec2>,
+    ppp: f32,
+    chrome_points: f32,
+) -> u32 {
+    (1..=3)
+        .rev()
+        .find(|&scale| fits_integer_scale(host_dims, monitor_points, ppp, chrome_points, scale))
+        .unwrap_or(0)
+}
+
+/// Re-assert only when we want a *lower* rate than the host reports and we
+/// have not just asked. Never re-asserts upward: the host's configured fps is
+/// a ceiling we cannot raise, so `desired >= reported` is already the final
+/// answer and asking again would loop forever.
+pub fn should_reassert_fps(desired: u32, reported: u32, last: Option<Instant>, now: Instant) -> bool {
+    desired != 0
+        && desired < reported
+        && last.is_none_or(|t| now.duration_since(t) > Duration::from_secs(2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,5 +1450,137 @@ mod tests {
         ] {
             assert!(!quality_label(mode).is_empty());
         }
+    }
+
+    #[test]
+    fn fps_label_zero_is_auto() {
+        assert_eq!(fps_label(0), "Auto (host)");
+    }
+
+    #[test]
+    fn fps_label_nonzero_shows_the_number() {
+        assert_eq!(fps_label(30), "30 fps");
+        assert_eq!(fps_label(24), "24 fps");
+    }
+
+    #[test]
+    fn auto_snap_label_covers_off_and_both_scales() {
+        assert_eq!(auto_snap_label(0), "Off");
+        assert_eq!(auto_snap_label(1), "1:1");
+        assert_eq!(auto_snap_label(2), "2x");
+        // A value this build doesn't offer must not panic or show garbage.
+        assert_eq!(auto_snap_label(9), "Off");
+    }
+
+    #[test]
+    fn should_reassert_fps_when_desired_is_lower_and_never_asked() {
+        let now = Instant::now();
+        assert!(should_reassert_fps(30, 60, None, now));
+    }
+
+    #[test]
+    fn should_reassert_fps_never_raises_the_rate() {
+        // The host's configured fps is a ceiling we cannot raise: asking for
+        // 60 while the host already reports 30 is already the final answer.
+        let now = Instant::now();
+        assert!(!should_reassert_fps(60, 30, None, now));
+    }
+
+    #[test]
+    fn should_reassert_fps_auto_never_reasserts() {
+        let now = Instant::now();
+        assert!(!should_reassert_fps(0, 60, None, now));
+    }
+
+    #[test]
+    fn should_reassert_fps_equal_desired_and_reported_does_not_reassert() {
+        let now = Instant::now();
+        assert!(!should_reassert_fps(30, 30, None, now));
+    }
+
+    #[test]
+    fn fits_integer_scale_true_when_monitor_unknown() {
+        // Can't check, so let the user try.
+        assert!(fits_integer_scale((1920, 1080), None, 1.0, 40.0, 1));
+        assert!(fits_integer_scale((1920, 1080), None, 1.0, 40.0, 2));
+    }
+
+    #[test]
+    fn fits_integer_scale_checks_width() {
+        let monitor = egui::vec2(1000.0, 2000.0);
+        assert!(!fits_integer_scale((1920, 1080), Some(monitor), 1.0, 40.0, 1));
+    }
+
+    #[test]
+    fn fits_integer_scale_checks_height_including_chrome() {
+        // This is bug 1: a monitor exactly as tall (in points) as the host
+        // desktop, at ppp 1.0, fits on width but not once the toolbar chrome
+        // is added to the height — the old width-only check would have said
+        // "fits" here and produced a window Windows had to clamp.
+        let monitor = egui::vec2(1920.0, 1080.0);
+        assert!(!fits_integer_scale((1920, 1080), Some(monitor), 1.0, 40.0, 1));
+        // Same desktop, a monitor with enough headroom for the chrome: fits.
+        let taller_monitor = egui::vec2(1920.0, 1130.0);
+        assert!(fits_integer_scale(
+            (1920, 1080),
+            Some(taller_monitor),
+            1.0,
+            40.0,
+            1
+        ));
+    }
+
+    #[test]
+    fn fits_integer_scale_scales_host_dims_by_ppp() {
+        // The example from the task: 1920x1080 host, a 2560x1600-physical /
+        // 1707x1067-point monitor at 150% scaling, comfortably fits a
+        // 1280x720-point window plus chrome at 1:1.
+        let monitor = egui::vec2(1707.0, 1067.0);
+        assert!(fits_integer_scale((1920, 1080), Some(monitor), 1.5, 40.0, 1));
+    }
+
+    #[test]
+    fn fits_integer_scale_at_2x_needs_double_the_room() {
+        // Same host and monitor as above, but doubled: 1920x1080 @ 2x wants a
+        // 2560x1440-point window plus chrome — this monitor (1707x1067
+        // points) cannot hold that, even though 1:1 fits comfortably.
+        let monitor = egui::vec2(1707.0, 1067.0);
+        assert!(!fits_integer_scale((1920, 1080), Some(monitor), 1.5, 40.0, 2));
+
+        // The task's other worked example: a 1280x720 host at 2x is
+        // 2560x1440 physical, which fits a 2560x1600-physical /
+        // 1707x1067-point screen at 150% scaling with room for the toolbar.
+        assert!(fits_integer_scale((1280, 720), Some(monitor), 1.5, 40.0, 2));
+    }
+
+    #[test]
+    fn largest_fitting_scale_picks_the_biggest_that_fits() {
+        let monitor = egui::vec2(1707.0, 1067.0);
+        // 1280x720 host fits both 1:1 and 2x on this monitor.
+        assert_eq!(
+            largest_fitting_scale((1280, 720), Some(monitor), 1.5, 40.0),
+            2
+        );
+        // 1920x1080 host fits 1:1 but not 2x on the same monitor.
+        assert_eq!(
+            largest_fitting_scale((1920, 1080), Some(monitor), 1.5, 40.0),
+            1
+        );
+        // Nothing fits: too small a monitor even for 1:1.
+        let tiny = egui::vec2(100.0, 100.0);
+        assert_eq!(
+            largest_fitting_scale((1920, 1080), Some(tiny), 1.0, 40.0),
+            0
+        );
+    }
+
+    #[test]
+    fn should_reassert_fps_is_rate_limited() {
+        let t0 = Instant::now();
+        // Just asked: must not fire again immediately.
+        assert!(!should_reassert_fps(30, 60, Some(t0), t0));
+        // Enough time has passed: fires again.
+        let later = t0 + Duration::from_secs(3);
+        assert!(should_reassert_fps(30, 60, Some(t0), later));
     }
 }

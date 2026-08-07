@@ -17,7 +17,7 @@ use directdesk_shared::crypto::HostIdentity;
 use directdesk_shared::protocol::QualityMode;
 
 use super::AppShared;
-use crate::config::{HostConfig, MAX_BITRATE_KBPS, MIN_BITRATE_KBPS};
+use crate::config::{HostConfig, MAX_BITRATE_KBPS, MAX_TARGET_FPS, MIN_BITRATE_KBPS};
 use crate::net::{NetCommand, NetConfig, NetEvent, NetHandle, NetService, StatusSnapshot};
 
 /// How many recent events the window keeps.
@@ -67,6 +67,7 @@ struct Edit {
     cap_enabled: bool,
     cap_kbps: u32,
     bitrate_kbps: u32,
+    fps: u32,
     start_minimized: bool,
 }
 
@@ -79,6 +80,7 @@ impl Edit {
             cap_enabled: cfg.bitrate_cap_kbps.is_some(),
             cap_kbps: cfg.bitrate_cap_kbps.unwrap_or(cfg.bitrate_kbps),
             bitrate_kbps: cfg.bitrate_kbps,
+            fps: cfg.target_fps,
             start_minimized: cfg.start_minimized,
         }
     }
@@ -224,18 +226,27 @@ impl HostApp {
         self.cfg.quality_mode = self.edit.quality;
         self.cfg.bitrate_cap_kbps = self.edit.cap();
         self.cfg.bitrate_kbps = self.edit.bitrate_kbps;
+        self.cfg.target_fps = self.edit.fps;
         self.cfg.start_minimized = self.edit.start_minimized;
         self.cfg = std::mem::take(&mut self.cfg).sanitized();
         self.edit = Edit::from(&self.cfg);
         self.cfg.save();
         self.note("settings saved");
 
-        // A running listener can take these two live; the rest need a rebind.
+        // A running listener can take these three live; the rest need a rebind.
         if let Some(net) = &self.net {
             net.command(NetCommand::SetQualityMode(self.cfg.quality_mode));
             net.command(NetCommand::SetBitrateCap(self.cfg.bitrate_cap_kbps));
+            net.command(NetCommand::SetTargetFps(self.cfg.target_fps));
         }
 
+        // The frame rate is deliberately NOT in this condition. This host is
+        // routinely configured from inside a remote session on the machine
+        // itself: adding fps here would tear down the QUIC listener on "Save
+        // and apply" and disconnect the very session doing the configuring,
+        // with nobody at the far end to reconnect it. The rate is a live-only
+        // control — it goes out as `SetTargetFps` above and the pipeline
+        // rebuilds just its encoder, leaving the listener alone.
         if access_changed || port_changed {
             match (self.cfg.remote_access_enabled, self.net.is_some()) {
                 (true, true) => self.stop_listener(true),
@@ -657,6 +668,18 @@ impl HostApp {
                         });
                 });
                 ui.horizontal(|ui| {
+                    ui.label("Max frame rate");
+                    ui.add(
+                        egui::DragValue::new(&mut self.edit.fps)
+                            .range(10..=MAX_TARGET_FPS)
+                            .suffix(" fps"),
+                    );
+                    ui.label(
+                        "(fewer frames per second at the same bitrate means more bits in each \
+                         frame — sharper still text)",
+                    );
+                });
+                ui.horizontal(|ui| {
                     ui.label("Starting bitrate");
                     ui.add(
                         egui::DragValue::new(&mut self.edit.bitrate_kbps)
@@ -781,6 +804,7 @@ mod tests {
             udp_port: 50_000,
             quality_mode: QualityMode::Motion,
             bitrate_cap_kbps: Some(4_000),
+            target_fps: 15,
             start_minimized: true,
             ..HostConfig::default()
         };
@@ -788,6 +812,7 @@ mod tests {
         assert_eq!(e.udp_port, 50_000);
         assert_eq!(e.quality, QualityMode::Motion);
         assert_eq!(e.cap(), Some(4_000));
+        assert_eq!(e.fps, 15);
         assert!(e.start_minimized);
 
         let uncapped = HostConfig {

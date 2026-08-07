@@ -55,6 +55,164 @@ impl EncoderPath {
     }
 }
 
+/// H.264 profiles to try on the output type, most to least desirable.
+///
+/// High buys CABAC and the 8x8 transform over Main. On a desktop — thin,
+/// high-contrast text on flat backgrounds — that is a visible sharpness win at
+/// a fixed bitrate, which is exactly the content we encode. The client decodes
+/// with `CLSID_MSH264DecoderMFT`, which handles High fine, and the profile is
+/// signalled in-band in the SPS, so nothing in the wire protocol changes.
+///
+/// Main is the fallback because it is universally supported: no H.264 decoder
+/// or encoder in existence refuses it. Some drivers (old integrated parts,
+/// virtualised GPUs) will refuse High on `SetOutputType`, and a refused output
+/// type fails the whole candidate MFT — so we walk down rather than die.
+const PROFILE_LADDER: [(i32, &str); 2] = [
+    (eAVEncH264VProfile_High.0, "High"),
+    (eAVEncH264VProfile_Main.0, "Main"),
+];
+
+/// Worst quantizer the encoder is allowed to reach — a quality *floor*, since a
+/// higher QP means a coarser picture. Small text is the first thing to dissolve
+/// when rate control panics on a full-window repaint; capping QP here means the
+/// encoder must spend bits (or drop below the mean, which peak-constrained VBR
+/// permits) rather than let text turn to mush.
+///
+/// Only `MaxQP` is set. A `MinQP` would forbid the encoder from spending *more*
+/// bits than it thinks necessary on an easy frame, which is exactly the saving
+/// VBR already makes on its own — it costs quality and buys nothing.
+const TEXT_QUALITY_FLOOR_MAX_QP: u32 = 32;
+
+/// Peak ceiling for a given mean, under peak-constrained VBR.
+///
+/// 1.5x is headroom for the one frame where the whole window repainted. Higher
+/// ratios keep a scroll marginally sharper but let the burst outrun a
+/// residential uplink, and a burst that queues in the uplink buffer is felt as
+/// input lag — at a ~258 ms RTT the user is already paying for every extra
+/// millisecond of queueing.
+///
+/// This lives in one place because the ceiling must be re-written every time the
+/// mean moves (see `apply_rate_control`): a mean cut by the adaptor with a stale
+/// ceiling left behind means the encoder keeps bursting into a link that just
+/// reported congestion.
+fn peak_bitrate_bps(mean_bps: u32) -> u32 {
+    ((mean_bps as u64 * 3) / 2).min(u32::MAX as u64) as u32
+}
+
+// ---- static refinement: the "MJPEG-like" pass --------------------------------
+//
+// WHY CQP AND NOT A BITRATE BURST
+//
+// Hardware KVMs (PiKVM, TinyPilot) look better than us on static text for one
+// architectural reason: they ship MJPEG, i.e. every frame is coded at a *fixed
+// quality factor* and the bitrate is whatever that quality costs. Our settle
+// IDR, by contrast, is coded inside a bitrate-targeted budget, so on a detailed
+// 1080p screen the rate controller quantizes it down to fit the mean and the
+// "refinement" comes out barely sharper than the frame it replaced.
+//
+// Two ways to fix that were on the table:
+//
+//   (b) stay in PeakConstrainedVBR and raise mean+peak to a big "burst" value
+//       for the one IDR. Reuses `apply_rate_control` and never changes mode,
+//       so it is the gentler thing to do to a vendor MFT — but it asks for the
+//       result indirectly. Rate control still owns the decision, still carries
+//       its HRD buffer state across the switch, and typically *ramps* toward a
+//       new mean rather than granting one enormous frame immediately. It also
+//       has no bound worth the name: the only lever is bits/second, the encoder
+//       decides how many of them land in this particular frame, and if it
+//       decides "all of them" the frame blows past the fragmenter's limit and
+//       is dropped outright (see the ceiling in `session.rs`).
+//
+//   (a) switch rate control to Quality (CQP) with a high `AVEncCommonQuality`
+//       for the one IDR, then switch back. This is MJPEG's own semantics —
+//       quality is the input, size is the output — so it targets the actual
+//       goal instead of a proxy for it. The hardware probe on this class of
+//       machine verified by measured output size (not by return codes) that the
+//       Intel QuickSync MFT accepts mode switches to Quality=3 and back, and
+//       that `AVEncCommonQuality` both takes and reads back.
+//
+// (a) is chosen. The decisive point is bounding: under CQP the cost is bounded
+// *directly* by a QP window (`AVEncVideoMinQP`/`MaxQP`, which the probe found
+// settable and honoured on this MFT despite `IsSupported` saying no), and a QP
+// floor is a hard, encoder-enforced cap on how many bits one frame may eat.
+// Under (b) there is no equivalent — a mean is not a per-frame limit.
+//
+// The two risks of (a) are handled rather than avoided:
+//   * mid-stream mode switch — it is a single property write, applied like
+//     `ForceKeyFrame` immediately before the `ProcessInput` it is meant to
+//     affect, and undone the same way;
+//   * being left in Quality mode, where the adaptor's mean/peak writes are
+//     ignored and it can no longer steer — see `end_static_refinement`, which
+//     the media loop calls unconditionally at the top of the *next* iteration
+//     and which `set_bitrate` also forces.
+//
+// On the Microsoft software encoder every codec-API write is ignored (the probe
+// found CBR and CQP produced byte-identical output); it follows only
+// MF_MT_AVG_BITRATE. There the whole feature is inert, which is the correct
+// degradation: no refinement, and equally no way to get stuck.
+
+/// Lowest `AVEncCommonQuality` a config may ask the refinement frame for.
+/// Below this the frame is not meaningfully better than the stream it
+/// interrupts and the extra IDR is not worth its bytes.
+pub const MIN_STATIC_REFINE_QUALITY: u32 = 50;
+/// Highest `AVEncCommonQuality` a config may ask for. Deliberately not 100:
+/// the quality scale runs toward QP 0, and a 1080p intra frame near QP 0 is
+/// megabytes — more than the fragmenter will carry, so it would be *dropped*
+/// and the user would get no picture at all. The QP window below is the hard
+/// bound; this is the first of the two guards.
+pub const MAX_STATIC_REFINE_QUALITY: u32 = 96;
+/// Default quality for the refinement frame. Near the top of the permitted
+/// range: the whole premise is that the screen is static, so we have the idle
+/// period and the idle bandwidth to spend on one good frame.
+pub const DEFAULT_STATIC_REFINE_QUALITY: u32 = 88;
+
+/// QP the refinement frame may never go below, whatever quality is asked for.
+///
+/// This is the real cost bound. At 1080p, desktop content (flat backgrounds,
+/// thin high-contrast text) codes an intra frame at roughly QP 18 in the low
+/// hundreds of KB; each further QP step down multiplies that. `MinQP` is
+/// enforced by the encoder itself, so unlike a bitrate target it cannot be
+/// "missed" on a hard frame.
+const REFINE_QP_FLOOR: u32 = 18;
+/// QP at the bottom of the permitted quality range — still a clear step better
+/// than the streaming path's `TEXT_QUALITY_FLOOR_MAX_QP` worst case.
+const REFINE_QP_CEILING: u32 = 26;
+/// Slack allowed above the target QP, so an unusually busy screen can give a
+/// little back instead of overshooting the size bound.
+const REFINE_QP_WINDOW: u32 = 4;
+
+/// The codec-API settings one refinement frame is encoded with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefineSettings {
+    /// `AVEncCommonQuality`, clamped into the permitted range.
+    pub quality: u32,
+    /// `AVEncVideoMinQP` — the size bound.
+    pub min_qp: u32,
+    /// `AVEncVideoMaxQP` — how coarse the frame is still allowed to get.
+    pub max_qp: u32,
+}
+
+/// Map a configured quality level onto a bounded QP window.
+///
+/// Pure, so the bound can be tested without an MFT. `quality` is clamped into
+/// `[MIN_STATIC_REFINE_QUALITY, MAX_STATIC_REFINE_QUALITY]` first, so no config
+/// value — hand-edited, zero, or `u32::MAX` — can produce a QP below
+/// [`REFINE_QP_FLOOR`].
+pub fn refine_settings(quality: u32) -> RefineSettings {
+    let quality = quality.clamp(MIN_STATIC_REFINE_QUALITY, MAX_STATIC_REFINE_QUALITY);
+    let span = MAX_STATIC_REFINE_QUALITY - MIN_STATIC_REFINE_QUALITY;
+    let depth = REFINE_QP_CEILING - REFINE_QP_FLOOR;
+    // Linear across the permitted band: MIN quality -> ceiling QP, MAX -> floor.
+    let step = (quality - MIN_STATIC_REFINE_QUALITY) * depth / span;
+    let min_qp = (REFINE_QP_CEILING - step).max(REFINE_QP_FLOOR);
+    let max_qp = (min_qp + REFINE_QP_WINDOW).min(TEXT_QUALITY_FLOOR_MAX_QP);
+    RefineSettings {
+        quality,
+        min_qp,
+        max_qp,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub width: u32,
@@ -106,6 +264,10 @@ pub struct MfH264Encoder {
     cfg: EncoderConfig,
     path: EncoderPath,
     friendly_name: String,
+    /// H.264 profile the MFT actually accepted, from [`PROFILE_LADDER`].
+    /// `"unknown"` until `negotiate_types` settles. Surfaced by `describe()` so
+    /// a human can tell High from Main without attaching a debugger.
+    negotiated_profile: &'static str,
 
     /// Async MFT credits. `need_input` is decremented per `ProcessInput`.
     need_input: u32,
@@ -117,6 +279,24 @@ pub struct MfH264Encoder {
     frame_id: u32,
     last_hns: i64,
     force_key: bool,
+    /// True while the MFT is parked in Quality/CQP mode for one static
+    /// refinement frame. Exists so the restore is idempotent and so
+    /// `set_bitrate` can tell that the adaptor is trying to steer an encoder
+    /// that is currently deaf to mean/peak writes.
+    refine_active: bool,
+    /// Cached SPS/PPS blob, spliced in front of keyframes that lack one.
+    ///
+    /// INVARIANT: this blob must describe the output type *currently installed*
+    /// on the MFT. Any code path that calls `SetOutputType` after streaming has
+    /// begun MUST clear it — `renegotiate_output` does. A Main-profile SPS
+    /// spliced in front of High-profile slices by `normalize_bitstream` is not a
+    /// soft failure or a quality regression: `profile_idc` in the SPS gates
+    /// CABAC and the 8x8 transform, so the decoder parses the slice data with
+    /// the wrong entropy coder and the stream is dead from that keyframe on.
+    ///
+    /// The profile ladder cannot trip this — `seq_header` is populated lazily at
+    /// the first keyframe, strictly after negotiation has settled — but write the
+    /// rule down so it is not reintroduced.
     seq_header: Vec<u8>,
     warned_format: bool,
     started: bool,
@@ -187,6 +367,7 @@ impl MfH264Encoder {
             cfg,
             path,
             friendly_name,
+            negotiated_profile: "unknown",
             need_input: 0,
             have_output: 0,
             out_provides_samples: false,
@@ -195,6 +376,7 @@ impl MfH264Encoder {
             frame_id: 0,
             last_hns: -1,
             force_key: false,
+            refine_active: false,
             seq_header: Vec::new(),
             warned_format: false,
             started: false,
@@ -348,7 +530,16 @@ impl MfH264Encoder {
         }
     }
 
-    fn negotiate_types(&mut self) -> Result<()> {
+    /// Build and install the H.264 output type at `profile`.
+    ///
+    /// The `MF_MT_MPEG2_PROFILE` setter stays `.ok()`-swallowed on purpose: an
+    /// attribute store refusing a `SetUINT32` tells us nothing. `SetOutputType`
+    /// is the real gate — that is the call that either accepts the profile or
+    /// rejects the whole type, so that is the error we propagate.
+    ///
+    /// # Safety
+    /// The transform must be live and not yet streaming (see `negotiate_types`).
+    unsafe fn set_output_type(&self, profile: u32) -> Result<()> {
         let bps = self.cfg.bitrate_kbps.saturating_mul(1000);
         // SAFETY: media types are freshly created; every setter takes static
         // GUID keys and plain scalars.
@@ -368,8 +559,7 @@ impl MfH264Encoder {
                 .ok();
             out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
                 .ok();
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)
-                .ok();
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile).ok();
             out.SetUINT32(
                 &MF_MT_MAX_KEYFRAME_SPACING,
                 self.cfg.fps.max(1) * self.cfg.gop_seconds.max(1),
@@ -381,7 +571,53 @@ impl MfH264Encoder {
             self.transform
                 .SetOutputType(0, &out, 0)
                 .map_err(enc_err("SetOutputType(H264)"))?;
+        }
+        Ok(())
+    }
 
+    fn negotiate_types(&mut self) -> Result<()> {
+        // Walk the profile ladder and keep the first profile the MFT installs.
+        //
+        // Retrying on the *same* transform is safe: `SetOutputType` may be
+        // called repeatedly until MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, which
+        // `try_build` only sends later, and a rejected call leaves the output
+        // type simply unset rather than half-applied. If every profile is
+        // refused we return the last error unchanged, so `new()` still demotes
+        // to the next candidate MFT and ultimately to the software encoder —
+        // never to "media pipeline unavailable" on a machine that had a working
+        // Main-profile encoder all along.
+        let mut last_err = None;
+        for (profile, name) in PROFILE_LADDER {
+            // SAFETY: live transform, not yet streaming (see above).
+            match unsafe { self.set_output_type(profile as u32) } {
+                Ok(()) => {
+                    self.negotiated_profile = name;
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "H.264 {name} profile refused by \"{}\": {e}",
+                        self.friendly_name
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        if self.negotiated_profile != "High" {
+            tracing::warn!(
+                profile = self.negotiated_profile,
+                "encoder fell back from H.264 High profile; without CABAC and the \
+                 8x8 transform, text will be softer at a given bitrate"
+            );
+        }
+
+        // SAFETY: media types are freshly created; every setter takes static
+        // GUID keys and plain scalars.
+        unsafe {
             let inp = MFCreateMediaType().map_err(enc_err("MFCreateMediaType(in)"))?;
             inp.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
             inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ok();
@@ -414,16 +650,113 @@ impl MfH264Encoder {
         Ok(())
     }
 
-    fn apply_codec_settings(&mut self) {
+    /// Write the mean *and* the peak ceiling together.
+    ///
+    /// Under peak-constrained VBR the two are a pair: writing one without the
+    /// other leaves the encoder bursting to a ceiling that no longer relates to
+    /// the rate we asked for. Every site that moves the bitrate goes through
+    /// here so the two cannot drift.
+    fn apply_rate_control(&self, kbps: u32) {
+        let mean = kbps.saturating_mul(1000);
+        self.set_codec_u32(&CODECAPI_AVEncCommonMeanBitRate, mean, "MeanBitRate");
+        self.set_codec_u32(
+            &CODECAPI_AVEncCommonMaxBitRate,
+            peak_bitrate_bps(mean),
+            "MaxBitRate",
+        );
+    }
+
+    /// Park the encoder in Quality/CQP for exactly one frame — the static
+    /// refinement IDR — and force that IDR.
+    ///
+    /// See the design note above [`refine_settings`] for why CQP rather than a
+    /// bitrate burst. The writes land here, immediately before the
+    /// `ProcessInput` they are meant to affect, for the same reason
+    /// `ForceKeyFrame` does: that is the point at which an MFT latches
+    /// per-frame parameters.
+    ///
+    /// THE CALLER MUST CALL [`end_static_refinement`] on its next iteration,
+    /// unconditionally. While this is active the encoder ignores mean/peak
+    /// writes, so the adaptor cannot steer it.
+    ///
+    /// [`end_static_refinement`]: Self::end_static_refinement
+    pub fn begin_static_refinement(&mut self, quality: u32) -> RefineSettings {
+        let s = refine_settings(quality);
         self.set_codec_u32(
             &CODECAPI_AVEncCommonRateControlMode,
-            eAVEncCommonRateControlMode_CBR.0 as u32,
-            "RateControlMode=CBR",
+            eAVEncCommonRateControlMode_Quality.0 as u32,
+            "RateControlMode=Quality",
         );
+        self.set_codec_u32(&CODECAPI_AVEncCommonQuality, s.quality, "CommonQuality");
+        // The bound. Written after the mode so a driver that resets its QP
+        // window on a mode change cannot leave us unbounded.
+        self.set_codec_u32(&CODECAPI_AVEncVideoMinQP, s.min_qp, "MinQP(refine)");
+        self.set_codec_u32(&CODECAPI_AVEncVideoMaxQP, s.max_qp, "MaxQP(refine)");
+        self.refine_active = true;
+        // Pair the IDR with the mode so the two can never be requested apart.
+        self.force_key = true;
+        s
+    }
+
+    /// Undo [`begin_static_refinement`]: back to peak-constrained VBR at the
+    /// bitrate currently in force, and drop the QP floor.
+    ///
+    /// Idempotent — a no-op when no refinement is armed — so the media loop can
+    /// call it every iteration without tracking whether it is needed.
+    ///
+    /// [`begin_static_refinement`]: Self::begin_static_refinement
+    pub fn end_static_refinement(&mut self) {
+        if !self.refine_active {
+            return;
+        }
+        self.refine_active = false;
         self.set_codec_u32(
-            &CODECAPI_AVEncCommonMeanBitRate,
-            self.cfg.bitrate_kbps.saturating_mul(1000),
-            "MeanBitRate",
+            &CODECAPI_AVEncCommonRateControlMode,
+            eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
+            "RateControlMode=PeakConstrainedVBR",
+        );
+        // `cfg.bitrate_kbps` tracks `set_bitrate`, so this restores the rate the
+        // adaptor last chose — never the one the config booted with.
+        self.apply_rate_control(self.cfg.bitrate_kbps);
+        // 0 = no floor, which is the streaming default: outside a refinement we
+        // want the encoder free to spend *fewer* bits on an easy frame.
+        self.set_codec_u32(&CODECAPI_AVEncVideoMinQP, 0, "MinQP");
+        self.set_codec_u32(
+            &CODECAPI_AVEncVideoMaxQP,
+            TEXT_QUALITY_FLOOR_MAX_QP,
+            "MaxQP",
+        );
+    }
+
+    /// True while a refinement frame's settings are installed on the MFT.
+    pub fn refining(&self) -> bool {
+        self.refine_active
+    }
+
+    fn apply_codec_settings(&mut self) {
+        // Peak-constrained VBR, not CBR. CBR hands every frame the same bit
+        // budget whether it is a full-window repaint or an unchanged desktop, so
+        // the repaint — the frame that draws the text — is the one that gets
+        // starved. VBR lets that frame overspend up to the peak and take the
+        // bits back on the idle frames that follow.
+        //
+        // PeakConstrainedVBR specifically: the probe confirmed the Intel MFT
+        // accepts it (as it does Quality/CQP and UnconstrainedVBR, but not
+        // LowDelayVBR or GlobalVBR), and a *constrained* peak is what keeps the
+        // burst inside the uplink's headroom.
+        self.set_codec_u32(
+            &CODECAPI_AVEncCommonRateControlMode,
+            eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
+            "RateControlMode=PeakConstrainedVBR",
+        );
+        self.apply_rate_control(self.cfg.bitrate_kbps);
+        // Quality floor. Best-effort like its neighbours, and deliberately not
+        // gated on `IsSupported`: the probe found the Intel MFT reports NO for
+        // MinQP/MaxQP and then accepts and honours the write anyway.
+        self.set_codec_u32(
+            &CODECAPI_AVEncVideoMaxQP,
+            TEXT_QUALITY_FLOOR_MAX_QP,
+            "MaxQP",
         );
         self.set_codec_bool(&CODECAPI_AVLowLatencyMode, true, "LowLatencyMode");
         self.set_codec_u32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0, "BPictureCount=0");
@@ -432,8 +765,16 @@ impl MfH264Encoder {
             self.cfg.fps.max(1) * self.cfg.gop_seconds.max(1),
             "GOPSize",
         );
-        // 0 = quality-biased, 100 = speed-biased. Remote desktop wants latency.
-        self.set_codec_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 33, "QualityVsSpeed");
+        // 0 = quality-biased, 100 = speed-biased. 33 was biased toward speed,
+        // and on this class of MFT that dial gates the intra-mode search and the
+        // 8x8-vs-4x4 transform decision — which is precisely the machinery High
+        // profile buys us. A hardware encoder at 1080p has the throughput to
+        // spare, so we now pay for High and let the encoder actually use it.
+        self.set_codec_u32(&CODECAPI_AVEncCommonQualityVsSpeed, 10, "QualityVsSpeed");
+        // High *permits* CABAC but plenty of MFTs still default to CAVLC, and
+        // CABAC is where most of High's coding gain actually lives. Best-effort
+        // like its neighbours: a driver that ignores this still encodes.
+        self.set_codec_bool(&CODECAPI_AVEncH264CABACEnable, true, "CABACEnable");
     }
 
     fn begin_streaming(&mut self) -> Result<()> {
@@ -622,17 +963,51 @@ impl MfH264Encoder {
         }
     }
 
+    /// Adopt the MFT's preferred output type after MF_E_TRANSFORM_STREAM_CHANGE.
+    ///
+    /// This path is HOT, not rare: the Intel MFT raises the stream change on the
+    /// *first* `ProcessOutput` of every session, so this runs on every single
+    /// connection. Treat it as part of startup.
+    ///
+    /// The MFT's preferred type carries the MFT's attributes, not ours — adopting
+    /// it wholesale silently drops `MF_MT_AVG_BITRATE` and everything else we set
+    /// in `set_output_type`. That matters twice over: it is what the *software*
+    /// encoder follows (it ignores the codec API entirely), and it is the last
+    /// word for any MFT that reads the media type rather than the codec API. So
+    /// re-stamp our attributes onto the type before installing it, then re-apply
+    /// the codec settings at the CURRENT adaptive bitrate — `self.cfg.bitrate_kbps`
+    /// tracks `set_bitrate`, so a renegotiation mid-session does not resurrect
+    /// the rate the session booted at.
+    ///
+    /// Frame size, frame rate and profile are deliberately left as the MFT chose
+    /// them: the stream change means the MFT is telling us what it will emit, and
+    /// arguing with it here just risks a refused `SetOutputType` on the one path
+    /// every session must pass through.
     fn renegotiate_output(&mut self) -> Result<()> {
-        // SAFETY: live transform; we adopt the MFT's own preferred output type.
+        // SAFETY: live transform; the type came from the MFT itself and every
+        // setter takes static GUID keys and plain scalars.
         unsafe {
             let t = self
                 .transform
                 .GetOutputAvailableType(0, 0)
                 .map_err(enc_err("GetOutputAvailableType"))?;
+            t.SetUINT32(
+                &MF_MT_AVG_BITRATE,
+                self.cfg.bitrate_kbps.saturating_mul(1000),
+            )
+            .ok();
+            t.SetUINT32(
+                &MF_MT_MAX_KEYFRAME_SPACING,
+                self.cfg.fps.max(1) * self.cfg.gop_seconds.max(1),
+            )
+            .ok();
+            t.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 0).ok();
             self.transform
                 .SetOutputType(0, &t, 0)
                 .map_err(enc_err("SetOutputType(renegotiate)"))?;
         }
+        // A new output type resets rate control on some drivers; re-state it.
+        self.apply_codec_settings();
         self.seq_header.clear();
         Ok(())
     }
@@ -653,7 +1028,23 @@ impl MfH264Encoder {
             if t.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, None)
                 .is_ok()
             {
-                tracing::debug!("captured {} byte H.264 sequence header", buf.len());
+                // The SPS is the ground truth for the profile we asked for; an
+                // MFT can accept MF_MT_MPEG2_PROFILE and still emit Main. Log
+                // what is actually on the wire, not what we requested.
+                match sps_profile_idc(&buf) {
+                    Some(idc) => tracing::info!(
+                        requested = self.negotiated_profile,
+                        chroma_format_idc = ?sps_chroma_format_idc(&buf),
+                        "captured {} byte H.264 sequence header; emitted profile_idc = {idc} \
+                         (66=Baseline, 77=Main, 100=High, 244=High 4:4:4), \
+                         chroma_format_idc (0=mono, 1=4:2:0, 2=4:2:2, 3=4:4:4)",
+                        buf.len()
+                    ),
+                    None => tracing::debug!(
+                        "captured {} byte H.264 sequence header (no SPS found in blob)",
+                        buf.len()
+                    ),
+                }
                 self.seq_header = buf;
             }
         }
@@ -739,6 +1130,15 @@ impl MfH264Encoder {
         }
     }
 
+    /// Adopt the frame numbering and timestamp watermark of the encoder being
+    /// replaced, so a mid-session rebuild is invisible to the receiver's
+    /// reassembler — which would otherwise spend `resync_after` frames adopting
+    /// a restart at zero (see shared::transport::reassembly).
+    pub(crate) fn resume_numbering_from(&mut self, prev: &Self) {
+        self.frame_id = prev.frame_id;
+        self.last_hns = prev.last_hns;
+    }
+
     fn set_codec_u32(&self, key: &GUID, value: u32, what: &str) {
         let Some(api) = &self.codec_api else { return };
         let var = variant_u32(value);
@@ -814,11 +1214,21 @@ impl Encoder for MfH264Encoder {
 
     fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
         self.cfg.bitrate_kbps = kbps;
-        self.set_codec_u32(
-            &CODECAPI_AVEncCommonMeanBitRate,
-            kbps.saturating_mul(1000),
-            "MeanBitRate",
-        );
+        // Second line of defence on the refinement restore. In Quality mode the
+        // mean/peak writes below are ignored, so an adaptor cutting the rate
+        // because the link is losing packets would achieve nothing at all.
+        // Steering outranks refinement: leave the mode first, which itself
+        // re-applies rate control at the new `cfg.bitrate_kbps`.
+        if self.refine_active {
+            self.end_static_refinement();
+            return Ok(());
+        }
+        // Mean *and* peak. Writing only the mean under peak-constrained VBR is a
+        // congestion-collapse trap: the adaptor cuts to, say, 1.5 Mbps because
+        // the link is losing packets, and an untouched ceiling lets the encoder
+        // go on bursting to whatever the build-time peak was — straight back
+        // into the congestion that caused the cut.
+        self.apply_rate_control(kbps);
         Ok(())
     }
 
@@ -834,7 +1244,8 @@ impl Encoder for MfH264Encoder {
             "CPU NV12 in"
         };
         format!(
-            "MF H.264 \"{}\" — {} on {} ({})",
+            "MF H.264 {} \"{}\" — {} on {} ({})",
+            self.negotiated_profile,
             self.friendly_name,
             self.path.label(),
             adapter,
@@ -1061,6 +1472,159 @@ pub fn contains_nal(b: &[u8], nal_type: u8) -> bool {
     false
 }
 
+/// `profile_idc` from the first SPS (NAL type 7) in an Annex-B buffer:
+/// 66 = Baseline, 77 = Main, 100 = High. `None` if there is no SPS, or if the
+/// buffer ends before the byte after the NAL header.
+///
+/// This is the *only* trustworthy answer to "which profile is the encoder
+/// actually emitting". `MF_MT_MPEG2_PROFILE` is a request: an MFT may accept the
+/// attribute, accept the output type, and then quietly emit Main anyway. The
+/// bitstream cannot lie — `profile_idc` is what the decoder itself reads.
+pub fn sps_profile_idc(b: &[u8]) -> Option<u8> {
+    let mut i = 0usize;
+    while i + 3 < b.len() {
+        if b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 {
+            if (b[i + 3] & 0x1F) == 7 {
+                // profile_idc is the byte immediately after the NAL header.
+                return b.get(i + 4).copied();
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// `chroma_format_idc` from the first SPS in an Annex-B buffer:
+/// 0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4. `None` if there is no SPS or
+/// it is truncated.
+///
+/// Worth parsing because the profile alone does not answer the question. The
+/// probe had the Intel MFT accept profile 244 (High 4:4:4 Predictive), report
+/// 244 back on `GetOutputAvailableType` — and then emit `chroma_format_idc = 1`,
+/// i.e. plain 4:2:0, which is what makes coloured text fringe. Only the
+/// bitstream tells the truth, so log what the bitstream says.
+///
+/// Profiles below High do not carry the field at all; the standard fixes them at
+/// 4:2:0, so `Some(1)` for those is the correct answer, not a guess.
+pub fn sps_chroma_format_idc(b: &[u8]) -> Option<u8> {
+    /// Profiles whose SPS carries the chroma/bit-depth extension (7.3.2.1.1).
+    const EXTENDED_PROFILES: [u8; 13] =
+        [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+    let rbsp = first_sps_rbsp(b)?;
+    let profile_idc = *rbsp.first()?;
+    if !EXTENDED_PROFILES.contains(&profile_idc) {
+        return Some(1);
+    }
+    // Skip profile_idc, the constraint-flag byte and level_idc.
+    let mut r = BitReader::new(rbsp.get(3..)?);
+    let _seq_parameter_set_id = r.ue()?;
+    let chroma = r.ue()?;
+    if chroma > 3 {
+        return None;
+    }
+    Some(chroma as u8)
+}
+
+/// Payload of the first SPS (NAL type 7) in an Annex-B buffer, with
+/// emulation-prevention bytes removed, starting at `profile_idc`.
+fn first_sps_rbsp(b: &[u8]) -> Option<Vec<u8>> {
+    let mut i = 0usize;
+    while i + 3 < b.len() {
+        if b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 {
+            if (b[i + 3] & 0x1F) == 7 {
+                let start = i + 4;
+                let end = next_start_code(b, start).unwrap_or(b.len());
+                return Some(unescape_rbsp(&b[start..end]));
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Index of the next 3-byte start code at or after `from`.
+fn next_start_code(b: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 2 < b.len() {
+        if b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 {
+            // Report the 4-byte form's leading zero when there is one, so the
+            // NAL payload does not keep a trailing 0x00 that belongs to the
+            // *next* start code.
+            return Some(if i > from && b[i - 1] == 0 { i - 1 } else { i });
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Drop the 0x03 of every `00 00 03` sequence — the escape H.264 inserts so a
+/// payload can never contain a start code.
+fn unescape_rbsp(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut zeros = 0usize;
+    for &byte in b {
+        if zeros >= 2 && byte == 3 {
+            zeros = 0;
+            continue;
+        }
+        if byte == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+        out.push(byte);
+    }
+    out
+}
+
+/// Big-endian bit reader over an RBSP, with the Exp-Golomb decode the SPS needs.
+struct BitReader<'a> {
+    b: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, bit: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<u32> {
+        let byte = *self.b.get(self.bit / 8)?;
+        let shift = 7 - (self.bit % 8);
+        self.bit += 1;
+        Some(((byte >> shift) & 1) as u32)
+    }
+
+    fn read_bits(&mut self, n: u32) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.read_bit()?;
+        }
+        Some(v)
+    }
+
+    /// Unsigned Exp-Golomb, `ue(v)`. `None` on a truncated or absurd code —
+    /// never a panic, since this parses attacker-adjacent encoder output.
+    fn ue(&mut self) -> Option<u32> {
+        let mut leading = 0u32;
+        while self.read_bit()? == 0 {
+            leading += 1;
+            if leading > 31 {
+                return None;
+            }
+        }
+        if leading == 0 {
+            return Some(0);
+        }
+        let rest = self.read_bits(leading)?;
+        Some((1u32 << leading) - 1 + rest)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1666,199 @@ mod tests {
         assert!(contains_nal(&buf, 7));
         assert!(contains_nal(&buf, 5));
     }
+
+    #[test]
+    fn sps_profile_idc_reads_the_first_sps() {
+        // SPS (0x67) first: profile_idc 100 = High.
+        assert_eq!(sps_profile_idc(&[0, 0, 0, 1, 0x67, 100, 0xC0]), Some(100));
+        // 3-byte start code, Main.
+        assert_eq!(sps_profile_idc(&[0, 0, 1, 0x67, 77, 0xC0]), Some(77));
+    }
+
+    #[test]
+    fn sps_profile_idc_skips_a_leading_slice() {
+        let buf = [0, 0, 0, 1, 0x65, 0xAA, 0xBB, 0, 0, 0, 1, 0x67, 66, 0xC0];
+        assert_eq!(sps_profile_idc(&buf), Some(66));
+    }
+
+    #[test]
+    fn sps_profile_idc_without_an_sps_is_none() {
+        // PPS (0x68) and an IDR slice (0x65), but no SPS.
+        let buf = [0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(sps_profile_idc(&buf), None);
+        assert_eq!(sps_profile_idc(&[]), None);
+    }
+
+    #[test]
+    fn sps_profile_idc_truncated_after_nal_header_is_none() {
+        // Buffer ends exactly on the NAL header byte: must be None, not a panic.
+        assert_eq!(sps_profile_idc(&[0, 0, 0, 1, 0x67]), None);
+        assert_eq!(sps_profile_idc(&[0, 0, 1, 0x67]), None);
+    }
+
+    #[test]
+    fn profile_ladder_prefers_high_then_main() {
+        assert_eq!(PROFILE_LADDER[0].1, "High");
+        assert_eq!(PROFILE_LADDER[0].0, 100);
+        assert_eq!(PROFILE_LADDER[PROFILE_LADDER.len() - 1].1, "Main");
+        assert_eq!(PROFILE_LADDER[PROFILE_LADDER.len() - 1].0, 77);
+    }
+
+    /// The regression test for "hardcoding High kills the pipeline": whatever
+    /// this machine's encoder is, if it builds at all it must have settled on a
+    /// real profile rather than failing negotiation outright.
+    #[cfg(windows)]
+    #[test]
+    fn built_encoder_reports_a_negotiated_profile() {
+        let Ok(enc) = MfH264Encoder::new(EncoderConfig::default(), None) else {
+            // CI may have no usable H.264 MFT and no Media Foundation startup.
+            // Nothing to assert; a missing encoder is not this test's subject.
+            return;
+        };
+        let d = enc.describe();
+        assert!(
+            d.contains("High") || d.contains("Main"),
+            "describe() must name the negotiated profile, got: {d}"
+        );
+    }
+
+    /// Synthetic SPS: `profile_idc`, a constraint byte, `level_idc`, then the
+    /// bit-packed `ue(seq_parameter_set_id) ue(chroma_format_idc)`.
+    fn synthetic_sps(profile_idc: u8, packed: u8) -> Vec<u8> {
+        vec![0, 0, 0, 1, 0x67, profile_idc, 0x00, 0x28, packed, 0x00]
+    }
+
+    #[test]
+    fn chroma_format_idc_reads_the_extension() {
+        // ue(0)="1", then ue(1)="010"  -> 1 010 0000
+        let c420 = sps_chroma_format_idc(&synthetic_sps(100, 0b1010_0000));
+        assert_eq!(c420, Some(1));
+        // ue(0)="1", then ue(0)="1"    -> 11 000000
+        let mono = sps_chroma_format_idc(&synthetic_sps(244, 0b1100_0000));
+        assert_eq!(mono, Some(0));
+        // ue(0)="1", then ue(3)="00100" -> 1 00100 00
+        let c444 = sps_chroma_format_idc(&synthetic_sps(244, 0b1001_0000));
+        assert_eq!(c444, Some(3));
+    }
+
+    /// The point of the whole function: High 4:4:4 in the profile field does not
+    /// mean 4:4:4 on the wire.
+    #[test]
+    fn profile_244_can_still_be_420() {
+        let sps = synthetic_sps(244, 0b1010_0000);
+        assert_eq!(sps_profile_idc(&sps), Some(244));
+        assert_eq!(sps_chroma_format_idc(&sps), Some(1));
+    }
+
+    #[test]
+    fn chroma_format_idc_is_implied_420_below_high() {
+        // Main and Baseline do not carry the field; 4:2:0 is fixed by the spec,
+        // so the payload bits after level_idc are irrelevant.
+        assert_eq!(sps_chroma_format_idc(&synthetic_sps(77, 0xFF)), Some(1));
+        assert_eq!(sps_chroma_format_idc(&synthetic_sps(66, 0x00)), Some(1));
+    }
+
+    #[test]
+    fn chroma_format_idc_without_an_sps_is_none() {
+        assert_eq!(sps_chroma_format_idc(&[0, 0, 0, 1, 0x68, 0xCE]), None);
+        assert_eq!(sps_chroma_format_idc(&[]), None);
+        // Truncated right after the NAL header, and after level_idc.
+        assert_eq!(sps_chroma_format_idc(&[0, 0, 0, 1, 0x67]), None);
+        let cut_after_level = sps_chroma_format_idc(&[0, 0, 0, 1, 0x67, 100, 0, 0x28]);
+        assert_eq!(cut_after_level, None);
+    }
+
+    #[test]
+    fn sps_payload_drops_emulation_prevention_bytes() {
+        assert_eq!(unescape_rbsp(&[0, 0, 3, 1, 2]), vec![0, 0, 1, 2]);
+        // 0x03 not preceded by two zeros is ordinary data.
+        assert_eq!(unescape_rbsp(&[0, 3, 1]), vec![0, 3, 1]);
+    }
+
+    #[test]
+    fn sps_payload_stops_at_the_next_nal() {
+        let buf = [0, 0, 0, 1, 0x67, 100, 0, 0x28, 0xA0, 0, 0, 0, 1, 0x68, 0xCE];
+        let rbsp = first_sps_rbsp(&buf).expect("sps present");
+        assert_eq!(rbsp, vec![100, 0, 0x28, 0xA0]);
+    }
+
+    #[test]
+    fn exp_golomb_matches_the_spec_table() {
+        let mut r = BitReader::new(&[0b1010_0110, 0b0101_0000]);
+        assert_eq!(r.ue(), Some(0)); // 1
+        assert_eq!(r.ue(), Some(1)); // 010
+        assert_eq!(r.ue(), Some(2)); // 011
+        assert_eq!(r.ue(), Some(4)); // 00101
+                                     // Nothing but zero bits left: truncated, not a panic.
+        assert_eq!(r.ue(), None);
+    }
+
+    #[test]
+    fn peak_is_one_and_a_half_times_the_mean() {
+        assert_eq!(peak_bitrate_bps(12_000_000), 18_000_000);
+        assert_eq!(peak_bitrate_bps(1_500_000), 2_250_000);
+        assert_eq!(peak_bitrate_bps(0), 0);
+        // The 3x multiply must not wrap at the top of the u32 range.
+        assert_eq!(peak_bitrate_bps(u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn refinement_quality_clamps_into_the_permitted_band() {
+        // Nothing a config file can say escapes the band — including 0, which
+        // means "disabled" upstream and must never reach here as a QP of 26+.
+        assert_eq!(refine_settings(0).quality, MIN_STATIC_REFINE_QUALITY);
+        assert_eq!(refine_settings(u32::MAX).quality, MAX_STATIC_REFINE_QUALITY);
+        assert_eq!(refine_settings(70).quality, 70);
+    }
+
+    #[test]
+    fn refinement_qp_is_bounded_at_both_ends() {
+        // The floor is the cost bound: no quality level may ask for a finer
+        // quantizer, because an intra frame below it stops fitting the
+        // fragmenter (see session::STATIC_REFINE_MAX_BYTES).
+        for q in 0..=120u32 {
+            let s = refine_settings(q);
+            assert!(s.min_qp >= REFINE_QP_FLOOR, "q={q} min_qp={}", s.min_qp);
+            assert!(s.min_qp <= REFINE_QP_CEILING, "q={q} min_qp={}", s.min_qp);
+            assert!(s.max_qp >= s.min_qp, "q={q}");
+            assert!(s.max_qp <= TEXT_QUALITY_FLOOR_MAX_QP, "q={q}");
+        }
+        assert_eq!(refine_settings(MAX_STATIC_REFINE_QUALITY).min_qp, REFINE_QP_FLOOR);
+        assert_eq!(
+            refine_settings(MIN_STATIC_REFINE_QUALITY).min_qp,
+            REFINE_QP_CEILING
+        );
+    }
+
+    #[test]
+    fn refinement_qp_falls_monotonically_with_quality() {
+        // Asking for more quality may never produce a coarser frame.
+        let mut prev = u32::MAX;
+        for q in MIN_STATIC_REFINE_QUALITY..=MAX_STATIC_REFINE_QUALITY {
+            let qp = refine_settings(q).min_qp;
+            assert!(qp <= prev, "q={q}: {qp} > {prev}");
+            prev = qp;
+        }
+    }
+
+    #[test]
+    fn refinement_is_strictly_better_than_the_streaming_floor() {
+        // If the refinement window were not below the streaming path's worst
+        // allowed QP, the whole feature would be a no-op.
+        let s = refine_settings(DEFAULT_STATIC_REFINE_QUALITY);
+        assert!(s.min_qp < TEXT_QUALITY_FLOOR_MAX_QP);
+        assert!(s.max_qp < TEXT_QUALITY_FLOOR_MAX_QP);
+    }
+
+    // The shipped default must itself be expressible; checked at compile time
+    // because it is a relation between constants.
+    const _: () = assert!(DEFAULT_STATIC_REFINE_QUALITY <= MAX_STATIC_REFINE_QUALITY);
+    const _: () = assert!(DEFAULT_STATIC_REFINE_QUALITY >= MIN_STATIC_REFINE_QUALITY);
+    const _: () = assert!(MIN_STATIC_REFINE_QUALITY < MAX_STATIC_REFINE_QUALITY);
+
+    // 51 is the H.264 maximum; a floor at or above it would be inert.
+    const _: () = assert!(TEXT_QUALITY_FLOOR_MAX_QP < 51);
+    const _: () = assert!(TEXT_QUALITY_FLOOR_MAX_QP > 0);
 
     #[test]
     fn encoder_path_labels_are_honest() {

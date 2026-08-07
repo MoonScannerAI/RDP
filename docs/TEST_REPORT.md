@@ -38,6 +38,7 @@ polish is covered inside M1/M3 rows.
 | Normalized-coordinate round-trip at frame corners | `geometry::tests::norm_roundtrip_corners` | PASS | 2026-08-04 |
 | Normalized-coordinate round-trip error bounded | `geometry::tests::norm_roundtrip_error_bounded` | PASS | 2026-08-04 |
 | Letterbox rect calculation | `geometry::tests::fit_rect_letterboxes` | PASS | 2026-08-04 |
+| Exact rect calculation (no scaling, no letterbox) | `geometry::tests::fit_rect_is_exact_when_dst_matches_src` | PASS | 2026-08-04 |
 | Input event validation rejects zero scan code | `input::tests::rejects_zero_scan_code` | PASS | 2026-08-04 |
 | Input event validation accepts normal events | `input::tests::accepts_normal_events` | PASS | 2026-08-04 |
 | Held-input tracking releases everything on demand | `input_state::tests::releases_everything_held` | PASS | 2026-08-04 |
@@ -107,7 +108,7 @@ see [BUILDING.md](BUILDING.md).
 | Bitrate adapts DOWN on real loss and recovers UP when clean | `adaptor_backs_off_on_real_loss_then_recovers` (synthetic ConnStats) | PASS | 2026-08-04 |
 | Adaptor driven by TRUE app-level loss (sees quinn's silent datagram discards) | `session::video_loss` unit tests + wired in host `status_loop` | PASS | 2026-08-04 |
 | Clean link raises bitrate, no false downshift (startup overrun gated) | real loopback: raised to 8750 kbps at 0% loss; `startup_overrun_does_not_spuriously_downshift` | PASS | 2026-08-04 |
-| TextDesktop frame-rate biasing on static screen | encoder-limited (MF MFT exposes no runtime FPS setter) — bitrate range applied only | PARTIAL | 2026-08-04 |
+| Quality mode bitrate ceiling (TextDesktop now highest due to text detail demands) | `quality_mode_switch_applies_ceiling_and_floor` (M5 tests); TextDesktop carries 20,000 kbps ceiling as glyph edges are bitrate-hungry high-frequency detail | PASS | 2026-08-04 |
 
 ## Cross-binary interop (keystone)
 

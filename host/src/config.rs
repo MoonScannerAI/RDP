@@ -27,6 +27,14 @@ pub const MIN_BITRATE_KBPS: u32 = 300;
 /// Highest bitrate the UI will let a user pin the encoder to.
 pub const MAX_BITRATE_KBPS: u32 = 60_000;
 
+/// Lowest frame rate a *config file* may express. Deliberately 1, not the UI's
+/// user-facing floor of 10: this bound only exists to keep a hand-edited `0`
+/// from reaching a divisor. The floor a person can actually pick is a UI
+/// concern and lives in the settings panel.
+pub const MIN_TARGET_FPS: u32 = 1;
+/// Highest frame rate the encoder is ever asked for.
+pub const MAX_TARGET_FPS: u32 = 240;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostConfig {
@@ -57,6 +65,25 @@ pub struct HostConfig {
     ///
     /// [`sanitized`]: HostConfig::sanitized
     pub idle_repeat_ms: u32,
+    /// How long (ms) the desktop must sit unchanged before the encoder is
+    /// given one settle keyframe. `0` disables it. Without this, a still
+    /// screen keeps whatever quality the one frame that drew it happened to
+    /// achieve forever — a repeated frame is just an all-skip P-frame
+    /// reproducing the same picture, so nothing ever re-encodes it sharper.
+    /// One refresh after things settle is what lets static text sharpen.
+    pub static_settle_ms: u32,
+    /// Quality (`AVEncCommonQuality`, 0..=100) the settle keyframe is encoded
+    /// at, in constant-quality mode rather than at the streaming bitrate. `0`
+    /// disables the refinement; the settle keyframe is then still sent, just
+    /// inside the ordinary rate-control budget, which on a detailed 1080p
+    /// screen is what left static text soft in the first place.
+    ///
+    /// Clamped by [`sanitized`] into
+    /// `[MIN_STATIC_REFINE_QUALITY, MAX_STATIC_REFINE_QUALITY]` — the upper
+    /// bound matters: the frame must stay small enough to fragment.
+    ///
+    /// [`sanitized`]: HostConfig::sanitized
+    pub static_refine_quality: u32,
     /// Start with the window hidden in the tray. `--minimized` also sets this
     /// for one run without persisting it.
     pub start_minimized: bool,
@@ -95,6 +122,8 @@ impl Default for HostConfig {
             bitrate_cap_kbps: None,
             gop_seconds: 4,
             idle_repeat_ms: 250,
+            static_settle_ms: crate::session::STATIC_SETTLE_MS,
+            static_refine_quality: crate::mf_encoder::DEFAULT_STATIC_REFINE_QUALITY,
             start_minimized: false,
             uac_clickthrough: false,
             uac_arm_ttl_secs: 20,
@@ -217,7 +246,7 @@ impl HostConfig {
         if self.tcp_port == 0 {
             self.tcp_port = DEFAULT_TCP_PORT;
         }
-        self.target_fps = self.target_fps.clamp(1, 240);
+        self.target_fps = self.target_fps.clamp(MIN_TARGET_FPS, MAX_TARGET_FPS);
         self.gop_seconds = self.gop_seconds.clamp(1, 30);
         // Migration: 33 ms was the old default — ~30 identical full frames a
         // second on a still desktop. Every host that ever started once has it
@@ -228,6 +257,19 @@ impl HostConfig {
             self.idle_repeat_ms = 250;
         }
         self.idle_repeat_ms = self.idle_repeat_ms.min(5_000);
+        // 0 stays 0 (disabled); anything larger is capped at a few seconds so a
+        // hand-edited value can't leave static text unsharpened indefinitely.
+        self.static_settle_ms = self.static_settle_ms.min(5_000);
+        // 0 stays 0 (refinement off). Anything else is clamped into the band
+        // the encoder will honour: too low is a pointless extra IDR, too high
+        // is a frame the fragmenter would refuse — and a refused keyframe is a
+        // frozen picture, not a dropped frame.
+        if self.static_refine_quality != 0 {
+            self.static_refine_quality = self.static_refine_quality.clamp(
+                crate::mf_encoder::MIN_STATIC_REFINE_QUALITY,
+                crate::mf_encoder::MAX_STATIC_REFINE_QUALITY,
+            );
+        }
         self.bitrate_kbps = self.bitrate_kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
         self.bitrate_cap_kbps = self
             .bitrate_cap_kbps
@@ -248,6 +290,8 @@ impl HostConfig {
             idle_repeat_ms: self.idle_repeat_ms,
             force_cpu_convert: false,
             frame_queue_depth: 8,
+            static_settle_ms: self.static_settle_ms,
+            static_refine_quality: self.static_refine_quality,
         }
     }
 }
@@ -306,6 +350,7 @@ mod tests {
             bitrate_kbps: 1,
             bitrate_cap_kbps: Some(u32::MAX),
             display_name: String::new(),
+            static_settle_ms: 99_999,
             ..Default::default()
         }
         .sanitized();
@@ -316,6 +361,28 @@ mod tests {
         assert_eq!(c.bitrate_kbps, MIN_BITRATE_KBPS);
         assert_eq!(c.bitrate_cap_kbps, Some(MAX_BITRATE_KBPS));
         assert!(!c.display_name.is_empty());
+        assert_eq!(c.static_settle_ms, 5_000);
+    }
+
+    #[test]
+    fn static_settle_ms_zero_stays_disabled() {
+        // 0 means "no settle keyframe"; sanitizing must not resurrect it.
+        let c = HostConfig {
+            static_settle_ms: 0,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(c.static_settle_ms, 0);
+    }
+
+    #[test]
+    fn target_fps_is_clamped_to_the_ceiling() {
+        let c = HostConfig {
+            target_fps: 9_999,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(c.target_fps, MAX_TARGET_FPS);
     }
 
     #[test]
@@ -441,10 +508,69 @@ mod tests {
         let c = HostConfig {
             target_fps: 30,
             bitrate_kbps: 4_000,
+            static_settle_ms: 1_200,
             ..Default::default()
         };
         let p = c.pipeline();
         assert_eq!(p.target_fps, 30);
         assert_eq!(p.bitrate_kbps, 4_000);
+        assert_eq!(p.static_settle_ms, 1_200);
+        assert_eq!(
+            p.static_refine_quality,
+            crate::mf_encoder::DEFAULT_STATIC_REFINE_QUALITY
+        );
+
+        // The knob reaches the pipeline, including its "off" value.
+        let off = HostConfig {
+            static_refine_quality: 0,
+            ..Default::default()
+        };
+        assert_eq!(off.pipeline().static_refine_quality, 0);
+    }
+
+    #[test]
+    fn static_refine_quality_is_clamped_but_zero_stays_off() {
+        use crate::mf_encoder::{MAX_STATIC_REFINE_QUALITY, MIN_STATIC_REFINE_QUALITY};
+        let hi = HostConfig {
+            static_refine_quality: 100,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(hi.static_refine_quality, MAX_STATIC_REFINE_QUALITY);
+
+        let lo = HostConfig {
+            static_refine_quality: 3,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(lo.static_refine_quality, MIN_STATIC_REFINE_QUALITY);
+
+        // 0 means "disabled"; sanitizing must not resurrect it.
+        let off = HostConfig {
+            static_refine_quality: 0,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(off.static_refine_quality, 0);
+
+        // A value already in band is left alone.
+        let mid = HostConfig {
+            static_refine_quality: 70,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(mid.static_refine_quality, 70);
+    }
+
+    #[test]
+    fn static_refine_quality_missing_key_defaults_on() {
+        // An older config file predating this option must get the refinement,
+        // not silently miss it.
+        let back: HostConfig = serde_json::from_str(r#"{"udp_port":47990}"#).unwrap();
+        assert_eq!(
+            back.static_refine_quality,
+            crate::mf_encoder::DEFAULT_STATIC_REFINE_QUALITY
+        );
+        assert!(back.static_refine_quality > 0);
     }
 }

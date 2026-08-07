@@ -547,6 +547,21 @@ pub fn effective_cap(host_cap: Option<u32>, client_limit: Option<u32>) -> Option
     }
 }
 
+/// Combine the host's frame rate with a client's `preferred_fps`. Same idiom as
+/// [`effective_cap`]: the client can only narrow, never widen.
+///
+/// `client_pref == 0` is "no preference" (the field is not optional on the
+/// wire), and yields the host's own value.
+pub fn effective_fps(host_fps: u32, client_pref: u32) -> u32 {
+    use crate::config::{MAX_TARGET_FPS, MIN_TARGET_FPS};
+    let host = host_fps.clamp(MIN_TARGET_FPS, MAX_TARGET_FPS);
+    if client_pref == 0 {
+        host
+    } else {
+        host.min(client_pref.clamp(MIN_TARGET_FPS, MAX_TARGET_FPS))
+    }
+}
+
 /// Clamp a bitrate target to a hard cap, if one is set.
 pub fn clamp_to_cap(kbps: u32, cap: Option<u32>) -> u32 {
     match cap {
@@ -653,6 +668,8 @@ pub struct StatusSnapshot {
     pub target_kbps: u32,
     /// Quality mode in force for the live session. `None` when idle.
     pub quality_mode: Option<QualityMode>,
+    /// Frame rate the encoder is actually running at (observed, not requested).
+    pub target_fps: u32,
     /// Delivery/throughput over the most recent matched status window. Honest
     /// per-window figures, distinct from the lifetime counters below.
     pub delivery: WindowDelivery,
@@ -731,6 +748,9 @@ pub enum NetCommand {
     DisconnectClient,
     SetQualityMode(QualityMode),
     SetBitrateCap(Option<u32>),
+    /// Change the encoder's frame rate on the live pipeline. Never restarts the
+    /// listener — see the note in the host UI's `apply_settings`.
+    SetTargetFps(u32),
     Shutdown,
 }
 
@@ -849,6 +869,11 @@ struct Inner {
     pipeline: tokio::sync::Mutex<Option<Arc<HostSession>>>,
     quality: Mutex<QualityMode>,
     bitrate_cap: Mutex<Option<u32>>,
+    /// Frame rate the next (or current) pipeline should run at. Live: changed by
+    /// [`NetCommand::SetTargetFps`] and by a client's `preferred_fps`, and read
+    /// by [`Inner::ensure_pipeline`] so a cold rebuild does not snap back to the
+    /// persisted default.
+    fps: Mutex<u32>,
 }
 
 impl Inner {
@@ -880,7 +905,11 @@ impl Inner {
             *guard = None;
         }
 
-        let cfg = self.cfg.pipeline.clone();
+        let mut cfg = self.cfg.pipeline.clone();
+        // Build from the LIVE frame rate, not the persisted one: the pipeline is
+        // a singleton that outlives any one client, so a cold rebuild after an
+        // fps change would otherwise snap back to whatever host.json says.
+        cfg.target_fps = *self.fps.lock();
         // `HostSession::start` blocks until D3D11 and the encoder are up.
         let session = tokio::task::spawn_blocking(move || HostSession::start(cfg))
             .await
@@ -951,8 +980,10 @@ impl NetService {
         }
 
         let inner = Arc::new(Inner {
+            // These three read `cfg` before it is moved in below; keep them here.
             quality: Mutex::new(cfg.quality_mode),
             bitrate_cap: Mutex::new(cfg.bitrate_cap_kbps),
+            fps: Mutex::new(cfg.pipeline.target_fps.max(1)),
             cfg,
             identity,
             store,
@@ -1090,6 +1121,24 @@ fn handle_command(inner: &Arc<Inner>, cmd: NetCommand) {
         NetCommand::SetBitrateCap(cap) => {
             *inner.bitrate_cap.lock() = cap;
             tracing::info!("bitrate cap set to {cap:?} kbps");
+        }
+        NetCommand::SetTargetFps(fps) => {
+            let fps = effective_fps(fps, 0);
+            *inner.fps.lock() = fps;
+            tracing::info!("target frame rate set to {fps} fps");
+            // The pipeline slot is an async mutex that `ensure_pipeline` holds
+            // across a multi-second blocking `HostSession::start`. Awaiting it
+            // here would stall the accept loop's `select!` — and with it every
+            // incoming connection — so the hand-off is spawned instead. It
+            // re-reads `inner.fps` rather than capturing `fps`, so two commands
+            // racing still converge on the value that was stored last.
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                let want = *inner.fps.lock();
+                if let Some(p) = inner.pipeline.lock().await.as_ref() {
+                    p.set_fps(want);
+                }
+            });
         }
         NetCommand::Shutdown => unreachable!("handled by the accept loop"),
     }
@@ -1488,10 +1537,9 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
         let streaming = streaming.clone();
         let stop = stop.clone();
         let counters = counters.clone();
-        let fps = inner.cfg.pipeline.target_fps.max(1);
         std::thread::Builder::new()
             .name("dd-video-tx".into())
-            .spawn(move || video_pump(conn, frames, pipeline, streaming, stop, counters, fps))
+            .spawn(move || video_pump(conn, frames, pipeline, streaming, stop, counters))
             .ok()
     };
     if video.is_none() {
@@ -1613,14 +1661,9 @@ fn video_pump(
     streaming: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     counters: Arc<VideoCounters>,
-    target_fps: u32,
 ) {
     crate::session::lower_video_thread_priority("video-tx");
     let _timer = TimerResolution::acquire();
-    // Spread a frame's fragments across ~60% of a frame interval so the next
-    // frame is still not due when we finish, i.e. pacing adds smoothing without
-    // adding steady-state latency.
-    let pace_window = Duration::from_micros(1_000_000 / target_fps.max(1) as u64) * 3 / 5;
     let start = Instant::now();
     let mut idr = RateLimiter::new(KEYFRAME_MIN_INTERVAL_MS);
 
@@ -1648,6 +1691,15 @@ fn video_pump(
                 pipeline.request_keyframe();
             }
         }
+
+        // Spread a frame's fragments across ~60% of a frame interval so the next
+        // frame is still not due when we finish, i.e. pacing adds smoothing
+        // without adding steady-state latency. Recomputed per frame (one relaxed
+        // atomic load) because the frame rate is live: at 15 fps the window is
+        // 40 ms rather than 10 ms, which is exactly the extra smoothing a
+        // residential uplink needs to get a big IDR out without tail-dropping.
+        let pace_window =
+            Duration::from_micros(1_000_000 / pipeline.active_fps().max(1) as u64) * 3 / 5;
 
         let mtu = match conn.max_datagram_size() {
             Some(m) => m,
@@ -1819,6 +1871,15 @@ async fn control_loop(
                      fps, {quality_mode:?}; host sends {w}x{h}"
                 );
                 *inner.quality.lock() = quality_mode;
+                // The client's preference narrows the host's frame rate, never
+                // widens it — same contract as `BitrateLimit` (`effective_cap`).
+                // The host side of that is the LIVE value, not `cfg.pipeline`:
+                // an operator who lowered the rate mid-session must not have it
+                // undone by the next StartStream.
+                let host_fps = *inner.fps.lock();
+                let fps = effective_fps(host_fps, preferred_fps);
+                *inner.fps.lock() = fps;
+                pipeline.set_fps(fps);
                 {
                     let mut a = adaptor.lock();
                     a.set_mode(quality_mode, now);
@@ -1830,7 +1891,12 @@ async fn control_loop(
                 let cfg = ControlMsg::VideoConfig {
                     width: w,
                     height: h,
-                    fps: inner.cfg.pipeline.target_fps,
+                    // The intended rate, not `pipeline.active_fps()`: `set_fps`
+                    // lands on the media thread on its next pass (up to one
+                    // frame away), so reading it back here would still report
+                    // the old value. `active_fps()` is for the status path,
+                    // where observed truth is what is wanted.
+                    fps,
                     bitrate_kbps: adaptor.lock().current(),
                     codec: Codec::H264,
                 };
@@ -2031,12 +2097,16 @@ async fn status_loop(
         }
 
         let injected = pipeline.input_events_injected();
+        // Observed, not requested: a rebuild that failed must not be reported as
+        // if it had taken.
+        let active_fps = pipeline.active_fps();
         inner.status_mut(|s| {
             s.transport = transport;
             s.pipeline = merged;
             s.pipeline_state = Some(format!("{state:?}"));
             s.secure_desktop = paused;
             s.quality_mode = Some(quality_mode);
+            s.target_fps = active_fps;
             s.delivery = delivery;
             s.frames_sent = sent;
             s.bytes_sent = bytes;
@@ -2793,6 +2863,19 @@ mod tests {
         assert_eq!(clamp_to_cap(8_000, Some(3_000)), 3_000);
         assert_eq!(clamp_to_cap(2_000, Some(3_000)), 2_000);
         assert_eq!(clamp_to_cap(8_000, None), 8_000);
+    }
+
+    #[test]
+    fn client_fps_narrows_but_never_widens() {
+        assert_eq!(effective_fps(60, 0), 60, "0 is 'no preference'");
+        assert_eq!(effective_fps(60, 30), 30, "client narrows");
+        assert_eq!(effective_fps(30, 60), 30, "client cannot widen");
+        assert_eq!(effective_fps(60, 1), 1);
+        assert_eq!(
+            effective_fps(60, 99_999),
+            60,
+            "an absurd preference is clamped, then still cannot widen"
+        );
     }
 
     #[test]

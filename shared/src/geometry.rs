@@ -58,4 +58,10 @@ mod tests {
         assert_eq!((x, w), (0, 1000));
         assert!(y > 0 && h < 1000);
     }
+
+    #[test]
+    fn fit_rect_is_exact_when_dst_matches_src() {
+        // Pins the exact 1:1 case — no letterbox, no scaling, no resample.
+        assert_eq!(fit_rect(1920, 1080, 1920, 1080), (0, 0, 1920, 1080));
+    }
 }

@@ -29,6 +29,30 @@ pub struct ClientConfig {
     /// never shipped over the wire by accident. Turning it on is an explicit,
     /// informed choice (the toolbar toggle spells out the consequence).
     pub capture_in_background: bool,
+    /// Client-requested frame rate ceiling. `0` means "Auto — follow whatever
+    /// the host is already running at". The host only ever lowers its rate to
+    /// match this (never raises it), so `0` reproduces today's behaviour
+    /// exactly — an old config that has never heard of this field must not
+    /// silently change the frame rate.
+    pub preferred_fps: u32,
+    /// Snap the window to a fixed integer scale with the host desktop as soon
+    /// as its video format is learned, so text renders pixel-exact instead of
+    /// being scaled. `0` = off, `1` = snap to 1:1, `2` = snap to 2x. Default
+    /// **0 (off)**: auto-resizing a user's window without being asked is a
+    /// bigger surprise than leaving them at a fractional scale.
+    ///
+    /// Superseded `auto_snap_1to1: bool`, which is no longer written but is
+    /// still read for one-time migration in `sanitized()` below: a config
+    /// saved by an older build with `auto_snap_1to1: true` and no
+    /// `auto_snap_scale` field must keep behaving like "snap to 1:1", not
+    /// silently revert to off.
+    #[serde(default)]
+    pub auto_snap_scale: u32,
+    /// Deprecated, kept only so old config files still parse and migrate (see
+    /// `sanitized()`). No longer read anywhere else and never written by this
+    /// build — `auto_snap_scale` is the source of truth going forward.
+    #[serde(default)]
+    auto_snap_1to1: bool,
 }
 
 impl Default for ClientConfig {
@@ -38,10 +62,16 @@ impl Default for ClientConfig {
             udp_port: DEFAULT_UDP_PORT,
             tcp_port: DEFAULT_TCP_PORT,
             display_name: String::new(),
-            quality_mode: QualityMode::Balanced,
+            // This is a remote *desktop*, so text is the primary workload. TextDesktop now carries
+            // the highest bitrate ceiling because sharp glyph edges are high-frequency detail and
+            // a low ceiling destroys them. Balanced caps at 15000 kbps, TextDesktop at 20000.
+            quality_mode: QualityMode::TextDesktop,
             show_diagnostics: false,
             start_fullscreen: false,
             capture_in_background: false,
+            preferred_fps: 0,
+            auto_snap_scale: 0,
+            auto_snap_1to1: false,
         }
     }
 }
@@ -104,6 +134,26 @@ impl ClientConfig {
             self.tcp_port = DEFAULT_TCP_PORT;
         }
         self.host_address.truncate(255);
+        // 0 is the sentinel for "Auto" and must pass through untouched; any
+        // other hand-edited value gets pulled into a sane range.
+        if self.preferred_fps != 0 {
+            self.preferred_fps = self.preferred_fps.clamp(5, 240);
+        }
+        // One-time migration: a config written before integer scales existed
+        // has `auto_snap_1to1: true` and no opinion on `auto_snap_scale` (it
+        // deserializes to the field default, 0). Carry the old preference
+        // forward as "snap to 1:1" rather than silently turning auto-snap
+        // off. A config that already has a nonzero `auto_snap_scale` (this
+        // build or a newer one) is left alone — that field is now the source
+        // of truth.
+        if self.auto_snap_scale == 0 && self.auto_snap_1to1 {
+            self.auto_snap_scale = 1;
+        }
+        // Never offer a scale this build doesn't know how to snap to (a
+        // hand-edited or future-written file could set anything).
+        if self.auto_snap_scale > 3 {
+            self.auto_snap_scale = 0;
+        }
         self
     }
 }
@@ -142,6 +192,46 @@ mod tests {
         // A config written before background capture existed must not silently
         // opt the user into shipping their local keystrokes to the host.
         assert!(!back.capture_in_background);
+        // Same for fps: a config written before this field existed must mean
+        // "Auto", never a silent frame-rate change.
+        assert_eq!(back.preferred_fps, 0);
+        // A config written before integer-scale snapping existed must not
+        // silently turn it on.
+        assert_eq!(back.auto_snap_scale, 0);
+    }
+
+    #[test]
+    fn old_auto_snap_1to1_true_migrates_to_scale_one() {
+        // A config saved by the pre-integer-scale build: `auto_snap_1to1:
+        // true`, no `auto_snap_scale` field at all. Losing that preference on
+        // upgrade would be exactly the kind of silent behaviour change this
+        // field exists to avoid. The migration lives in `sanitized()`, which
+        // `load()` always runs — mirror that here rather than asserting on
+        // the raw deserialize.
+        let back: ClientConfig =
+            serde_json::from_str(r#"{"host_address":"pc.lan","auto_snap_1to1":true}"#).unwrap();
+        assert_eq!(back.sanitized().auto_snap_scale, 1);
+    }
+
+    #[test]
+    fn explicit_auto_snap_scale_wins_over_the_old_flag() {
+        // A newer file that already set `auto_snap_scale` (even alongside a
+        // stale `auto_snap_1to1`) must not be overridden by the migration.
+        let back: ClientConfig = serde_json::from_str(
+            r#"{"host_address":"pc.lan","auto_snap_1to1":true,"auto_snap_scale":2}"#,
+        )
+        .unwrap();
+        assert_eq!(back.sanitized().auto_snap_scale, 2);
+    }
+
+    #[test]
+    fn auto_snap_scale_above_three_is_reset_to_off() {
+        let c = ClientConfig {
+            auto_snap_scale: 9,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(c.auto_snap_scale, 0);
     }
 
     #[test]
@@ -154,5 +244,32 @@ mod tests {
         .sanitized();
         assert_eq!(c.udp_port, DEFAULT_UDP_PORT);
         assert_eq!(c.tcp_port, DEFAULT_TCP_PORT);
+    }
+
+    #[test]
+    fn preferred_fps_zero_means_auto_and_is_never_clamped() {
+        let c = ClientConfig {
+            preferred_fps: 0,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(c.preferred_fps, 0);
+    }
+
+    #[test]
+    fn preferred_fps_is_clamped_to_a_sane_range() {
+        let low = ClientConfig {
+            preferred_fps: 1,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(low.preferred_fps, 5);
+
+        let high = ClientConfig {
+            preferred_fps: 1_000,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(high.preferred_fps, 240);
     }
 }

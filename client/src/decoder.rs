@@ -43,6 +43,31 @@ use directdesk_shared::video::EncodedFrame;
 /// always does). `width`/`height` are the *display* dimensions, which may be
 /// smaller than the coded plane — that is how 1088-tall H.264 output gets
 /// cropped back to 1080.
+///
+/// # Chroma upsampling geometry (MPEG-2 / "left-sited")
+///
+/// H.264 with no `chroma_sample_loc_type` in the VUI — which is what this
+/// pipeline produces — means chroma sample `(k, j)` sits **co-sited with the
+/// even luma column `2k`** and **midway between luma rows `2j` and `2j+1`**.
+/// We reconstruct with bilinear interpolation on exactly that grid:
+///
+/// * Horizontal: luma column `2k` is the chroma sample `k` itself (weight 1);
+///   luma column `2k+1` is halfway between `k` and `k+1` → `0.5 / 0.5`.
+/// * Vertical: chroma row `j` lives at luma-row coordinate `2j + 0.5`, so luma
+///   row `r` maps to chroma coordinate `r/2 - 0.25`. Luma row `2k` lands at
+///   `k - 0.25` → `0.75 * C[k] + 0.25 * C[k-1]`; luma row `2k+1` lands at
+///   `k + 0.25` → `0.75 * C[k] + 0.25 * C[k+1]`.
+/// * Edges: the out-of-range neighbour is clamped to the nearest existing
+///   sample/row, which degenerates the blend to weight 1 on the edge sample.
+///
+/// The previous implementation replicated chroma nearest-neighbour in both
+/// axes, which desaturated 1px coloured glyph stems *and* shifted them half a
+/// pixel left of the luma stroke they belong to.
+///
+/// Interpolation stays in integers: the vertical `0.75/0.25` blend is kept in
+/// Q2 (value × 4) per output row, and the horizontal blend promotes it to Q3
+/// (value × 8), which the Q8 colour matrix absorbs by shifting 11 instead of 8.
+/// For a constant chroma field this is bit-identical to the old code.
 pub fn nv12_to_rgba(
     y_plane: &[u8],
     uv_plane: &[u8],
@@ -73,28 +98,71 @@ pub fn nv12_to_rgba(
         )));
     }
 
+    let cw = width.div_ceil(2); // chroma samples per row
+    let uv_row_bytes = cw * 2; // interleaved U,V
+    let last_c = cw - 1;
+    let last_c_row = uv_rows - 1;
+
     let mut out = vec![0u8; width * height * 4];
+    // Scratch for the vertically-blended chroma row, in Q2 (value * 4).
+    // Allocated once and reused for every output row.
+    let mut cblend = vec![0i32; uv_row_bytes];
+
     for row in 0..height {
         let y_row = &y_plane[row * stride..row * stride + width];
-        let uv_base = (row / 2) * stride;
-        let uv_row = &uv_plane[uv_base..uv_base + width.div_ceil(2) * 2];
+
+        // Vertical 0.75 / 0.25 blend, done once per output row.
+        let k = row / 2;
+        let far_row = if row % 2 == 0 {
+            k.saturating_sub(1) // clamp above the first chroma row
+        } else {
+            (k + 1).min(last_c_row) // clamp below the last chroma row
+        };
+        let near = &uv_plane[k * stride..k * stride + uv_row_bytes];
+        let far = &uv_plane[far_row * stride..far_row * stride + uv_row_bytes];
+        for i in 0..uv_row_bytes {
+            cblend[i] = 3 * near[i] as i32 + far[i] as i32;
+        }
+
         let out_row = &mut out[row * width * 4..(row + 1) * width * 4];
-
-        for (col, px) in out_row.chunks_exact_mut(4).enumerate() {
-            let c = y_row[col] as i32 - 16;
-            // 4:2:0 — one chroma pair per 2x2 luma block.
-            let uv = col & !1;
-            let d = uv_row[uv] as i32 - 128;
-            let e = uv_row[uv + 1] as i32 - 128;
-
-            let luma = 298 * c;
-            px[0] = clamp_u8((luma + 459 * e + 128) >> 8);
-            px[1] = clamp_u8((luma - 55 * d - 136 * e + 128) >> 8);
-            px[2] = clamp_u8((luma + 541 * d + 128) >> 8);
-            px[3] = 255;
+        // One chroma sample feeds a pair of output pixels: the even column
+        // takes it straight, the odd column averages it with the next one.
+        let mut pairs = out_row.chunks_exact_mut(8);
+        for (kx, pair) in pairs.by_ref().enumerate() {
+            let kx1 = (kx + 1).min(last_c);
+            let (u0, v0) = (cblend[kx * 2], cblend[kx * 2 + 1]);
+            let (u1, v1) = (cblend[kx1 * 2], cblend[kx1 * 2 + 1]);
+            let (even, odd) = pair.split_at_mut(4);
+            write_px(even, y_row[kx * 2], u0 * 2, v0 * 2);
+            write_px(odd, y_row[kx * 2 + 1], u0 + u1, v0 + v1);
+        }
+        // Odd display width: the trailing pixel is an even (co-sited) column.
+        let rem = pairs.into_remainder();
+        if !rem.is_empty() {
+            write_px(
+                rem,
+                y_row[width - 1],
+                cblend[last_c * 2] * 2,
+                cblend[last_c * 2 + 1] * 2,
+            );
         }
     }
     Ok(out)
+}
+
+/// Q8 limited-range BT.709 matrix, taking chroma in Q3 (value * 8).
+///
+/// Identical to `(298*c + 459*e + 128) >> 8` when the chroma is a whole
+/// number: everything is scaled by 8 and the shift grows from 8 to 11.
+#[inline(always)]
+fn write_px(px: &mut [u8], y: u8, u_q3: i32, v_q3: i32) {
+    let d = u_q3 - 128 * 8;
+    let e = v_q3 - 128 * 8;
+    let luma = 298 * 8 * (y as i32 - 16);
+    px[0] = clamp_u8((luma + 459 * e + 1024) >> 11);
+    px[1] = clamp_u8((luma - 55 * d - 136 * e + 1024) >> 11);
+    px[2] = clamp_u8((luma + 541 * d + 1024) >> 11);
+    px[3] = 255;
 }
 
 #[inline(always)]
@@ -1230,22 +1298,126 @@ mod tests {
         );
     }
 
+    /// The Q8 integer matrix as it was before bilinear upsampling — the
+    /// reference for "a whole-numbered chroma sample must convert exactly".
+    fn ref_rgb(yv: u8, u: i32, v: i32) -> (u8, u8, u8) {
+        let luma = 298 * (yv as i32 - 16);
+        let (d, e) = (u - 128, v - 128);
+        (
+            clamp_u8((luma + 459 * e + 128) >> 8),
+            clamp_u8((luma - 55 * d - 136 * e + 128) >> 8),
+            clamp_u8((luma + 541 * d + 128) >> 8),
+        )
+    }
+
     #[test]
-    fn chroma_is_shared_across_each_2x2_block() {
-        // One red 2x2 block, rest black — proves the 4:2:0 subsampling index.
-        let (y, uv) = synth_nv12(4, 4, 4, |x, y| {
-            if x < 2 && y < 2 {
-                (63, 102, 240)
+    fn uniform_chroma_is_bit_identical_to_the_unfiltered_matrix() {
+        // Interpolating a constant field returns the constant, so a flat image
+        // must round-trip to exactly the same RGB as the old nearest code.
+        for (yv, u, v) in [
+            (16u8, 128i32, 128i32),
+            (235, 128, 128),
+            (63, 102, 240),
+            (173, 42, 26),
+            (32, 240, 118),
+            (128, 200, 60),
+        ] {
+            let (y, uv) = synth_nv12(6, 6, 16, |_, _| (yv, u as u8, v as u8));
+            let rgba = nv12_to_rgba(&y, &uv, 6, 6, 16).unwrap();
+            let want = ref_rgb(yv, u, v);
+            for row in 0..6 {
+                for col in 0..6 {
+                    let (r, g, b, a) = px(&rgba, 6, col, row);
+                    assert_eq!((r, g, b), want, "({col},{row}) Y{yv} U{u} V{v}");
+                    assert_eq!(a, 255);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_chroma_is_left_sited_and_bilinear() {
+        // Chroma columns k = 0..3 cover x = 0,2,4,6. V steps 128 -> 240 at k=2.
+        // Expected V per luma column: co-sited on even, midpoint on odd.
+        let width = 8;
+        let (y, uv) = synth_nv12(width, 2, 16, |x, _| {
+            if x < 4 {
+                (128, 128, 128)
             } else {
-                (16, 128, 128)
+                (128, 128, 240)
             }
         });
-        let rgba = nv12_to_rgba(&y, &uv, 4, 4, 4).unwrap();
-        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-            let (r, _, _, _) = px(&rgba, 4, x, y);
-            assert!(r > 200, "({x},{y}) should be red, got r={r}");
+        let rgba = nv12_to_rgba(&y, &uv, width, 2, 16).unwrap();
+        // k:      0    0/1  1    1/2  2    2/3  3    3/clamp
+        let want_v = [128, 128, 128, 184, 240, 240, 240, 240];
+        for (col, v) in want_v.into_iter().enumerate() {
+            let (r, g, b, _) = px(&rgba, width, col, 0);
+            assert_eq!((r, g, b), ref_rgb(128, 128, v), "column {col}");
         }
-        assert_eq!(px(&rgba, 4, 3, 3), (0, 0, 0, 255));
+    }
+
+    #[test]
+    fn a_sharp_chroma_edge_gets_an_intermediate_column() {
+        // The improvement: the old nearest code produced a hard 2px step with
+        // no transitional sample. Column 3 must now sit strictly between its
+        // neighbours instead of matching column 2 exactly.
+        let (y, uv) = synth_nv12(8, 2, 16, |x, _| {
+            if x < 4 {
+                (128, 128, 128)
+            } else {
+                (128, 128, 240)
+            }
+        });
+        let rgba = nv12_to_rgba(&y, &uv, 8, 2, 16).unwrap();
+        let r_at = |x| px(&rgba, 8, x, 0).0;
+        let (flat, mid, full) = (r_at(2), r_at(3), r_at(4));
+        assert!(
+            flat < mid && mid < full,
+            "expected an intermediate boundary column, got {flat} < {mid} < {full}"
+        );
+    }
+
+    #[test]
+    fn vertical_chroma_uses_quarter_weights_and_clamps_at_the_edges() {
+        // Chroma rows j = 0,1 sit midway between luma rows (0,1) and (2,3).
+        // V steps 128 -> 240 at j=1.
+        let (y, uv) = synth_nv12(2, 4, 8, |_, row| {
+            if row < 2 {
+                (128, 128, 128)
+            } else {
+                (128, 128, 240)
+            }
+        });
+        let rgba = nv12_to_rgba(&y, &uv, 2, 4, 8).unwrap();
+        // row0: clamped to C0 -> 128        row1: .75*C0 + .25*C1 -> 156
+        // row2: .75*C1 + .25*C0 -> 212      row3: clamped to C1 -> 240
+        let want_v = [128, 156, 212, 240];
+        for (row, v) in want_v.into_iter().enumerate() {
+            for col in 0..2 {
+                let (r, g, b, _) = px(&rgba, 2, col, row);
+                assert_eq!((r, g, b), ref_rgb(128, 128, v), "({col},{row})");
+            }
+        }
+    }
+
+    #[test]
+    fn odd_dimensions_clamp_instead_of_reading_out_of_bounds() {
+        // 5x3: the trailing luma column/row have no right/bottom chroma
+        // neighbour, so the blend must degenerate to the edge sample.
+        let (y, uv) = synth_nv12(5, 3, 8, |x, _| {
+            if x < 2 {
+                (128, 128, 128)
+            } else {
+                (128, 128, 240)
+            }
+        });
+        let rgba = nv12_to_rgba(&y, &uv, 5, 3, 8).unwrap();
+        assert_eq!(rgba.len(), 5 * 3 * 4);
+        for row in 0..3 {
+            // Column 4 is co-sited with the last chroma sample (k=2).
+            let (r, g, b, _) = px(&rgba, 5, 4, row);
+            assert_eq!((r, g, b), ref_rgb(128, 128, 240), "row {row}");
+        }
     }
 
     #[test]

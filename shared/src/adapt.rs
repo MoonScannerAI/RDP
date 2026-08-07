@@ -25,9 +25,18 @@ impl AdaptConfig {
     pub fn for_mode(mode: QualityMode) -> Self {
         match mode {
             QualityMode::TextDesktop => Self {
-                floor_kbps: 1_000,
-                ceiling_kbps: 8_000,
-                start_kbps: 4_000,
+                // Text is the demanding case, not the cheap one: sharp glyph edges are
+                // high-frequency detail and a low ceiling destroys them. A static desktop
+                // already costs almost nothing (capture suppresses unchanged frames), so a
+                // high ceiling is only actually spent during scrolls and redraws — which is
+                // exactly when text needs the bits. The ceiling is deliberately above what a
+                // typical residential uplink sustains because it is not meant to be the binding
+                // constraint — the AIMD adaptor plus the host's bitrate cap measure the real
+                // link and back off, whereas a low ceiling is a guess that binds even on a
+                // good day.
+                floor_kbps: 1_500,
+                ceiling_kbps: 28_000,
+                start_kbps: 12_000,
                 step_kbps: 500,
                 raise_after_ms: 3_000,
                 decrease_factor: 0.7,

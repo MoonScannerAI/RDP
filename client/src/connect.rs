@@ -57,7 +57,12 @@ impl Default for StreamCaps {
         Self {
             max_width: 3840,
             max_height: 2160,
-            preferred_fps: 60,
+            // 0 = "no preference, host decides". The host now honours this
+            // field (clamped so a client can only *lower* its rate, never
+            // raise it); a hardcoded 60 here would be a lie dressed up as a
+            // preference — indistinguishable from the user actually asking
+            // for 60. 0 preserves today's behaviour bit-for-bit.
+            preferred_fps: 0,
         }
     }
 }
@@ -164,6 +169,14 @@ impl ConnectSupervisor {
     /// reconnecting). Cleared by [`disconnect`](Self::disconnect).
     pub fn is_connected(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// Update the fps the *next* `connect()` carries (a fresh connect, or a
+    /// reconnect after a drop). Does not touch a currently-live connection —
+    /// applying a choice live is the UI's job, by re-sending `StartStream`
+    /// directly on the session's control channel.
+    pub fn set_preferred_fps(&mut self, fps: u32) {
+        self.caps.preferred_fps = fps;
     }
 
     /// Spawn `run_client` for `request`, cancelling any prior attempt first so a

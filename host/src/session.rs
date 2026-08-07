@@ -24,14 +24,16 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use directdesk_shared::input::InputEvent;
 use directdesk_shared::stats::ConnStats;
 use directdesk_shared::traits::{Encoder, InputInjector};
-use directdesk_shared::video::EncodedFrame;
+use directdesk_shared::video::{EncodedFrame, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME};
 use directdesk_shared::{Error, Result};
 use parking_lot::Mutex;
 
 use crate::capture::{CaptureState, DdaCapture};
 use crate::convert::{bgra_to_nv12, GpuConverter};
 use crate::input_inject::WinInjector;
-use crate::mf_encoder::{EncoderConfig, FrameInput, MfH264Encoder};
+use crate::mf_encoder::{
+    EncoderConfig, FrameInput, MfH264Encoder, MAX_STATIC_REFINE_QUALITY, MIN_STATIC_REFINE_QUALITY,
+};
 use crate::mfinit::MfThread;
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,91 @@ pub struct SessionConfig {
     pub force_cpu_convert: bool,
     /// Depth of the outbound encoded-frame queue. Oldest is dropped when full.
     pub frame_queue_depth: usize,
+    /// How long the desktop must sit unchanged before the encoder is given one
+    /// settle keyframe (see `media_thread`). 0 disables the settle entirely.
+    ///
+    /// Without it, a still screen is frozen at whatever quality the one frame
+    /// that drew it happened to achieve — if that frame landed mid-scroll with
+    /// rate control still paying off the burst, the text stays soft forever,
+    /// because a repeated frame is just an all-skip P-frame reproducing the
+    /// same picture. One refresh after things settle is what lets text sharpen.
+    pub static_settle_ms: u32,
+    /// `AVEncCommonQuality` (0..=100) the one settle keyframe of each idle
+    /// period is encoded at, in constant-quality mode instead of at the
+    /// streaming bitrate. `0` disables the refinement — the settle keyframe is
+    /// still sent, just inside the ordinary rate-control budget.
+    ///
+    /// This is the MJPEG-shaped part of the design: while the screen is static
+    /// we have the whole idle period and the idle bandwidth, so we buy one
+    /// frame at a fixed quality rather than at a fixed price. See the design
+    /// note in `mf_encoder` above `refine_settings`.
+    pub static_refine_quality: u32,
+}
+
+/// How long the desktop must sit unchanged before the encoder is given one
+/// settle keyframe (see `media_thread`). 0 disables the settle entirely.
+///
+/// Expressed in time, not in a count of repeat frames, so it means the same
+/// thing at 15 fps as at 60 and does not move when `idle_repeat_ms` is tuned.
+/// ~700 ms is comfortably longer than a scroll or a window drag — those keep
+/// producing changed frames, so they never reach the settle — but short enough
+/// that a user who stops to read has sharp text before they have finished
+/// finding their place on the line.
+pub const STATIC_SETTLE_MS: u32 = 700;
+
+/// Smallest QUIC datagram we are willing to assume when sizing the refinement
+/// frame. Real paths negotiate more; assuming less than we get is the safe
+/// direction, because the number below is a *ceiling* on how big a frame we are
+/// prepared to emit.
+const MIN_ASSUMED_DATAGRAM: usize = 1_200;
+
+/// The largest encoded frame the fragmenter will carry at that datagram size.
+///
+/// `shared::video::fragment*` refuses any frame needing more than
+/// [`MAX_FRAGS_PER_FRAME`] datagrams. A refused *keyframe* is not a dropped
+/// frame, it is a frozen picture: `host::net` logs it, latches
+/// `oversized_keyframe`, and hands the adaptor a full congestion event, which
+/// cuts the bitrate. An unbounded refinement frame would therefore produce no
+/// picture *and* make the stream worse — exactly self-defeating.
+pub const FRAGMENTER_FRAME_LIMIT_BYTES: usize =
+    MAX_FRAGS_PER_FRAME as usize * (MIN_ASSUMED_DATAGRAM - FRAG_HEADER_LEN);
+
+/// Ceiling we hold a refinement frame to: 40% of what the fragmenter would
+/// physically accept.
+///
+/// Not 100%, for two reasons. The frame also has to *fit through a residential
+/// uplink* in one pacing window without causing the loss that would make the
+/// adaptor back off — a ~240 KB burst is already ~2 Mbit on the wire. And the
+/// margin leaves room for FEC parity and for a path whose datagram size is
+/// smaller than the estimate. Exceeding this is not fatal on the frame that
+/// does it (we cannot un-encode it) — it lowers the quality of every later
+/// refinement, see [`adapt_refine_quality`].
+pub const STATIC_REFINE_MAX_BYTES: usize = FRAGMENTER_FRAME_LIMIT_BYTES * 2 / 5;
+
+/// How much quality one oversized refinement costs the next one.
+const REFINE_QUALITY_STEP: u32 = 8;
+
+/// The quality the *next* refinement should use, having seen this one come out
+/// at `bytes`.
+///
+/// Pure so the back-off ladder can be tested. Monotonically downward and
+/// terminating: a refinement that overshoots [`STATIC_REFINE_MAX_BYTES`] costs
+/// [`REFINE_QUALITY_STEP`], and one that still overshoots at the bottom of the
+/// permitted band turns the feature off for the rest of the session (`0`)
+/// rather than looping forever on a screen that simply cannot be refined
+/// cheaply. Never ratchets back up: this is a safety valve, not a controller,
+/// and an oscillating one would put a large frame on the wire every time it
+/// probed upward.
+fn adapt_refine_quality(current: u32, bytes: usize, ceiling: usize) -> u32 {
+    if current == 0 || bytes <= ceiling {
+        return current;
+    }
+    if current <= MIN_STATIC_REFINE_QUALITY {
+        return 0;
+    }
+    current
+        .saturating_sub(REFINE_QUALITY_STEP)
+        .max(MIN_STATIC_REFINE_QUALITY)
 }
 
 impl Default for SessionConfig {
@@ -57,11 +144,14 @@ impl Default for SessionConfig {
             gop_seconds: 4,
             // A still desktop only needs a low-rate keepalive, not ~30 identical
             // full-frame re-encodes/sec. 250 ms (~4/s) cuts static-screen
-            // bandwidth; the keepalives are ordinary re-sent frames, not forced
-            // IDRs (see media_thread) — periodic IDRs come from the GOP.
+            // bandwidth; the keepalives are ordinary re-sent frames, and exactly
+            // one of them per idle period is promoted to an IDR so the picture
+            // converges (see the settle logic in media_thread).
             idle_repeat_ms: 250,
             force_cpu_convert: false,
             frame_queue_depth: 8,
+            static_settle_ms: STATIC_SETTLE_MS,
+            static_refine_quality: crate::mf_encoder::DEFAULT_STATIC_REFINE_QUALITY,
         }
     }
 }
@@ -142,6 +232,14 @@ struct Shared {
     stop: AtomicBool,
     keyframe_req: AtomicBool,
     bitrate_req: AtomicU32,
+    /// Pending frame-rate change, take-and-clear like [`Shared::bitrate_req`]:
+    /// `0` means nothing is pending. Applied by the media thread, which is the
+    /// only thread allowed to touch the (thread-affine) encoder.
+    fps_req: AtomicU32,
+    /// The frame rate actually in force. Published by the media thread once a
+    /// rebuild succeeded, so readers (the video pump's pacing, the status
+    /// snapshot) observe truth rather than a request that may have failed.
+    fps_now: AtomicU32,
     /// While `true`, client input is routed to the SYSTEM UAC worker instead of
     /// the local injector. Observability only — the actual switch is serialized
     /// on the input thread via [`InputCtl::ElevationRoute`], so local injection
@@ -194,6 +292,8 @@ impl HostSession {
             stop: AtomicBool::new(false),
             keyframe_req: AtomicBool::new(true), // first frame should be an IDR
             bitrate_req: AtomicU32::new(0),
+            fps_req: AtomicU32::new(0),
+            fps_now: AtomicU32::new(cfg.target_fps.max(1)),
             elevation_active: AtomicBool::new(false),
         });
 
@@ -257,6 +357,33 @@ impl HostSession {
         self.shared
             .bitrate_req
             .store(kbps.max(1), Ordering::Relaxed);
+    }
+
+    /// Change the encoder's frame rate; applied on the next media-thread pass.
+    ///
+    /// Unlike [`set_bitrate`] this rebuilds the encoder (MF fixes the frame rate
+    /// at media-type negotiation), so it is not free — but it is a live change:
+    /// capture, the D3D device and the session description are untouched, and a
+    /// failed rebuild leaves the session running at the old rate.
+    ///
+    /// [`set_bitrate`]: HostSession::set_bitrate
+    pub fn set_fps(&self, fps: u32) {
+        let want = fps.clamp(
+            crate::config::MIN_TARGET_FPS,
+            crate::config::MAX_TARGET_FPS,
+        );
+        self.shared.fps_req.store(want, Ordering::Relaxed);
+    }
+
+    /// The frame rate the encoder is actually running at.
+    ///
+    /// Observed truth, not the last request: a [`set_fps`] whose rebuild failed
+    /// (or has not landed yet — it takes up to one frame) still reads the old
+    /// value here.
+    ///
+    /// [`set_fps`]: HostSession::set_fps
+    pub fn active_fps(&self) -> u32 {
+        self.shared.fps_now.load(Ordering::Relaxed).max(1)
     }
 
     /// Release every key/button currently held on behalf of the client.
@@ -399,7 +526,10 @@ fn media_thread(
         return;
     }
 
-    let frame_budget = Duration::from_micros(1_000_000 / cfg.target_fps.max(1) as u64);
+    let mut cur_fps = cfg.target_fps.max(1);
+    let mut cur_bitrate = cfg.bitrate_kbps.max(1);
+    let mut frame_budget = frame_budget(cur_fps);
+    shared.fps_now.store(cur_fps, Ordering::Relaxed);
     let mut cpu_bgra: Vec<u8> = Vec::new();
     let mut cpu_nv12: Vec<u8> = Vec::new();
     let mut gpu_convert_ok = converter.is_some();
@@ -411,14 +541,98 @@ fn media_thread(
     let mut win_bytes = 0u64;
     let mut win_pipeline_ms = 0f32;
     let mut paused_since: Option<Instant> = None;
+    // When the desktop last started being unchanged, and whether this idle
+    // period has already had its one settle keyframe.
+    let mut static_since: Option<Instant> = None;
+    let mut settle_sent = false;
+    let settle_delay = Duration::from_millis(cfg.static_settle_ms as u64);
+    // Quality the next refinement frame is encoded at; 0 = feature off. Clamped
+    // here so a `SessionConfig` built by hand (selftest, tests, an out-of-range
+    // host.json that skipped `sanitized`) cannot ask for something silly.
+    let mut refine_quality = match cfg.static_refine_quality {
+        0 => 0,
+        q => q.clamp(MIN_STATIC_REFINE_QUALITY, MAX_STATIC_REFINE_QUALITY),
+    };
+    // The encoder is currently parked in constant-quality mode. Exactly one
+    // loop iteration long, by construction — see the restore at the top.
+    let mut refine_armed = false;
+    // A refinement frame has been submitted and we have not yet seen the
+    // keyframe it produced, whose size we want to log and police.
+    let mut refine_pending = false;
 
     while !shared.stop.load(Ordering::Relaxed) {
         let tick = Instant::now();
 
+        // --- refinement restore (structural) ---------------------------------
+        //
+        // First statement of the loop body, before any `continue`, any error
+        // path and any early `break` can be reached, and unconditional. That is
+        // the whole guarantee: whatever happened on the iteration that armed it
+        // — the capture failed, the encode errored, the frame was dropped for
+        // want of an input credit, the encoder produced nothing — constant
+        // quality lasted that one iteration and no more.
+        //
+        // Getting this wrong is not a cosmetic bug. Left armed, the encoder
+        // ignores every mean/peak write, so the adaptor loses its only lever on
+        // a residential uplink at ~258 ms RTT and cannot back off from
+        // congestion. `MfH264Encoder::set_bitrate` forces the same restore as a
+        // second line of defence.
+        if refine_armed {
+            refine_armed = false;
+            encoder.end_static_refinement();
+        }
+
         let bitrate = shared.bitrate_req.swap(0, Ordering::Relaxed);
         if bitrate > 0 {
             let _ = encoder.set_bitrate(bitrate);
+            // Remembered so an encoder rebuilt for a frame-rate change starts at
+            // the rate in force, not the one the config booted with.
+            cur_bitrate = bitrate;
         }
+
+        // Live frame-rate change. MF pins the frame rate in the negotiated
+        // media type, so the only way to move it is a new encoder — but only
+        // the encoder: capture, the D3D device and the SessionDescription are
+        // unchanged, which is why this never touches build_pipeline.
+        //
+        // Build-then-swap: `encoder` keeps the working MFT until the new one is
+        // fully constructed, so a vendor MFT that refuses to activate at the
+        // requested rate costs a log line and nothing else.
+        let want_fps = shared.fps_req.swap(0, Ordering::Relaxed);
+        if want_fps > 0 && want_fps != cur_fps {
+            match rebuild_encoder(&cfg, &capture, want_fps, cur_bitrate) {
+                Ok(mut new_encoder) => {
+                    // The requirement is one-directional. When the live pipeline
+                    // hands the encoder D3D textures, a replacement that cannot
+                    // take them would be fed the wrong input kind, so refuse. The
+                    // reverse is harmless: an encoder that *could* take textures
+                    // is perfectly happy being fed CPU NV12, which is what a
+                    // pipeline without a GPU converter does. Demanding equality
+                    // here would make the whole fps control inert on those hosts.
+                    if gpu_texture_input && !new_encoder.accepts_textures() {
+                        tracing::warn!(
+                            "refusing {cur_fps} -> {want_fps} fps: the live pipeline submits GPU \
+                             textures and the rebuilt encoder only accepts CPU NV12"
+                        );
+                    } else {
+                        // Carry numbering forward so the rebuild is invisible to
+                        // the receiver's reassembler instead of costing it a
+                        // resync_after adoption window plus a forced keyframe.
+                        new_encoder.resume_numbering_from(&encoder);
+                        encoder = new_encoder;
+                        cur_fps = want_fps;
+                        frame_budget = self::frame_budget(cur_fps);
+                        shared.fps_now.store(cur_fps, Ordering::Relaxed);
+                        // A brand-new encoder has no reference chain the client
+                        // can use; give it a fresh IDR immediately.
+                        shared.keyframe_req.store(true, Ordering::Relaxed);
+                        tracing::info!("encoder rebuilt at {cur_fps} fps");
+                    }
+                }
+                Err(e) => tracing::warn!("could not rebuild the encoder at {want_fps} fps ({e}); staying at {cur_fps}"),
+            }
+        }
+
         if shared.keyframe_req.swap(false, Ordering::Relaxed) {
             encoder.request_keyframe();
         }
@@ -465,13 +679,62 @@ fn media_thread(
         win_captured += 1;
         let ts = frame.timestamp_ms;
 
-        // NOTE: idle keepalives are left as ordinary P-frames on purpose. Forcing
-        // an IDR on every static-screen keepalive made each one re-quantize the
-        // whole image slightly differently under CBR, which shows up as a visible
-        // flicker/pulse on colored backgrounds (invisible on white). P-frames of
-        // an unchanged image reproduce identical pixels, so they stay stable; loss
-        // recovery on a static screen is handled reactively by the client's
-        // existing keyframe request when it detects a dropped fragment.
+        // --- static-scene settle ---------------------------------------------
+        //
+        // A repeated frame is coded as an all-skip P-frame, which reproduces the
+        // previous picture exactly. That is bandwidth-perfect and quality-frozen:
+        // whatever the *one* frame that drew the current screen achieved is what
+        // the user stares at forever. If that frame landed right after a scroll,
+        // with rate control still paying off the burst, the text stays soft and
+        // nothing in the pipeline will ever refine it.
+        //
+        // So once the screen has genuinely settled, send exactly ONE keyframe,
+        // then latch until the desktop actually changes again.
+        //
+        // The older note here warned that forcing an IDR on *every* keepalive
+        // pulsed visibly on coloured backgrounds. That was real, and it was a
+        // property of periodic re-encoding under CBR: each IDR re-quantized the
+        // whole image to a different fixed bit budget, so the image breathed. Two
+        // things remove it. One IDR per idle period cannot be periodic — there is
+        // no second one to differ from — and under peak-constrained VBR with a QP
+        // ceiling (see mf_encoder) the settle frame is encoded at better quality
+        // than the frame it replaces, not merely differently. A single step up in
+        // sharpness is what we want the user to see.
+        if frame.repeated {
+            let since = *static_since.get_or_insert(tick);
+            if should_settle(since.elapsed(), settle_delay, settle_sent) {
+                settle_sent = true;
+                encoder.request_keyframe();
+                // ...and, if refinement is on, buy that one keyframe at a fixed
+                // *quality* instead of at the streaming bitrate. Without this
+                // the settle IDR is still quantized to fit the mean, which on a
+                // detailed 1080p screen leaves it about as soft as the picture
+                // it replaced — the actual gap against an MJPEG KVM.
+                //
+                // Deliberately reusing the existing `settle_sent` latch as the
+                // one-per-idle-period mechanism rather than adding a second: a
+                // refinement that repeated would be periodic re-quantization,
+                // which is the visible "breathing" this design already rejects.
+                if refine_quality > 0 {
+                    let s = encoder.begin_static_refinement(refine_quality);
+                    refine_armed = true;
+                    refine_pending = true;
+                    tracing::debug!(
+                        quality = s.quality,
+                        min_qp = s.min_qp,
+                        max_qp = s.max_qp,
+                        "static refinement armed"
+                    );
+                }
+                tracing::debug!(
+                    "desktop static for {} ms; sending one settle keyframe",
+                    since.elapsed().as_millis()
+                );
+            }
+        } else {
+            static_since = None;
+            settle_sent = false;
+        }
 
         // --- convert + encode -------------------------------------------------
         let encoded = 'encode: {
@@ -539,6 +802,40 @@ fn media_thread(
                 .fetch_add(ef.data.len() as u64, Ordering::Relaxed);
             if ef.keyframe {
                 shared.counters.keyframes.fetch_add(1, Ordering::Relaxed);
+                // The refinement's whole effect is "this frame is bigger and
+                // sharper". Log the size at INFO so host.log alone answers
+                // whether it worked — a refinement that comes out the same size
+                // as an ordinary IDR means the MFT ignored the mode (the
+                // software encoder does), and one that comes out huge is about
+                // to be policed below.
+                if refine_pending {
+                    refine_pending = false;
+                    let bytes = ef.data.len();
+                    tracing::info!(
+                        bytes,
+                        quality = refine_quality,
+                        ceiling = STATIC_REFINE_MAX_BYTES,
+                        "static refinement keyframe emitted"
+                    );
+                    let next = adapt_refine_quality(refine_quality, bytes, STATIC_REFINE_MAX_BYTES);
+                    if next != refine_quality {
+                        if next == 0 {
+                            tracing::warn!(
+                                bytes,
+                                "refinement frames stay oversized at the lowest quality; \
+                                 disabling static refinement for this session"
+                            );
+                        } else {
+                            tracing::warn!(
+                                bytes,
+                                from = refine_quality,
+                                to = next,
+                                "refinement frame exceeded its size ceiling; lowering quality"
+                            );
+                        }
+                        refine_quality = next;
+                    }
+                }
             }
             if let Err(full) = frames_tx.try_send(ef) {
                 // Queue full: evict the oldest so the consumer always gets the
@@ -615,6 +912,59 @@ fn maybe_report(
     *encoded = 0;
     *bytes = 0;
     *pipeline_ms = 0.0;
+}
+
+/// How long one frame is allowed to take before the media loop sleeps out the
+/// rest of it. `0` is treated as 1 — the loop must never divide by zero, and a
+/// config that says "no frames" means nothing sensible.
+fn frame_budget(fps: u32) -> Duration {
+    Duration::from_micros(1_000_000 / fps.max(1) as u64)
+}
+
+/// Is this the moment to spend the one settle keyframe of this idle period?
+///
+/// Pure so the decision can be tested without a desktop: `static_for` is how
+/// long the image has been unchanged, `delay` is the configured settle (zero
+/// disables), `already_sent` is the latch that keeps it one-shot.
+fn should_settle(static_for: Duration, delay: Duration, already_sent: bool) -> bool {
+    !delay.is_zero() && !already_sent && static_for >= delay
+}
+
+/// A new encoder for the live capture, at `want` fps.
+///
+/// Deliberately *only* the encoder: it mirrors the `EncoderConfig` block of
+/// [`build_pipeline`] and reuses the existing capture's D3D device, so nothing
+/// about the capture, the adapter or the published [`SessionDescription`]
+/// changes. Calling `build_pipeline` here instead would construct a second
+/// `DdaCapture` — a duplicate desktop duplication, which is exactly the thing a
+/// live frame-rate change must not do.
+///
+/// `bitrate_kbps` is the rate currently in force (the adaptor's, not the
+/// config's): rebuilding at `cfg.bitrate_kbps` would silently undo every
+/// adaptive step taken so far and hold the wrong rate until the adaptor next
+/// happens to change its mind.
+fn rebuild_encoder(
+    cfg: &SessionConfig,
+    capture: &DdaCapture,
+    want: u32,
+    bitrate_kbps: u32,
+) -> Result<MfH264Encoder> {
+    let (w, h) = {
+        use directdesk_shared::traits::FrameSource;
+        capture.dimensions()
+    };
+    let info = capture.adapter_info().clone();
+    let enc_cfg = EncoderConfig {
+        width: w,
+        height: h,
+        fps: want.max(1),
+        bitrate_kbps: bitrate_kbps.max(1),
+        gop_seconds: cfg.gop_seconds.max(1),
+        adapter_luid: Some(info.luid),
+        adapter_vendor_id: Some(info.vendor_id),
+        adapter_name: info.short(),
+    };
+    MfH264Encoder::new(enc_cfg, Some(capture.device()))
 }
 
 type Pipeline = (
@@ -788,6 +1138,96 @@ mod tests {
         assert!(c.target_fps > 0 && c.frame_queue_depth > 0);
         assert!(c.bitrate_kbps > 0);
     }
+
+    #[test]
+    fn frame_budget_follows_the_frame_rate() {
+        assert_eq!(frame_budget(1), Duration::from_millis(1_000));
+        assert_eq!(frame_budget(15), Duration::from_micros(66_666));
+        assert_eq!(frame_budget(60), Duration::from_micros(16_666));
+        assert_eq!(frame_budget(240), Duration::from_micros(4_166));
+        // Lower fps means a bigger budget — the whole point of the control.
+        assert!(frame_budget(15) > frame_budget(60));
+    }
+
+    #[test]
+    fn frame_budget_never_divides_by_zero() {
+        assert_eq!(frame_budget(0), frame_budget(1));
+    }
+
+    #[test]
+    fn settle_fires_once_after_the_delay() {
+        let delay = Duration::from_millis(700);
+        assert!(!should_settle(Duration::from_millis(699), delay, false));
+        assert!(should_settle(Duration::from_millis(700), delay, false));
+        assert!(should_settle(Duration::from_secs(30), delay, false));
+        // Latched: no second settle until a real frame clears the flag.
+        assert!(!should_settle(Duration::from_secs(30), delay, true));
+    }
+
+    // The bound only means anything if it is comfortably below the size at
+    // which a keyframe is refused outright (no picture, plus a forced bitrate
+    // cut) — and still big enough that a refinement is worth doing at all: a
+    // sharp 1080p intra frame is well over 100 KB. Both relations are between
+    // constants, so they are checked when the crate compiles rather than when
+    // someone remembers to run the tests.
+    const _: () = assert!(STATIC_REFINE_MAX_BYTES * 2 < FRAGMENTER_FRAME_LIMIT_BYTES);
+    const _: () = assert!(STATIC_REFINE_MAX_BYTES > 128 * 1024);
+
+    #[test]
+    fn refinement_ceiling_derivation_is_what_it_claims() {
+        assert_eq!(FRAGMENTER_FRAME_LIMIT_BYTES, 512 * (1200 - 14));
+        assert_eq!(MAX_FRAGS_PER_FRAME, 512);
+        assert_eq!(FRAG_HEADER_LEN, 14);
+        assert_eq!(STATIC_REFINE_MAX_BYTES, 242_892);
+    }
+
+    #[test]
+    fn refinement_quality_backs_off_only_when_oversized() {
+        let ceiling = STATIC_REFINE_MAX_BYTES;
+        // Within budget: untouched, no drift.
+        assert_eq!(adapt_refine_quality(88, 100_000, ceiling), 88);
+        assert_eq!(adapt_refine_quality(88, ceiling, ceiling), 88);
+        // Over budget: one step down.
+        assert_eq!(
+            adapt_refine_quality(88, ceiling + 1, ceiling),
+            88 - REFINE_QUALITY_STEP
+        );
+        // Never below the permitted band...
+        assert_eq!(
+            adapt_refine_quality(MIN_STATIC_REFINE_QUALITY + 1, ceiling + 1, ceiling),
+            MIN_STATIC_REFINE_QUALITY
+        );
+        // ...and at the bottom, off rather than an infinite ladder.
+        assert_eq!(
+            adapt_refine_quality(MIN_STATIC_REFINE_QUALITY, ceiling + 1, ceiling),
+            0
+        );
+        // Disabled stays disabled whatever is observed.
+        assert_eq!(adapt_refine_quality(0, usize::MAX, ceiling), 0);
+    }
+
+    #[test]
+    fn refinement_backoff_terminates() {
+        // Worst case — every refinement oversized — must reach 0 in a few
+        // steps and stay there, never oscillate.
+        let mut q = MAX_STATIC_REFINE_QUALITY;
+        for _ in 0..32 {
+            q = adapt_refine_quality(q, usize::MAX, STATIC_REFINE_MAX_BYTES);
+        }
+        assert_eq!(q, 0);
+    }
+
+    #[test]
+    fn settle_delay_of_zero_disables_it() {
+        assert!(!should_settle(
+            Duration::from_secs(60),
+            Duration::ZERO,
+            false
+        ));
+    }
+
+    // Long enough to outlast a scroll, short enough not to outlast a pause.
+    const _: () = assert!(STATIC_SETTLE_MS >= 300 && STATIC_SETTLE_MS <= 2_000);
 
     #[test]
     fn state_liveness() {

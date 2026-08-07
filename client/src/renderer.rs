@@ -6,12 +6,112 @@
 //! has already arrived. That discard is counted so the diagnostics panel can
 //! show it honestly.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use directdesk_shared::geometry::fit_rect;
 use directdesk_shared::traits::{PixelFormat, RawFrame};
 use parking_lot::Mutex;
+
+/// Texture filtering for the video surface: nearest on magnification, linear
+/// on minification.
+///
+/// Upscaling text with a linear filter is what makes a remote desktop look
+/// like a photocopy of a photocopy, so nearest keeps glyph edges hard.
+/// Minifying with nearest aliases badly through thin strokes, so downscale
+/// stays linear. Both `tex.set` and `ctx.load_texture` call sites must use
+/// this constant, or the filter silently flips whenever the host resolution
+/// changes and the texture is reallocated instead of updated in place.
+/// How close to a whole-number scale we still call "integer".
+const INTEGER_SCALE_TOLERANCE: f32 = 0.02;
+
+/// How close to exactly 1.0 the diagnostic label calls "1:1 exact". Tighter
+/// than `INTEGER_SCALE_TOLERANCE` above: that tolerance decides a texture
+/// filter (a little slack there is free), this one answers "is the user's
+/// text actually pixel-exact right now", so it should not flatter a scale
+/// that is merely close.
+const EXACT_SCALE_TOLERANCE: f32 = 0.005;
+
+/// Texture filtering for the video, chosen from the scale it is actually drawn
+/// at.
+///
+/// Nearest keeps glyph edges hard, but only when each host pixel maps to a whole
+/// number of screen pixels. At a fractional scale it duplicates some pixel
+/// columns and not others, so stroke weights come out uneven — visibly worse
+/// than the blur it replaced. Linear is the right default everywhere else,
+/// including all minification, where nearest drops whole scanlines through thin
+/// strokes.
+///
+/// `scale` is drawn width / source width, in physical pixels.
+fn video_texture_options(scale: f32) -> egui::TextureOptions {
+    let crisp = scale.is_finite()
+        && scale >= 1.0 - INTEGER_SCALE_TOLERANCE
+        && (scale - scale.round()).abs() <= INTEGER_SCALE_TOLERANCE;
+    egui::TextureOptions {
+        magnification: if crisp {
+            egui::TextureFilter::Nearest
+        } else {
+            egui::TextureFilter::Linear
+        },
+        // Unconditional, including when the window cannot reach 1:1 at all:
+        // nearest minification drops whole scanlines through thin strokes
+        // (it samples one texel and discards the rest that mapped onto the
+        // same screen pixel), which is worse than the slight blur linear
+        // gives. There is no scale at which nearest minification is the
+        // right call for text.
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: None,
+    }
+}
+
+/// Whether `scale` (drawn width / source width) is close enough to a whole
+/// number — 1.0, 2.0, 3.0, ... — to call the video pixel-exact. Generalised
+/// from the original "close to exactly 1.0" check: any integer scale draws
+/// each host pixel as a whole block of screen pixels, so it is just as crisp
+/// as 1:1, not merely "close" to it.
+///
+/// `scale.round() >= 1.0` is the guard that keeps this from calling a
+/// near-zero minification scale "exact" just because it happens to round
+/// to 0.0 within tolerance — there is no such thing as an exact 0x.
+pub fn is_exact_scale(scale: f32) -> bool {
+    scale.is_finite() && scale.round() >= 1.0 && (scale - scale.round()).abs() <= EXACT_SCALE_TOLERANCE
+}
+
+/// Formats the current draw scale for the toolbar/diagnostics: "1:1 exact" at
+/// unit scale, "Nx exact" at a whole multiple, otherwise "N.NNx" — the whole
+/// point is that a fractional scale (the thing that makes text blurry) is
+/// never silently hidden.
+pub fn describe_scale(scale: f32) -> String {
+    if !scale.is_finite() {
+        "—".to_string()
+    } else if is_exact_scale(scale) {
+        let n = scale.round() as i64;
+        if n <= 1 {
+            "1:1 exact".to_string()
+        } else {
+            format!("{n}x exact")
+        }
+    } else {
+        format!("{scale:.2}x")
+    }
+}
+
+/// Snaps a points-space coordinate to the nearest whole physical pixel, then
+/// converts back to points.
+///
+/// `viewport.min` (the bottom edge of the toolbar panel) is not guaranteed to
+/// land on a whole device pixel when `ppp` is fractional (e.g. 1.5 at 150%
+/// scaling) — its point value times `ppp` generally isn't an integer. Left
+/// alone, that means the video rect's origin can sit half a physical pixel
+/// off *even at scale exactly 1.0*, so the texture is sampled at a half-texel
+/// offset and strokes come out with uneven weight — the very artifact this
+/// whole feature exists to remove. Snapping the final origin (not the pre-fit
+/// math) fixes it without perturbing `fit_rect`'s physical-pixel sizing.
+fn snap_to_physical_pixel(points: f32, ppp: f32) -> f32 {
+    (points * ppp).round() / ppp
+}
 
 /// One decoded frame waiting to be shown.
 struct Slotted {
@@ -173,6 +273,10 @@ pub struct Presenter {
     decode_meter: RateMeter,
     present_meter: RateMeter,
     warned_format: bool,
+    /// Scale the last frame was drawn at, written by `draw_video` and read when
+    /// the next frame is uploaded. `Cell` because drawing takes `&self`. One
+    /// frame of lag after a resize is imperceptible and costs nothing.
+    last_scale: Cell<f32>,
 }
 
 impl Presenter {
@@ -186,6 +290,7 @@ impl Presenter {
             decode_meter: RateMeter::new(now),
             present_meter: RateMeter::new(now),
             warned_format: false,
+            last_scale: Cell::new(1.0),
         }
     }
 
@@ -195,16 +300,13 @@ impl Presenter {
             match self.build_color_image(&frame) {
                 Some(image) => {
                     self.tex_size = image.size;
+                    let opts = video_texture_options(self.last_scale.get());
                     match &mut self.texture {
                         Some(tex) if tex.size() == image.size => {
-                            tex.set(image, egui::TextureOptions::LINEAR);
+                            tex.set(image, opts);
                         }
                         slot_tex => {
-                            *slot_tex = Some(ctx.load_texture(
-                                "directdesk_video",
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            ));
+                            *slot_tex = Some(ctx.load_texture("directdesk_video", image, opts));
                         }
                     }
                     self.last_generation = generation;
@@ -262,25 +364,53 @@ impl Presenter {
         let (viewport, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
         let painter = ui.painter_at(viewport);
         painter.rect_filled(viewport, 0.0, egui::Color32::BLACK);
-        (viewport, self.draw_video(&painter, viewport))
+        let ppp = ui.ctx().pixels_per_point();
+        (viewport, self.draw_video(&painter, viewport, ppp))
     }
 
-    fn draw_video(&self, painter: &egui::Painter, viewport: egui::Rect) -> Option<VideoView> {
+    fn draw_video(
+        &self,
+        painter: &egui::Painter,
+        viewport: egui::Rect,
+        ppp: f32,
+    ) -> Option<VideoView> {
         let texture = self.texture.as_ref()?;
         let (src_w, src_h) = (self.tex_size[0] as u32, self.tex_size[1] as u32);
-        let (x, y, w, h) = fit_rect(
-            src_w,
-            src_h,
-            viewport.width().max(0.0) as u32,
-            viewport.height().max(0.0) as u32,
-        );
-        if w == 0 || h == 0 {
+        // fit_rect is unit-agnostic; feed it PHYSICAL pixels, not egui points,
+        // or a 1:1-sized host frame gets resampled against a too-small box on
+        // any scaled display (e.g. 1920 points == 2880 physical px at 150%).
+        // That resample is a permanent softness floor no texture filter fixes.
+        let ppp = if ppp.is_finite() { ppp.max(0.1) } else { 1.0 };
+        let dst_w_px = (viewport.width().max(0.0) * ppp) as u32;
+        let dst_h_px = (viewport.height().max(0.0) * ppp) as u32;
+        let (x_px, y_px, w_px, h_px) = fit_rect(src_w, src_h, dst_w_px, dst_h_px);
+        if w_px == 0 || h_px == 0 {
             return None;
         }
-        let rect = egui::Rect::from_min_size(
-            viewport.min + egui::vec2(x as f32, y as f32),
-            egui::vec2(w as f32, h as f32),
+        // Record what the next upload should filter for. Measured from the rect
+        // we are about to draw, so it can never disagree with what is on screen.
+        if src_w > 0 {
+            self.last_scale.set(w_px as f32 / src_w as f32);
+        }
+        // Convert back to points: VideoView.rect must stay in points because
+        // input_capture's pointer mapping consumes it directly against egui
+        // pointer positions, which are always in points.
+        let (x, y, w, h) = (
+            x_px as f32 / ppp,
+            y_px as f32 / ppp,
+            w_px as f32 / ppp,
+            h_px as f32 / ppp,
         );
+        // Snap the origin onto a whole physical pixel (see `snap_to_physical_pixel`);
+        // the size is left as-is since it came from `w_px`/`h_px`, already whole
+        // physical pixels, so an integer origin plus that size lands the far edge
+        // on a whole physical pixel too.
+        let origin = viewport.min + egui::vec2(x, y);
+        let origin = egui::pos2(
+            snap_to_physical_pixel(origin.x, ppp),
+            snap_to_physical_pixel(origin.y, ppp),
+        );
+        let rect = egui::Rect::from_min_size(origin, egui::vec2(w, h));
         painter.image(
             texture.id(),
             rect,
@@ -317,6 +447,13 @@ impl Presenter {
         (self.tex_size[0] > 0).then(|| (self.tex_size[0] as u32, self.tex_size[1] as u32))
     }
 
+    /// The scale the video was actually drawn at last frame (drawn width /
+    /// source width, physical pixels). `1.0` before anything has been drawn.
+    /// Feeds the "am I at 1:1?" toolbar diagnostic.
+    pub fn last_scale(&self) -> f32 {
+        self.last_scale.get()
+    }
+
     /// Drop the presented image (stream stopped / reconnecting).
     pub fn reset(&mut self) {
         self.texture = None;
@@ -335,6 +472,27 @@ impl Default for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_is_only_used_where_it_actually_helps() {
+        use egui::TextureFilter::{Linear, Nearest};
+        // 1:1 and whole multiples: every host pixel lands on a whole number of
+        // screen pixels, so nearest keeps glyph edges hard.
+        assert_eq!(video_texture_options(1.0).magnification, Nearest);
+        assert_eq!(video_texture_options(2.0).magnification, Nearest);
+        assert_eq!(video_texture_options(3.0).magnification, Nearest);
+        assert_eq!(video_texture_options(1.995).magnification, Nearest);
+        // Fractional upscales duplicate some columns and not others, which reads
+        // as uneven stroke weight — worse than the blur it would replace.
+        assert_eq!(video_texture_options(1.333).magnification, Linear);
+        assert_eq!(video_texture_options(1.5).magnification, Linear);
+        // Minification always stays linear; nearest drops scanlines through
+        // thin strokes.
+        assert_eq!(video_texture_options(0.75).magnification, Linear);
+        assert_eq!(video_texture_options(1.0).minification, Linear);
+        // A nonsense scale must not panic or pick nearest.
+        assert_eq!(video_texture_options(f32::NAN).magnification, Linear);
+    }
 
     fn frame(w: u32, h: u32, tag: u8) -> RawFrame {
         RawFrame {
@@ -408,5 +566,80 @@ mod tests {
         slot.publish(frame(2, 2, 1));
         slot.clear();
         assert!(slot.take_newer_than(0).is_none());
+    }
+
+    #[test]
+    fn snap_to_physical_pixel_lands_on_a_whole_device_pixel() {
+        // 150% scaling: a toolbar height in points rarely times out to a whole
+        // device pixel. 613.0 points * 1.5 = 919.5 physical px — exactly the
+        // half-texel case this exists to fix.
+        let ppp = 1.5;
+        let snapped = snap_to_physical_pixel(613.0, ppp);
+        let px = snapped * ppp;
+        assert!(
+            (px - px.round()).abs() < 1e-4,
+            "snapped point {snapped} * ppp {ppp} = {px} is not a whole physical pixel"
+        );
+    }
+
+    #[test]
+    fn snap_to_physical_pixel_is_a_no_op_at_integer_scale() {
+        // At ppp = 1.0 every point is already a whole physical pixel.
+        assert_eq!(snap_to_physical_pixel(42.0, 1.0), 42.0);
+    }
+
+    #[test]
+    fn snap_to_physical_pixel_moves_by_less_than_one_physical_pixel() {
+        // Snapping must never move the origin by more than the rounding error
+        // it is fixing — otherwise it would introduce its own visible shift.
+        let ppp = 1.5;
+        let points = 613.333;
+        let snapped = snap_to_physical_pixel(points, ppp);
+        assert!(((snapped - points) * ppp).abs() <= 0.5 + 1e-4);
+    }
+
+    #[test]
+    fn describe_scale_says_exact_at_one() {
+        assert_eq!(describe_scale(1.0), "1:1 exact");
+        // Within tolerance of 1.0 still reads as exact.
+        assert_eq!(describe_scale(1.003), "1:1 exact");
+    }
+
+    #[test]
+    fn describe_scale_says_exact_at_higher_integer_scales() {
+        // 2x and 3x are just as crisp as 1:1 (nearest-filtered pixel
+        // doubling/tripling), so they get the same approving label, not the
+        // fractional-scale warning format.
+        assert_eq!(describe_scale(2.0), "2x exact");
+        assert_eq!(describe_scale(3.0), "3x exact");
+        // Within tolerance of a higher integer still reads as exact.
+        assert_eq!(describe_scale(1.997), "2x exact");
+    }
+
+    #[test]
+    fn describe_scale_shows_the_fraction_otherwise() {
+        assert_eq!(describe_scale(1.3333), "1.33x");
+        assert_eq!(describe_scale(0.75), "0.75x");
+    }
+
+    #[test]
+    fn describe_scale_handles_nonsense() {
+        assert_eq!(describe_scale(f32::NAN), "—");
+    }
+
+    #[test]
+    fn is_exact_scale_matches_describe_scale() {
+        assert!(is_exact_scale(1.0));
+        assert!(is_exact_scale(0.996));
+        assert!(!is_exact_scale(1.333));
+        assert!(!is_exact_scale(f32::NAN));
+    }
+
+    #[test]
+    fn is_exact_scale_is_true_at_any_crisp_integer() {
+        assert!(is_exact_scale(2.0));
+        assert!(is_exact_scale(3.0));
+        // A fractional scale between two integers is exact at neither.
+        assert!(!is_exact_scale(2.5));
     }
 }
