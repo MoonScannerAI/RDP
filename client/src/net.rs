@@ -259,6 +259,8 @@ pub async fn run_client(
                 keyframe_request_min_interval_ms: 250,
                 ..ReassemblyConfig::default()
             },
+            // The client is the receiving end of a one-directional video path.
+            receive_video: true,
         };
         let (session, receivers) = match QuicSession::start(conn, streams, route, cfg) {
             Ok(pair) => pair,

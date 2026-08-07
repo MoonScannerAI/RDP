@@ -1117,6 +1117,41 @@ impl TcpSession {
         Ok((session, receivers))
     }
 
+    /// Queue a video frame. Drops the oldest when the queue is full (see the
+    /// module docs on latest-wins) and never blocks.
+    ///
+    /// Inherent, not part of [`Session`]: video egress is transport-specific and
+    /// the QUIC side deliberately has none — a datagram sender needs FEC,
+    /// pacing and a send-buffer precheck, all of which live in the host's
+    /// `video_pump`. TCP's media path is a different animal (ordered stream
+    /// segments, see [`encode_media_segments`]) and *is* the real sender for
+    /// this transport, so it stays — just not behind a trait that would imply
+    /// every transport has one.
+    pub fn send_video(&self, frame: EncodedFrame) -> Result<()> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(Error::Transport("session is closed".into()));
+        }
+        let dropped = self.shared.video_out.push(frame) as u64;
+        if dropped > 0 {
+            self.shared
+                .counters
+                .video_frames_dropped_local
+                .fetch_add(dropped, Ordering::Relaxed);
+            // The peer's decode chain now has a hole in it. Only this side can
+            // fix that, by encoding an IDR — so the signal is local, not a
+            // `RequestKeyframe` aimed at the peer, which would ask the wrong
+            // party for the wrong thing.
+            if self.shared.arm_idr() {
+                self.shared
+                    .counters
+                    .idr_signals
+                    .fetch_add(1, Ordering::Relaxed);
+                self.shared.emit(SessionEvent::KeyframeNeeded);
+            }
+        }
+        Ok(())
+    }
+
     /// Number of video frames dropped locally because the send queue was full.
     pub fn frames_dropped_local(&self) -> u64 {
         self.shared
@@ -1216,31 +1251,6 @@ impl Session for TcpSession {
             .input_out
             .try_send(msg)
             .map_err(|e| Error::Transport(format!("input queue: {e}")))
-    }
-
-    fn send_video(&self, frame: EncodedFrame) -> Result<()> {
-        if self.shared.closed.load(Ordering::SeqCst) {
-            return Err(Error::Transport("session is closed".into()));
-        }
-        let dropped = self.shared.video_out.push(frame) as u64;
-        if dropped > 0 {
-            self.shared
-                .counters
-                .video_frames_dropped_local
-                .fetch_add(dropped, Ordering::Relaxed);
-            // The peer's decode chain now has a hole in it. Only this side can
-            // fix that, by encoding an IDR — so the signal is local, not a
-            // `RequestKeyframe` aimed at the peer, which would ask the wrong
-            // party for the wrong thing.
-            if self.shared.arm_idr() {
-                self.shared
-                    .counters
-                    .idr_signals
-                    .fetch_add(1, Ordering::Relaxed);
-                self.shared.emit(SessionEvent::KeyframeNeeded);
-            }
-        }
-        Ok(())
     }
 
     fn close(&self, reason: &str) {

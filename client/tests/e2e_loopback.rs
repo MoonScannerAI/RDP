@@ -38,7 +38,7 @@ use directdesk_shared::protocol::{
 use directdesk_shared::stats::TransportRoute;
 use directdesk_shared::transport::quic::{self, QuicParams, SessionStreams};
 use directdesk_shared::transport::session::{QuicSession, Session, SessionConfig};
-use directdesk_shared::video::EncodedFrame;
+use directdesk_shared::video::{fragment_frame_fec, EncodedFrame};
 use quinn::Connection;
 use tokio::sync::watch;
 
@@ -328,6 +328,29 @@ async fn write_auth(streams: &mut SessionStreams, msg: &AuthMsg) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
+/// The host side of the video path: fragment the frame and put each fragment on
+/// the wire as its own datagram. The session driver owns no video *sender* —
+/// the real host does this in `host::net::video_pump`, with FEC and pacing this
+/// test does not need.
+///
+/// Errors are swallowed rather than asserted on, exactly as the old
+/// `Session::send_video` swallowed a full-queue drop: this runs on a detached
+/// thread that races session teardown, and a lost frame at the end of the test
+/// must not become a panic.
+fn send_frame(conn: &Connection, frame: &EncodedFrame) {
+    let Ok(mtu) = quic::max_datagram(conn) else {
+        return;
+    };
+    let Ok(frags) = fragment_frame_fec(frame, mtu, 0) else {
+        return;
+    };
+    for f in frags {
+        if conn.send_datagram(f.into()).is_err() {
+            break;
+        }
+    }
+}
+
 /// Feed the session with frames: real H.264 from the host pipeline if the
 /// capture stack is up, else synthetic Annex-B. Runs on its own OS thread since
 /// [`Session`] methods are synchronous.
@@ -339,6 +362,8 @@ fn spawn_frame_producer(
     std::thread::spawn(move || {
         #[cfg(windows)]
         directdesk_host::capture::set_process_dpi_aware();
+
+        let conn = session.connection().clone();
 
         let real =
             directdesk_host::session::HostSession::start(directdesk_host::session::SessionConfig {
@@ -360,7 +385,7 @@ fn spawn_frame_producer(
                 while !stop.load(Ordering::SeqCst) {
                     match frames.recv_timeout(Duration::from_millis(200)) {
                         Ok(f) => {
-                            let _ = session.send_video(f);
+                            send_frame(&conn, &f);
                         }
                         Err(_) => {
                             if session.is_closed() {
@@ -380,7 +405,7 @@ fn spawn_frame_producer(
                 while !stop.load(Ordering::SeqCst) && !session.is_closed() {
                     let keyframe = id.is_multiple_of(60);
                     let ts = start.elapsed().as_millis() as u32;
-                    let _ = session.send_video(synth_annexb(id, keyframe, ts));
+                    send_frame(&conn, &synth_annexb(id, keyframe, ts));
                     id = id.wrapping_add(1);
                     std::thread::sleep(interval);
                 }
@@ -504,7 +529,7 @@ async fn pair_stream_and_input_end_to_end() {
     // The 3s throughput window opens at the *first received frame*, not at
     // Connected: spawn_frame_producer's real-capture path blocks inside
     // HostSession::start (Media Foundation + DDA capture init — observed
-    // 1.0-3.5s) before it ever calls send_video for the first time. Starting
+    // 1.0-3.5s) before it ever calls send_frame for the first time. Starting
     // the clock at Connected races that init and undercounts (or zeroes)
     // frames through no fault of the streaming path itself. Waiting for the
     // first frame first, with a generous separate deadline, isolates "the

@@ -10,7 +10,6 @@
 //! | control writer | out | drains the control queue onto the control stream |
 //! | control reader | in | decodes control messages, answers `Ping`, matches `Pong` |
 //! | input writer / reader | both | same, for [`InputMsg`] |
-//! | video sender | out | fragments [`EncodedFrame`]s into datagrams |
 //! | video receiver | in | reassembles datagrams, requests keyframes on loss |
 //! | heartbeat | out | periodic `Ping` for liveness and RTT |
 //! | stats sampler | — | turns `Connection::stats()` into [`ConnStats`] |
@@ -18,10 +17,21 @@
 //! Everything above the transport talks to [`SessionReceivers`] and the
 //! [`Session`] trait and never touches quinn.
 //!
+//! # There is no video *sender* here, on purpose
+//!
+//! Video egress lives in the host's `video_pump`, not in this driver. That is
+//! where the things a real sender needs already are: FEC parity, pacing across
+//! the frame interval, a `datagram_send_buffer_space` precheck so a frame is
+//! never offered piecemeal, and latest-wins coalescing of the encoder queue. A
+//! second, simpler egress path in here would be a worse copy of it that quietly
+//! competed for the same datagram buffer, so the driver only *receives* video.
+//! Senders fragment with [`crate::video::fragment_frame_fec`] and call
+//! [`Connection::send_datagram`] themselves.
+//!
 //! # Why a trait
 //!
 //! The TCP/TLS fallback in a later milestone has to present the same interface,
-//! so the useful surface is deliberately transport-agnostic: three typed send
+//! so the useful surface is deliberately transport-agnostic: two typed send
 //! methods, four typed receivers, a stats snapshot, and a close. Nothing in
 //! [`Session`] mentions QUIC, and nothing in it is `async` — which keeps it
 //! object-safe, so callers can hold a `Box<dyn Session>` and swap transports at
@@ -31,9 +41,9 @@
 //!
 //! - Control and input are **reliable**: a full queue is an error the caller
 //!   sees, never a silent drop. Losing a key-up event leaves a key stuck down.
-//! - Video is **droppable**: a full queue drops the frame and counts it. A
-//!   video frame that arrives late is worth less than nothing, because it
-//!   delays the one behind it.
+//! - Inbound video is **droppable**: a full receive queue drops the reassembled
+//!   frame and warns. A video frame that arrives late is worth less than
+//!   nothing, because it delays the one behind it.
 //!
 //! # Time
 //!
@@ -87,10 +97,29 @@ pub struct SessionConfig {
     pub control_capacity: usize,
     /// Queue depth for input messages.
     pub input_capacity: usize,
-    /// Queue depth for video frames in each direction.
+    /// Queue depth for inbound video frames.
     pub video_capacity: usize,
     /// Reassembly policy for inbound video.
     pub reassembly: ReassemblyConfig,
+    /// Whether to run the inbound video path at all.
+    ///
+    /// Video in DirectDesk is **one-directional**: the host sends, the client
+    /// receives, and no client ever puts a video datagram on the wire. A host
+    /// that spawns the receive loop therefore keeps a whole [`Reassembler`]
+    /// alive for datagrams that never arrive — and, worse, hands the peer a
+    /// second route into its encoder: on a fragment gap the loop emits
+    /// [`SessionEvent::KeyframeNeeded`], which the host turns straight into a
+    /// `request_keyframe()` with **no** rate limit, unlike the intended
+    /// `ControlMsg::RequestKeyframe` path, which is limited.
+    ///
+    /// Defaults to `true` so a plain [`Session`] is a receiver — that is what
+    /// every client is, and what the host's own integration tests act as. Only
+    /// the host's real serving path sets it to `false`.
+    ///
+    /// QUIC only. [`crate::transport::tcp::TcpSession`] carries media on the
+    /// same byte stream as control and input, so its reader cannot decline to
+    /// see it and this flag has no effect there.
+    pub receive_video: bool,
 }
 
 impl Default for SessionConfig {
@@ -103,6 +132,7 @@ impl Default for SessionConfig {
             // Small on purpose: a deep video queue is just latency in disguise.
             video_capacity: 8,
             reassembly: ReassemblyConfig::default(),
+            receive_video: true,
         }
     }
 }
@@ -126,7 +156,8 @@ pub struct SessionReceivers {
     pub control: mpsc::Receiver<ControlMsg>,
     /// Inbound input messages.
     pub input: mpsc::Receiver<InputMsg>,
-    /// Inbound reassembled video frames.
+    /// Inbound reassembled video frames. Yields `None` immediately when the
+    /// session was started with [`SessionConfig::receive_video`] off.
     pub video: mpsc::Receiver<EncodedFrame>,
     /// Driver events.
     pub events: mpsc::Receiver<SessionEvent>,
@@ -151,8 +182,6 @@ pub trait Session: Send + Sync {
     fn send_control(&self, msg: ControlMsg) -> Result<()>;
     /// Queue an input message. Fails rather than dropping.
     fn send_input(&self, msg: InputMsg) -> Result<()>;
-    /// Queue a video frame. Drops when the queue is full (see module docs).
-    fn send_video(&self, frame: EncodedFrame) -> Result<()>;
     /// Close gracefully with a reason the peer will see.
     fn close(&self, reason: &str);
     /// Whether the session has been closed locally or by the peer.
@@ -162,7 +191,6 @@ pub trait Session: Send + Sync {
 /// Counters the driver keeps that are not part of [`ConnStats`].
 #[derive(Debug, Default)]
 struct Counters {
-    video_frames_dropped_local: AtomicU64,
     keyframes_requested: AtomicU64,
     /// Input messages actually framed onto the wire by the input `write_loop`.
     /// On the client this is the transmit-side twin of the hook's enqueue count
@@ -187,7 +215,6 @@ struct Shared {
     counters: Counters,
     control_out: mpsc::Sender<ControlMsg>,
     input_out: mpsc::Sender<InputMsg>,
-    video_out: mpsc::Sender<EncodedFrame>,
     events: mpsc::Sender<SessionEvent>,
 }
 
@@ -241,7 +268,9 @@ impl QuicSession {
         let (control_in_tx, control_in_rx) = mpsc::channel(config.control_capacity);
         let (input_out_tx, input_out_rx) = mpsc::channel(config.input_capacity);
         let (input_in_tx, input_in_rx) = mpsc::channel(config.input_capacity);
-        let (video_out_tx, video_out_rx) = mpsc::channel(config.video_capacity);
+        // Created even when `receive_video` is off, so `SessionReceivers` keeps
+        // one shape for every caller. Dropping the unused sender below is what
+        // makes `rx.video.recv()` return `None` straight away.
         let (video_in_tx, video_in_rx) = mpsc::channel(config.video_capacity);
         let (events_tx, events_rx) = mpsc::channel(config.control_capacity);
 
@@ -256,7 +285,6 @@ impl QuicSession {
             counters: Counters::default(),
             control_out: control_out_tx,
             input_out: input_out_tx,
-            video_out: video_out_tx,
             events: events_tx,
         });
 
@@ -286,12 +314,13 @@ impl QuicSession {
             input_recv,
             input_in_tx,
         )));
-        tasks.push(tokio::spawn(video_send_loop(shared.clone(), video_out_rx)));
-        tasks.push(tokio::spawn(video_recv_loop(
-            shared.clone(),
-            video_in_tx,
-            config.reassembly,
-        )));
+        if config.receive_video {
+            tasks.push(tokio::spawn(video_recv_loop(
+                shared.clone(),
+                video_in_tx,
+                config.reassembly,
+            )));
+        }
         if config.heartbeat_ms > 0 {
             tasks.push(tokio::spawn(heartbeat_loop(
                 shared.clone(),
@@ -317,14 +346,6 @@ impl QuicSession {
             events: events_rx,
         };
         Ok((session, receivers))
-    }
-
-    /// Number of video frames dropped locally because the send queue was full.
-    pub fn frames_dropped_local(&self) -> u64 {
-        self.shared
-            .counters
-            .video_frames_dropped_local
-            .load(Ordering::Relaxed)
     }
 
     /// Number of keyframe requests this side has sent.
@@ -417,21 +438,6 @@ impl Session for QuicSession {
             .input_out
             .try_send(msg)
             .map_err(|e| Error::Transport(format!("input queue: {e}")))
-    }
-
-    fn send_video(&self, frame: EncodedFrame) -> Result<()> {
-        match self.shared.video_out.try_send(frame) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Deliberate: a queued video frame is stale latency.
-                self.shared
-                    .counters
-                    .video_frames_dropped_local
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => Err(Error::Transport(format!("video queue: {e}"))),
-        }
     }
 
     fn close(&self, reason: &str) {
@@ -587,38 +593,6 @@ async fn input_read_loop(shared: Arc<Shared>, mut stream: RecvStream, tx: mpsc::
     }
 }
 
-async fn video_send_loop(shared: Arc<Shared>, mut rx: mpsc::Receiver<EncodedFrame>) {
-    while let Some(frame) = rx.recv().await {
-        let mtu = match quic::max_datagram(&shared.conn) {
-            Ok(m) => m,
-            Err(e) => {
-                shared.emit(SessionEvent::Warning {
-                    detail: format!("no datagrams: {e}"),
-                });
-                shared.mark_closed("peer does not support datagrams");
-                return;
-            }
-        };
-        let frags = match crate::video::fragment_frame(&frame, mtu) {
-            Ok(f) => f,
-            Err(e) => {
-                shared.emit(SessionEvent::Warning {
-                    detail: format!("fragment: {e}"),
-                });
-                continue;
-            }
-        };
-        for frag in frags {
-            if let Err(e) = shared.conn.send_datagram(bytes::Bytes::from(frag)) {
-                shared.emit(SessionEvent::Warning {
-                    detail: format!("send datagram: {e}"),
-                });
-                break;
-            }
-        }
-    }
-}
-
 async fn video_recv_loop(
     shared: Arc<Shared>,
     tx: mpsc::Sender<EncodedFrame>,
@@ -729,10 +703,12 @@ async fn stats_loop(shared: Arc<Shared>, interval_ms: u64) {
             stats.bandwidth_kbps = sampled.bandwidth_kbps;
             stats.keyframes_requested =
                 shared.counters.keyframes_requested.load(Ordering::Relaxed) as u32;
-            stats.frames_dropped = shared
-                .counters
-                .video_frames_dropped_local
-                .load(Ordering::Relaxed) as u32;
+            // `stats.frames_dropped` is deliberately left alone. The wire field
+            // stays — it is pinned byte-for-byte by the anti-brick suite in
+            // `crate::protocol` — but the transport no longer has a send queue
+            // to drop frames from, so it has no honest number to put there. The
+            // media pipeline does, and the host overwrites this field from
+            // `HostSession::stats()` before the sample goes out.
             *stats
         };
         prev = cur;
@@ -881,6 +857,17 @@ mod tests {
     use crate::crypto::HostIdentity;
     use crate::transport::quic::QuicParams;
     use crate::video::EncodedFrame;
+
+    /// The sender half of the video path, which the driver deliberately does not
+    /// own: fragment and put each fragment on the wire as its own datagram.
+    /// This is `host::net::video_pump` in miniature, minus the pacing and the
+    /// backpressure precheck that only a real encoder feed needs.
+    fn send_frame(conn: &Connection, frame: &EncodedFrame) {
+        let mtu = quic::max_datagram(conn).expect("datagrams");
+        for f in crate::video::fragment_frame_fec(frame, mtu, 0).expect("fragment") {
+            conn.send_datagram(bytes::Bytes::from(f)).expect("datagram");
+        }
+    }
 
     #[test]
     fn config_validation() {
@@ -1102,15 +1089,17 @@ mod tests {
                 .expect("input closed");
             assert!(matches!(input, InputMsg::ReleaseAll));
 
-            // A frame large enough to require several datagrams.
-            session
-                .send_video(EncodedFrame {
+            // A frame large enough to require several datagrams, put on the wire
+            // the way the host really does it — the driver has no send path.
+            send_frame(
+                session.connection(),
+                &EncodedFrame {
                     frame_id: 42,
                     keyframe: true,
                     timestamp_ms: 1234,
                     data: (0..8000u32).map(|i| (i % 251) as u8).collect(),
-                })
-                .expect("send video");
+                },
+            );
 
             // Keep the session alive while the client drains.
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1184,6 +1173,92 @@ mod tests {
 
         session.close("test done");
         assert!(session.is_closed());
+        client_ep.wait_idle().await;
+    }
+
+    /// With [`SessionConfig::receive_video`] off there is no reassembler and no
+    /// datagram reader — the sender half of the video channel is never created,
+    /// so `rx.video` is closed from the start rather than merely idle. That is
+    /// the difference a caller can actually observe, and it is what lets the
+    /// host stop paying for an inbound path nothing uses.
+    #[tokio::test]
+    async fn receive_video_false_spawns_no_reassembler() {
+        let id = HostIdentity::generate("no-recv-host").unwrap();
+        let params = QuicParams::default();
+        let server =
+            quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let host_task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let streams = quic::accept_streams(&conn).await.expect("accept streams");
+            let (session, mut rx) = QuicSession::start(
+                conn,
+                streams,
+                TransportRoute::DirectUdp,
+                SessionConfig {
+                    heartbeat_ms: 0,
+                    stats_interval_ms: 0,
+                    receive_video: false,
+                    ..Default::default()
+                },
+            )
+            .expect("host session");
+
+            // Closed immediately, without waiting for anything: the loop that
+            // would have held the sender was never spawned.
+            let got = tokio::time::timeout(Duration::from_secs(10), rx.video.recv())
+                .await
+                .expect("video receiver should close, not hang");
+            assert!(got.is_none(), "no video should ever be delivered");
+            // Everything else still works; only the video path is gone. Stay up
+            // long enough for the client's datagrams to arrive and be ignored —
+            // closing straight away would only prove the receiver was gone
+            // because the connection was.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!session.is_closed());
+            session.close("test done");
+        });
+
+        let client_ep = quic::client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
+        let conn = quic::connect(&client_ep, server_addr)
+            .await
+            .expect("connect");
+        let streams = quic::open_streams(&conn).await.expect("open streams");
+        let (session, _rx) = QuicSession::start(
+            conn,
+            streams,
+            TransportRoute::DirectUdp,
+            SessionConfig::default(),
+        )
+        .expect("client session");
+
+        // Datagrams sent at a peer that is not listening must be inert: they are
+        // discarded by quinn, not queued, and nothing on either side notices.
+        send_frame(
+            session.connection(),
+            &EncodedFrame {
+                frame_id: 1,
+                keyframe: true,
+                timestamp_ms: 0,
+                data: vec![7u8; 8000],
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(15), host_task)
+            .await
+            .unwrap()
+            .unwrap();
         client_ep.wait_idle().await;
     }
 

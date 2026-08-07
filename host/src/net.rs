@@ -1805,7 +1805,13 @@ async fn run_session(
         stats_interval_ms: STATUS_INTERVAL_MS,
         control_capacity: 64,
         input_capacity: 512,
-        video_capacity: 8,
+        // The host only ever *sends* video (`video_pump` below). Running the
+        // driver's receive path here would keep a reassembler alive for
+        // datagrams no client sends, and give the client a second, unlimited
+        // route into `request_keyframe` — the `ControlMsg::RequestKeyframe`
+        // path in `control_loop` is rate-limited, `SessionEvent::KeyframeNeeded`
+        // is not.
+        receive_video: false,
         ..DriverConfig::default()
     };
     let (session, receivers) =

@@ -380,7 +380,6 @@ async fn client_session(addr: SocketAddr, code: &str) -> Result<Outcome> {
         quic.path.lost_packets, quic.path.sent_packets
     );
     println!("keyframe reqs: {}", session.keyframes_requested());
-    println!("client drops : {}", session.frames_dropped_local());
 
     // -- input -------------------------------------------------------------
     // Hold a key the desktop ignores, then let the host's release path put it
