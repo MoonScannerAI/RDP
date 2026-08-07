@@ -8,7 +8,13 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-directdesk-shared = { workspace = true }
+# `netsim` is parked behind a cargo feature in `shared` because no product
+# binary reaches it — this harness is its only consumer. The `test` disjunct on
+# that module's `#[cfg]` covers `shared`'s OWN test harness, not ours: `cfg(test)`
+# is not set in `shared` when a different crate builds it, so this feature has to
+# be requested explicitly. Drop it and every `directdesk_shared::netsim::*` path
+# in `src/` and `tests/` stops resolving.
+directdesk-shared = { workspace = true, features = ["netsim"] }
 # The refinement-tile rows drive the host's *real* congestion policy —
 # `tile_budget_kbps`, `congestion_signal`, `WindowDelivery` — rather than a copy
 # of it, which is the only way a test of that policy can catch a change to it.

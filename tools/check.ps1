@@ -62,7 +62,14 @@ try {
     $fmtOk = Run-Check -Name "cargo fmt --check" -ArgList @("fmt", "--check")
     if (-not $fmtOk) { $overallPass = $false }
 
-    $clippyOk = Run-Check -Name "cargo clippy --workspace -D warnings" -ArgList @("clippy", "--workspace", "--", "-D", "warnings")
+    # `--all-features` is not optional here. Several sizeable modules in
+    # `shared` (transport::tcp, transport::race, nettest, netsim) are parked
+    # behind default-off cargo features because no binary selects them. Without
+    # this flag clippy simply would not see ~7100 lines of the workspace, and
+    # parked code that nothing lints is code that rots. Do NOT also add
+    # `--all-targets`: that would newly subject every test file in the workspace
+    # to `-D warnings`, which is a large unrelated change in scope.
+    $clippyOk = Run-Check -Name "cargo clippy --workspace --all-features -D warnings" -ArgList @("clippy", "--workspace", "--all-features", "--", "-D", "warnings")
     if (-not $clippyOk) { $overallPass = $false }
 
     $testOk = Run-Check -Name "cargo test --workspace" -ArgList @("test", "--workspace")

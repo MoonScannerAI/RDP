@@ -24,8 +24,17 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 Push-Location $RepoRoot
 try {
-    Write-Host "==> cargo build --workspace --release" -ForegroundColor Cyan
-    & cargo build --workspace --release
+    # Deliberately three per-crate builds rather than one `--workspace`.
+    #
+    # Cargo unifies features across every member built in a single invocation.
+    # `directdesk-tests` depends on `directdesk-shared` with `features =
+    # ["netsim"]`, so a `--workspace` build compiles `shared` ONCE with the
+    # simulator switched on and links that rlib into all three shipped exes --
+    # silently undoing the parking that `shared/Cargo.toml` exists to do.
+    # Naming the three product crates keeps the tests crate out of the resolve,
+    # so the shipped binaries get the small `shared`. Same three exes either way.
+    Write-Host "==> cargo build --release (host, client, service)" -ForegroundColor Cyan
+    & cargo build --release -p directdesk-host -p directdesk-client -p directdesk-service
     if ($LASTEXITCODE -ne 0) {
         Write-Host "FAIL: release build failed (exit code $LASTEXITCODE)" -ForegroundColor Red
         exit 1

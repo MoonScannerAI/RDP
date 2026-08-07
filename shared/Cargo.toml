@@ -4,6 +4,66 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# ---------------------------------------------------------------------------
+# Features: the parked modules
+# ---------------------------------------------------------------------------
+#
+# Four sizeable modules in this crate are finished, tested, and selected by NO
+# binary: the TCP/TLS fallback transport, the route racer, the NAT/STUN prober,
+# and the deterministic network simulator. Together they are ~7100 lines that
+# every product build of host.exe, client.exe and service.exe was compiling and
+# linking so that nothing could call them. Each feature below parks one of
+# them — off by default, so the shipped binaries stop paying for code that no
+# code path can reach.
+#
+# THE GATE ON EACH MODULE MUST BE `#[cfg(any(feature = "...", test))]`,
+# NEVER a bare `#[cfg(feature = "...")]`.
+#
+# Why the `test` disjunct is not decoration: rustc sets `cfg(test)` when this
+# crate is compiled as its own test harness, which is exactly what
+# `cargo test --workspace` does for `-p directdesk-shared`. With `test` inside
+# the `any(...)`, each module and its `#[cfg(test)] mod tests` still compile and
+# run under that harness, while every product build excludes them. We lose the
+# code from the binaries and keep all ~105 of its tests.
+#
+# A bare feature gate would instead silently DELETE those ~105 tests from the
+# default suite. Nothing would go red. `cargo test --workspace` would print a
+# smaller number and pass — which is the worst failure mode a test suite has:
+# it stops testing and does not tell you. That is why `shared/src/lib.rs`
+# carries `#[cfg(test)] mod parked_modules`, a test that merely names one public
+# item from each parked module. Tidy a gate down to a bare feature and that file
+# stops COMPILING, so the suite fails loudly instead of quietly shrinking.
+#
+# `netsim` is the exception that proves the rule. The `directdesk-tests` crate
+# consumes it as an ordinary dependency, and `cfg(test)` in *this* crate is not
+# set when *another* crate builds it — so `tests/Cargo.toml` turns the feature
+# on explicitly with `features = ["netsim"]`. Delete that and the integration
+# harness fails to compile, which is loud enough on its own.
+#
+# One honest caveat about `netsim`, so nobody over-claims the win: cargo unifies
+# features across workspace members built in a single invocation. Because
+# `directdesk-tests` asks for `netsim`, a `cargo build --workspace --release`
+# (which is what `tools/build-installer.ps1` runs) compiles `shared` ONCE with
+# `netsim` on, and host/client/service link that rlib. The per-crate builds in
+# `docs/BUILDING.md` — `cargo build -p directdesk-host --release` and friends —
+# do not pull the tests crate in and so do get the smaller `shared`. The other
+# three features are requested by no member at all, so they are genuinely off in
+# every build either way.
+#
+# `tools/check.ps1` runs clippy with `--all-features` so the parked code stays
+# linted rather than rotting out of sight.
+[features]
+default = []
+# `transport::tcp` — the TLS-over-TCP fallback session (~2500 lines).
+transport-tcp = []
+# `transport::race` — staggered "happy eyeballs" route racing (~1250 lines).
+transport-race = []
+# `nettest` — the STUN client and the NAT/connectivity prober (~2200 lines).
+nettest = []
+# `netsim` — the deterministic network simulator (~1250 lines). Used only by
+# `directdesk-tests`, which enables this feature in its own manifest.
+netsim = []
+
 [dependencies]
 tokio = { workspace = true }
 quinn = { workspace = true }

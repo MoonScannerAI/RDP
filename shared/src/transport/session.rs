@@ -116,9 +116,12 @@ pub struct SessionConfig {
     /// every client is, and what the host's own integration tests act as. Only
     /// the host's real serving path sets it to `false`.
     ///
-    /// QUIC only. [`crate::transport::tcp::TcpSession`] carries media on the
-    /// same byte stream as control and input, so its reader cannot decline to
-    /// see it and this flag has no effect there.
+    /// QUIC only. `transport::tcp::TcpSession` carries media on the same byte
+    /// stream as control and input, so its reader cannot decline to see it and
+    /// this flag has no effect there. (Deliberately not an intra-doc link:
+    /// `tcp` is behind the `transport-tcp` feature and is off in a default
+    /// build, so a link here would be a broken-intra-doc-link warning that
+    /// `tools/check.ps1` does not run `cargo doc` to catch.)
     pub receive_video: bool,
 }
 
