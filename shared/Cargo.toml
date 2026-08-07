@@ -24,6 +24,11 @@ subtle = { workspace = true }
 zeroize = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
+# Lossless static-region tiles (see `tiles`). Default features select the pure
+# Rust `miniz_oxide` backend — no C toolchain, which this project deliberately
+# avoids. Already resolved in Cargo.lock transitively via `png`, so this pins no
+# new version and downloads nothing.
+flate2 = "1.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }

@@ -27,6 +27,7 @@ pub mod mfinit;
 pub mod net;
 pub mod session;
 pub mod testsupport;
+pub mod tiles;
 pub mod uac_client;
 pub mod uac_proto;
 pub mod ui;

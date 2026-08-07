@@ -25,6 +25,7 @@ use crate::input_capture::{
 use crate::pipeline::Pipeline;
 use crate::renderer::{describe_scale, is_exact_scale, FrameSlot, Presenter, VideoView};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
+use crate::tiles::TileStore;
 
 /// An outstanding UAC prompt on the remote host, awaiting an operator
 /// decision. Shown as a banner over the session view; auto-dismisses so a
@@ -89,6 +90,11 @@ pub struct ClientApp {
     _transport: Option<TransportEndpoints>,
     slot: Arc<FrameSlot>,
     pipeline: Pipeline,
+    /// The pipeline's lossless refinement store. Held here so every place that
+    /// already invalidates presentation state can invalidate the overlay in the
+    /// same breath — a tile describes *screen content*, so it outlives any one
+    /// decoded frame and nothing else would ever drop it.
+    tiles: Arc<TileStore>,
     presenter: Presenter,
     input: InputCapture,
     mode: SourceMode,
@@ -157,6 +163,11 @@ pub struct ClientApp {
     /// (and cleared) by `toolbar`, which is where `ctx` and `chrome_points`
     /// are available to actually resize the window.
     pending_auto_snap: bool,
+
+    /// Tint composited tiles green so their coverage is visible at a glance.
+    /// Bring-up aid; mirrored into the pipeline (which the decode thread
+    /// reads) whenever it changes. Deliberately not persisted.
+    tile_highlight: bool,
 }
 
 impl ClientApp {
@@ -181,6 +192,18 @@ impl ClientApp {
         if let Some(sup) = supervisor.as_mut() {
             sup.set_preferred_fps(init.config.preferred_fps);
         }
+
+        // Lossless refinement tiles. The store belongs to the pipeline (the
+        // decode thread paints from it and is spawned before this app exists);
+        // we take a clone to invalidate it and to read its gauges. Both ends of
+        // the delivery channel are wired here: the tile thread drains it, and
+        // the transport driver publishes into it through a one-time sink,
+        // because `run_client`'s argument list is owned by `ConnectSupervisor`.
+        let mut pipeline = init.pipeline;
+        let tiles = pipeline.tiles();
+        pipeline.attach_tile_thread(init.session.tiles_rx.clone());
+
+
         Self {
             address_input: init.config.host_address.clone(),
             udp_port_input: init.config.udp_port.to_string(),
@@ -193,7 +216,8 @@ impl ClientApp {
             session: init.session,
             _transport: init.transport,
             slot: init.slot,
-            pipeline: init.pipeline,
+            pipeline,
+            tiles,
             presenter: Presenter::new(),
             input,
             mode: init.mode,
@@ -223,6 +247,7 @@ impl ClientApp {
             last_fps_reassert: None,
             auto_snap_scale,
             pending_auto_snap: false,
+            tile_highlight: false,
         }
     }
 
@@ -290,6 +315,12 @@ impl ClientApp {
             if !state.is_live() {
                 self.presenter.reset();
                 self.slot.clear();
+                // The overlay describes a screen we are no longer watching, and
+                // `run_client` reconnects on its own — so without this a
+                // reconnect would paint the *old* session's pixels until every
+                // lease ran out. `clear` also disarms until the host's next
+                // `Reset`, which closes the race against strips still in flight.
+                self.tiles.clear();
                 // With background capture on, keep the hook installed across
                 // connection churn (connecting, WAN stalls, reconnects) so the
                 // capture path is live again the moment the session is. Nothing
@@ -339,6 +370,16 @@ impl ClientApp {
                 // First format learned this connection, so this is the moment
                 // "auto 1:1" (if the user opted in) should fire.
                 let first_config = self.host_video.is_none();
+                // A resolution change makes every resident tile's coordinates
+                // mean something else, so the overlay has to go. Gated, because
+                // this arm also fires on every fps re-assert (and on the reply
+                // to our own `StartStream`): clearing unconditionally would
+                // disarm the store several times a minute and the refinement
+                // would visibly blink off. See `tiles_invalidated_by_config`.
+                if tiles_invalidated_by_config(self.host_video, width, height) {
+                    tracing::info!("host resolution changed; dropping refinement tiles");
+                    self.tiles.clear();
+                }
                 // Retain the host's own dims/fps so the 1:1 button and the fps
                 // diagnostics work even before a frame has decoded.
                 self.host_video = Some((width, height, fps, bitrate_kbps));
@@ -403,6 +444,11 @@ impl ClientApp {
                     self.input.stop_capture();
                 }
                 self.presenter.reset();
+                // Matches `presenter.reset()` above: this site deliberately has
+                // no `slot.clear()`, but the overlay must still go — it would
+                // otherwise survive a host-initiated disconnect and be blitted
+                // onto the first frame of whatever comes next.
+                self.tiles.clear();
             }
             other => tracing::debug!("unhandled control message: {other:?}"),
         }
@@ -999,6 +1045,7 @@ impl ClientApp {
         self.input.stop_capture();
         self.presenter.reset();
         self.slot.clear();
+        self.tiles.clear();
         self.route = None;
         self.elevation = None;
         self.state = ConnectionState::Disconnected;
@@ -1203,6 +1250,103 @@ impl ClientApp {
             },
         );
         self.show_diagnostics = open;
+        self.tiles_window(ctx);
+    }
+
+    /// Lossless-refinement counters, shown alongside the diagnostics window and
+    /// under the same toggle.
+    ///
+    /// A window of its own rather than a section inside `diagnostics::show`:
+    /// `DiagnosticsInput` is the contract that panel renders and widening it is
+    /// not this change's business, whereas the highlight toggle needs `&mut
+    /// self` anyway.
+    fn tiles_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_diagnostics;
+        egui::Window::new("Lossless tiles")
+            .open(&mut open)
+            .default_width(300.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let armed = self.tiles.is_armed();
+                let (sw, sh) = self.tiles.store_size();
+                let bytes = self.tiles.resident_bytes();
+                egui::Grid::new("diag_tiles")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("State");
+                        if armed {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(90, 200, 120),
+                                egui::RichText::new(format!("armed for {sw} x {sh}")).monospace(),
+                            );
+                        } else {
+                            // Honest: not armed is not an error — it just means
+                            // the host has not sent (or has stopped sending)
+                            // refinement for this connection.
+                            ui.label(egui::RichText::new("not armed").monospace());
+                        }
+                        ui.end_row();
+
+                        ui.label("Resident tiles");
+                        ui.label(
+                            egui::RichText::new(self.tiles.resident_tiles().to_string())
+                                .monospace(),
+                        );
+                        ui.end_row();
+
+                        ui.label("Screen covered");
+                        ui.label(
+                            egui::RichText::new(match covered_percent(
+                                self.tiles.covered_pixels(),
+                                (sw, sh),
+                            ) {
+                                Some(pct) => format!("{pct:.1} %"),
+                                None => "—".to_string(),
+                            })
+                            .monospace(),
+                        );
+                        ui.end_row();
+
+                        ui.label("Resident bytes");
+                        ui.label(egui::RichText::new(format_bytes(bytes)).monospace());
+                        ui.end_row();
+
+                        ui.label("Admitted / dropped");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {}",
+                                self.tiles.tiles_admitted(),
+                                self.tiles.tiles_dropped_capacity()
+                            ))
+                            .monospace(),
+                        );
+                        ui.end_row();
+
+                        ui.label("Messages rejected");
+                        ui.label(
+                            egui::RichText::new(self.tiles.msgs_rejected().to_string()).monospace(),
+                        );
+                        ui.end_row();
+                    });
+
+                if ui
+                    .checkbox(&mut self.tile_highlight, "Highlight composited tiles")
+                    .on_hover_text(
+                        "Tint every refined region green as it is painted, so tile coverage \
+                         is visible against the H.264 picture. Diagnostic only — it changes \
+                         what you see, not what is stored.",
+                    )
+                    .changed()
+                {
+                    self.pipeline.set_tile_highlight(self.tile_highlight);
+                }
+            });
+        // The window's own close button turns the whole diagnostics toggle off,
+        // matching the main panel rather than leaving a second hidden switch.
+        if !open {
+            self.show_diagnostics = false;
+        }
     }
 
     fn persist(&mut self) {
@@ -1426,6 +1570,57 @@ fn largest_fitting_scale(
         .unwrap_or(0)
 }
 
+/// Share of the armed screen the resident tiles cover, or `None` when the store
+/// is disarmed and there is nothing honest to divide by.
+///
+/// `covered_pixels` ignores frame-edge clipping and double-counts nothing (the
+/// store is keyed by tile id), so this cannot exceed 100% for a real grid — but
+/// it is clamped anyway rather than rendering a number that reads as a bug.
+pub fn covered_percent(covered_px: u64, store_size: (u32, u32)) -> Option<f32> {
+    let total = u64::from(store_size.0) * u64::from(store_size.1);
+    if total == 0 {
+        return None;
+    }
+    Some((covered_px as f64 / total as f64 * 100.0).min(100.0) as f32)
+}
+
+/// Byte counts at a glance. Kept free of egui so it is unit-testable.
+pub fn format_bytes(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Whether a `VideoConfig` invalidates the lossless refinement overlay.
+///
+/// `prev` is `ClientApp::host_video` *before* this message is applied. Only a
+/// genuine change of the host's **dimensions** counts:
+///
+/// * fps and bitrate changes do not move a single pixel's coordinates, and this
+///   arm fires on every fps re-assert — treating those as invalidation would
+///   disarm the store repeatedly and the refinement would never settle.
+/// * The *first* config of a connection is not a change either. Nothing has
+///   been learned yet to contradict, and the paths that end a connection
+///   (`drain_session`'s non-live branch, `Bye`, `disconnect`) have already
+///   cleared the store. Clearing here as well would be a live hazard rather
+///   than a no-op: the host's `Reset` opens the tile stream around the same
+///   moment, and a `VideoConfig` processed after it would disarm a store the
+///   host believes is armed — leaving refinement off for the whole session,
+///   since `Reset` is not re-sent.
+pub fn tiles_invalidated_by_config(
+    prev: Option<(u32, u32, u32, u32)>,
+    width: u32,
+    height: u32,
+) -> bool {
+    prev.is_some_and(|(w, h, _, _)| (w, h) != (width, height))
+}
+
 /// Re-assert only when we want a *lower* rate than the host reports and we
 /// have not just asked. Never re-asserts upward: the host's configured fps is
 /// a ceiling we cannot raise, so `desired >= reported` is already the final
@@ -1572,6 +1767,57 @@ mod tests {
             largest_fitting_scale((1920, 1080), Some(tiny), 1.0, 40.0),
             0
         );
+    }
+
+    #[test]
+    fn video_config_clears_tiles_only_on_a_real_dimension_change() {
+        // The bug this guards: `VideoConfig` also arrives in reply to every fps
+        // re-assert and every `StartStream`. If those counted as invalidation
+        // the store would be disarmed several times a minute and refinement
+        // would never become visible.
+        let base = Some((1920u32, 1080u32, 60u32, 8_000u32));
+        assert!(!tiles_invalidated_by_config(base, 1920, 1080));
+
+        // Same dims, different fps / bitrate — the exact fps-re-assert case.
+        let fps_changed = Some((1920, 1080, 30, 8_000));
+        assert!(!tiles_invalidated_by_config(fps_changed, 1920, 1080));
+        let bitrate_changed = Some((1920, 1080, 60, 2_500));
+        assert!(!tiles_invalidated_by_config(bitrate_changed, 1920, 1080));
+
+        // A genuine resolution change: every tile's coordinates now mean
+        // something else, so the overlay must go.
+        assert!(tiles_invalidated_by_config(base, 1280, 1080));
+        assert!(tiles_invalidated_by_config(base, 1920, 720));
+        assert!(tiles_invalidated_by_config(base, 1280, 720));
+
+        // The first config of a connection is not a change. The disconnect
+        // paths already cleared the store, and clearing here could disarm a
+        // store the host has just armed with its `Reset`.
+        assert!(!tiles_invalidated_by_config(None, 1920, 1080));
+    }
+
+    #[test]
+    fn covered_percent_is_none_until_the_store_is_armed() {
+        assert_eq!(covered_percent(0, (0, 0)), None);
+        assert_eq!(covered_percent(1_000, (1920, 0)), None);
+        assert_eq!(covered_percent(1_000, (0, 1080)), None);
+    }
+
+    #[test]
+    fn covered_percent_reports_the_share_of_the_armed_screen() {
+        assert_eq!(covered_percent(0, (100, 100)), Some(0.0));
+        assert_eq!(covered_percent(5_000, (100, 100)), Some(50.0));
+        assert_eq!(covered_percent(10_000, (100, 100)), Some(100.0));
+        // Never renders as a number that reads like a bug.
+        assert_eq!(covered_percent(u64::MAX, (100, 100)), Some(100.0));
+    }
+
+    #[test]
+    fn format_bytes_scales_its_unit() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KiB");
+        assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
     }
 
     #[test]

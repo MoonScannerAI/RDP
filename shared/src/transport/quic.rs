@@ -446,6 +446,50 @@ async fn open_tagged(
     Ok((send, recv))
 }
 
+// ---------------------------------------------------------------------------
+// Bulk unidirectional stream (lossless refinement tiles)
+// ---------------------------------------------------------------------------
+//
+// Deliberately separate from the tagged bidirectional machinery above. Tiles
+// travel host→client only and are opened *after* the handshake, gated on a
+// mutually-agreed `Hello.features` bit — so there is no tag byte, no `Channel`
+// variant, and crucially no change to `accept_streams`' `for _ in 0..2`.
+//
+// That last point is the whole design: widening that loop would make a new host
+// wait for a third stream an old client never opens, and the only bound is the
+// 15 s handshake timeout, which lands in the auth-failure path and locks the
+// client out. Uni streams sidestep it entirely — the budget for them
+// (`max_concurrent_uni_streams(2)`) was already granted by shipped builds.
+
+/// Open the host→client bulk stream for refinement tiles.
+///
+/// Priority is [`PRIORITY_BULK`], below everything else, so tiles never delay a
+/// keystroke. Note this orders tiles only against other *streams*: video rides
+/// datagrams and shares the congestion window, which the caller must throttle.
+///
+/// [`PRIORITY_BULK`]: super::PRIORITY_BULK
+pub async fn open_bulk(conn: &Connection) -> Result<SendStream> {
+    let send = conn
+        .open_uni()
+        .await
+        .map_err(|e| Error::Transport(format!("open_uni(bulk): {e}")))?;
+    send.set_priority(super::PRIORITY_BULK)
+        .map_err(|e| Error::Transport(format!("set_priority(bulk): {e}")))?;
+    Ok(send)
+}
+
+/// Accept the host's bulk stream on the client side.
+///
+/// The caller only ever awaits this when it advertised the feature bit and the
+/// host echoed it, so a host that never opens the stream simply leaves this
+/// future pending — it must not be awaited on a path that would time the
+/// session out.
+pub async fn accept_bulk(conn: &Connection) -> Result<RecvStream> {
+    conn.accept_uni()
+        .await
+        .map_err(|e| Error::Transport(format!("accept_uni(bulk): {e}")))
+}
+
 /// Accept the session's streams on the host side, using the tag byte rather
 /// than accept order so the two ends cannot disagree.
 pub async fn accept_streams(conn: &Connection) -> Result<SessionStreams> {

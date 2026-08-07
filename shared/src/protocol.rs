@@ -53,6 +53,16 @@ pub mod features {
     pub const CLIPBOARD_TEXT: u64 = 1 << 0;
     pub const CURSOR_METADATA: u64 = 1 << 1;
     pub const ADAPTIVE_BITRATE: u64 = 1 << 2;
+    /// Lossless static-region tile refinement on a host-opened unidirectional
+    /// stream (see [`crate::tiles`]).
+    ///
+    /// Negotiated as an intersection: the client sets the bit in its `Hello`,
+    /// and the host echoes it only if it too supports and is configured for the
+    /// feature. The host opens the stream **only** when the bit is mutual, so a
+    /// peer that predates this feature never sees a byte of it — which is the
+    /// whole reason this is a feature bit rather than a `PROTOCOL_VERSION` bump
+    /// or a new `ControlMsg` variant. See the wire-stability tests below.
+    pub const LOSSLESS_TILES: u64 = 1 << 3;
 }
 
 /// Pairing + steady-state authentication messages.
@@ -263,5 +273,159 @@ mod tests {
             agent: "x".into(),
         };
         assert!(validate_hello(&h).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wire stability — the anti-brick suite.
+    //
+    // These tests exist to be READ by the next person adding a feature. The
+    // host is remote (Ohio) and is reached through the very session this
+    // protocol carries, so a wire change that breaks the handshake does not
+    // merely fail — it removes the means of shipping the fix.
+    //
+    // Every assertion below guards a specific, verified path to that outcome.
+    // If one fails, do not update the expected value: change your feature to
+    // negotiate via `Hello.features` instead, the way `LOSSLESS_TILES` does.
+    // -----------------------------------------------------------------------
+
+    /// Bumping `PROTOCOL_VERSION` bricks a remote host.
+    ///
+    /// `validate_hello` is exact-equality, so a mismatched version returns
+    /// `Error::Version`. That lands in the host's auth-failure path, which
+    /// calls `record_failure`; three failures inside 60 s trigger a 30 s IP
+    /// lockout — while the client's reconnect `BACKOFF_MAX` is only 10 s. The
+    /// client therefore retries *faster* than the lockout clears and the two
+    /// never converge: a permanent lockout loop, unrecoverable without
+    /// physical access to the host.
+    #[test]
+    fn protocol_version_is_pinned() {
+        assert_eq!(
+            PROTOCOL_VERSION, 1,
+            "bumping PROTOCOL_VERSION causes a permanent auth-lockout loop \
+             against every already-deployed peer — negotiate with a \
+             Hello.features bit instead"
+        );
+    }
+
+    /// `Hello`'s postcard encoding must not move.
+    ///
+    /// postcard is positional and has no field names: inserting, reordering or
+    /// retyping a field silently changes how an old peer parses the bytes. A
+    /// new *value* in the existing `features` u64 is safe; a new *field* is not.
+    #[test]
+    fn hello_encoding_is_stable() {
+        let h = Hello {
+            version: 1,
+            features: 0,
+            agent: "d".into(),
+        };
+        // version(u16 varint)=01, features(u64 varint)=00, agent len=01 'd'=64
+        assert_eq!(postcard::to_stdvec(&h).unwrap(), vec![0x01, 0x00, 0x01, 0x64]);
+
+        // Setting a feature bit must change only the features byte(s) — proof
+        // that negotiation costs no structural change.
+        let h2 = Hello {
+            features: features::LOSSLESS_TILES,
+            ..h
+        };
+        assert_eq!(postcard::to_stdvec(&h2).unwrap(), vec![0x01, 0x08, 0x01, 0x64]);
+    }
+
+    /// Adding a `ConnStats` field breaks every already-deployed peer.
+    ///
+    /// `ConnStats` rides inside `ControlMsg::Stats` and is decoded with
+    /// `decode_strict`, which rejects trailing bytes. A new field appends
+    /// bytes an old peer cannot account for → "trailing bytes" → the control
+    /// stream errors → `mark_closed`. The session dies on the first stats tick,
+    /// i.e. within a second of connecting.
+    #[test]
+    fn conn_stats_encoding_is_pinned() {
+        // Distinctive non-zero values on purpose: an all-default struct encodes
+        // every integer as a 1-byte varint, so it would not notice a u32 field
+        // widening to u64. These values make each field's width visible.
+        let s = crate::stats::ConnStats {
+            rtt_ms: 1.0,
+            jitter_ms: 2.0,
+            loss: 0.5,
+            bandwidth_kbps: 300,
+            fps_capture: 3.0,
+            fps_encode: 4.0,
+            fps_decode: 5.0,
+            fps_present: 6.0,
+            bitrate_kbps: 400,
+            frames_dropped: 500,
+            keyframes_requested: 600,
+            pipeline_ms: 7.0,
+            input_injected: 700,
+        };
+        let got = postcard::to_stdvec(&s).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                0x00, 0x00, 0x80, 0x3f, // rtt_ms      f32 1.0
+                0x00, 0x00, 0x00, 0x40, // jitter_ms   f32 2.0
+                0x00, 0x00, 0x00, 0x3f, // loss        f32 0.5
+                0xac, 0x02, // bandwidth_kbps       u32 varint 300
+                0x00, 0x00, 0x40, 0x40, // fps_capture f32 3.0
+                0x00, 0x00, 0x80, 0x40, // fps_encode  f32 4.0
+                0x00, 0x00, 0xa0, 0x40, // fps_decode  f32 5.0
+                0x00, 0x00, 0xc0, 0x40, // fps_present f32 6.0
+                0x90, 0x03, // bitrate_kbps         u32 varint 400
+                0xf4, 0x03, // frames_dropped       u32 varint 500
+                0xd8, 0x04, // keyframes_requested  u32 varint 600
+                0x00, 0x00, 0xe0, 0x40, // pipeline_ms f32 7.0
+                0xbc, 0x05, // input_injected       u64 varint 700
+            ],
+            "ConnStats' encoding moved: it is positional, so adding, removing, \
+             reordering or retyping a field makes every already-deployed peer \
+             fail decode_strict with 'trailing bytes' and drop the session on \
+             the first stats tick"
+        );
+    }
+
+    /// `ControlMsg` discriminants are positional in postcard, so *inserting* a
+    /// variant renumbers every variant after it. An old peer would then read a
+    /// `Bye` as something else entirely — and an unknown discriminant fails
+    /// `decode_strict`, which is treated as fatal and closes the session.
+    ///
+    /// New variants may only be APPENDED, and only once both ends are known to
+    /// support them. This test pins the existing order.
+    #[test]
+    fn control_msg_discriminants_are_pinned() {
+        let cases: [(ControlMsg, u8); 6] = [
+            (ControlMsg::StopStream, 1),
+            (ControlMsg::RequestKeyframe, 2),
+            (ControlMsg::Bye { reason: String::new() }, 13),
+            (ControlMsg::Ping { token: 0 }, 14),
+            (ControlMsg::Pong { token: 0 }, 15),
+            (ControlMsg::ElevationEnded, 12),
+        ];
+        for (msg, want) in cases {
+            let got = postcard::to_stdvec(&msg).unwrap()[0];
+            assert_eq!(got, want, "discriminant moved for {msg:?} — a variant was \
+                 inserted rather than appended; old peers will misparse every \
+                 later variant");
+        }
+    }
+
+    /// The tile feature must be negotiable, i.e. actually distinguishable from
+    /// the bits already in use. Cheap, but it catches a copy-paste collision.
+    #[test]
+    fn feature_bits_are_distinct() {
+        let bits = [
+            features::CLIPBOARD_TEXT,
+            features::CURSOR_METADATA,
+            features::ADAPTIVE_BITRATE,
+            features::LOSSLESS_TILES,
+        ];
+        for (i, a) in bits.iter().enumerate() {
+            assert!(a.count_ones() == 1, "feature bits must be single bits");
+            for b in &bits[i + 1..] {
+                assert_eq!(a & b, 0, "feature bit collision");
+            }
+        }
+        // The client reserves the high half for local hints
+        // (`FEATURE_PAIRING_REQUEST = 1 << 32`); protocol bits stay low.
+        assert!(bits.iter().all(|b| *b < (1u64 << 32)));
     }
 }

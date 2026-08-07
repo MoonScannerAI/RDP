@@ -537,6 +537,224 @@ pub fn congestion_signal(loss: f32, backpressure: f32, overrun: f32, warm: bool)
     loss.max(backpressure).max(overrun).clamp(0.0, 1.0)
 }
 
+/// Loss above this fraction means the link is already hurting; refinement
+/// tiles are a luxury and must stop entirely until it clears.
+const TILE_LOSS_CUTOFF: f32 = 0.02;
+
+/// Share of the measured spare headroom that tiles may claim. A quarter is
+/// deliberately timid: the headroom figure is an estimate, and being wrong in
+/// the generous direction degrades the video this feature exists to improve.
+const TILE_HEADROOM_SHARE: u32 = 4;
+
+/// Bandwidth (kbps) refinement tiles may use over the next window.
+///
+/// **This is the one hazard the design cannot structurally remove.** Tiles ride
+/// a QUIC stream and video rides datagrams, so they never contend for the same
+/// send buffer — but they share one congestion window. Unthrottled tiles
+/// therefore inflate `backpressured` → `pressure` → [`congestion_signal`] and
+/// the adaptor quietly cuts **video** bitrate, with no loss and no obvious
+/// cause. Stream priority does not help: it orders streams against each other,
+/// not against datagrams.
+///
+/// So the budget is spent only out of *demonstrated* spare capacity: the gap
+/// between what the adaptor has allocated and what the encoder is actually
+/// producing. On a static screen — exactly when tiles want to run — capture
+/// suppresses frames so `media_kbps` collapses while the adaptor's allocation
+/// stays high, which is precisely the headroom being measured.
+///
+/// Any sign of strain zeroes it outright rather than scaling it down: a
+/// half-speed refinement of a struggling link is still a struggling link.
+#[allow(clippy::too_many_arguments)]
+pub fn tile_budget_kbps(
+    adaptor_target: u32,
+    media_kbps: u32,
+    pressure: f32,
+    loss: f32,
+    oversized_keyframe: bool,
+    streaming: bool,
+    cap_kbps: u32,
+) -> u32 {
+    // Any backpressure at all: quinn already had to drop something we offered.
+    if !streaming || oversized_keyframe || pressure > 0.0 || loss > TILE_LOSS_CUTOFF {
+        return 0;
+    }
+    let headroom = adaptor_target.saturating_sub(media_kbps) / TILE_HEADROOM_SHARE;
+    // `0` on the cap means "no explicit ceiling"; the headroom is the limit.
+    if cap_kbps == 0 {
+        headroom
+    } else {
+        headroom.min(cap_kbps)
+    }
+}
+
+/// Lowest tile ceiling the throttle will learn down to, and the level it starts
+/// from. Conservative on purpose: refinement ramping up over a few seconds is
+/// invisible, refinement overshooting is not.
+pub const TILE_CEILING_MIN_KBPS: u32 = 500;
+/// Ramp step while the ceiling is still below a level known to be safe.
+pub const TILE_CEILING_STEP_KBPS: u32 = 500;
+
+/// Step used when probing *above* the last known-safe level.
+///
+/// Deliberately tiny. Overshooting is not symmetric with under-using: an
+/// overshoot costs the **video** bitrate a 30% multiplicative cut that takes
+/// many seconds of additive recovery to undo, while under-using costs only some
+/// refinement latency on a picture that is already correct. So above the safe
+/// level this creeps rather than steps.
+///
+/// A flat step cannot converge at all below a certain link speed: the cycle
+/// settles wherever `spare > STEP / (1 - BACKOFF)`, which for a 500 kbps step is
+/// 1667 kbps. Measured on a link with ~1550 kbps spare, `0.7 * 1664 + 500` is an
+/// exact fixed point, so the same damaging level recurred on schedule forever.
+/// 64 kbps puts that floor at ~213 kbps instead.
+pub const TILE_CEILING_CREEP_KBPS: u32 = 64;
+/// Multiplicative decrease on strain. Matches the video adaptor's
+/// `decrease_factor` so the two react to congestion at the same rate.
+pub const TILE_CEILING_BACKOFF: f32 = 0.7;
+
+/// Learns how much bandwidth refinement may actually use, by experiment.
+///
+/// # Why the gap alone is not enough
+///
+/// [`tile_budget_kbps`] offers a quarter of `adaptor_target - media_kbps`, and
+/// that gap is only *demonstrated* spare capacity when the encoder has actually
+/// been filling the link. On a low-motion screen it has not: the encoder is
+/// **content** limited, so video alone never congests anything, so the adaptor's
+/// AIMD ratchets its target all the way to the quality mode's ceiling (28 Mbps
+/// on `TextDesktop`) without ever testing what the link can carry. A quarter of
+/// that un-validated gap can exceed the real spare capacity — and it does so
+/// precisely on a still screen, which is exactly when refinement runs.
+///
+/// The failure is invisible in the obvious places: the link drops nothing, so
+/// packet loss stays at zero. What happens instead is that tile bytes fill the
+/// shared congestion window, the *video* pump's datagrams no longer fit, and the
+/// adaptor reads that backpressure as congestion and cuts the **video** bitrate
+/// 30%. Measured on a 2500 kbps link, that held the video target at ~42% of
+/// where the same link sat with refinement switched off.
+///
+/// So the ceiling is learned the same way the video bitrate is: additive
+/// increase while clean, multiplicative decrease on strain — and the decrease is
+/// anchored to what was **actually spent**, not to the previous ceiling, because
+/// the ceiling may sit far above the level that did the damage.
+#[derive(Debug, Clone)]
+pub struct TileThrottle {
+    ceiling_kbps: u32,
+    /// Highest level not yet known to hurt — TCP's `ssthresh` in all but name.
+    /// Below it the ceiling ramps; above it it creeps.
+    safe_kbps: u32,
+    /// Whether the window just closed was strained, and therefore granted
+    /// nothing. Distinguishes "refinement declined its grant" from "refinement
+    /// was never given one" — `spent_kbps` is zero in both cases and cannot
+    /// tell them apart.
+    last_window_strained: bool,
+}
+
+impl Default for TileThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TileThrottle {
+    pub fn new() -> Self {
+        Self {
+            ceiling_kbps: TILE_CEILING_MIN_KBPS,
+            // Nothing is known to hurt yet, so the initial ramp is the fast one.
+            safe_kbps: u32::MAX,
+            last_window_strained: false,
+        }
+    }
+
+    /// The learned ceiling, for diagnostics.
+    pub fn ceiling(&self) -> u32 {
+        self.ceiling_kbps
+    }
+
+    /// Fold in one status window and return the budget for the next.
+    ///
+    /// `spent_kbps` is the tile bandwidth actually used over the window just
+    /// closed — the evidence the ceiling is learned from.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe(
+        &mut self,
+        spent_kbps: u32,
+        adaptor_target: u32,
+        media_kbps: u32,
+        pressure: f32,
+        loss: f32,
+        oversized_keyframe: bool,
+        streaming: bool,
+        cap_kbps: u32,
+    ) -> u32 {
+        let strained =
+            !streaming || oversized_keyframe || pressure > 0.0 || loss > TILE_LOSS_CUTOFF;
+        if strained {
+            // Only learn from strain refinement could plausibly have caused,
+            // and `pressure` is the signal that actually implicates it: it means
+            // our own sending outran the congestion window. Packet loss with no
+            // backpressure is the link being lossy on its own — video was going
+            // to lose those packets regardless — so lowering the tile ceiling
+            // for it is a false attribution that throttles refinement on
+            // precisely the links where it was never the problem.
+            if spent_kbps > 0 && pressure > 0.0 {
+                let backed_off =
+                    ((spent_kbps as f32 * TILE_CEILING_BACKOFF) as u32).max(TILE_CEILING_MIN_KBPS);
+                self.safe_kbps = backed_off;
+                self.ceiling_kbps = backed_off;
+            }
+            self.last_window_strained = true;
+            return 0;
+        }
+        let gap = tile_budget_kbps(
+            adaptor_target,
+            media_kbps,
+            pressure,
+            loss,
+            oversized_keyframe,
+            streaming,
+            cap_kbps,
+        );
+
+        // Grow the ceiling ONLY on evidence, which means two things had to be
+        // true of the window just closed: the ceiling is what held refinement
+        // back (rather than the gap), and refinement actually used most of what
+        // it was granted.
+        //
+        // Without this the learned value is thrown away. The ceiling climbs a
+        // flat step per clean window while the gap it is meant to bound grows
+        // only a quarter of the adaptor's own step, so within about two windows
+        // the ceiling overtakes the gap and stops binding — the backoff keeps
+        // correctly landing it near the safe level, and the very next window
+        // discards that answer and reverts to the raw gap. Measured on a
+        // constrained link, the ceiling bound the budget in 2 of 29 windows.
+        //
+        // This is the rule TCP applies when it is application-limited rather
+        // than window-limited: a grant you did not spend is no evidence the
+        // link would have carried more.
+        let ceiling_was_binding = self.ceiling_kbps <= gap;
+        // A window that was granted nothing is not a refusal, and must not be
+        // read as one. `spent_kbps` is zero both when refinement declined its
+        // grant and when it never had one; without this distinction a link that
+        // strains every other window can never climb out of the floor, because
+        // every recovery window follows a zeroed one.
+        let judgeable = !self.last_window_strained;
+        let used_its_grant = spent_kbps.saturating_mul(2) >= self.ceiling_kbps;
+        if ceiling_was_binding && (!judgeable || used_its_grant) {
+            let step = if self.ceiling_kbps < self.safe_kbps {
+                TILE_CEILING_STEP_KBPS
+            } else {
+                TILE_CEILING_CREEP_KBPS
+            };
+            self.ceiling_kbps = self
+                .ceiling_kbps
+                .saturating_add(step)
+                .min(crate::config::MAX_TILE_KBPS);
+        }
+        self.last_window_strained = false;
+        gap.min(self.ceiling_kbps)
+    }
+}
+
 /// Combine the host's standing cap with a client's `BitrateLimit`. A client can
 /// only narrow the cap, never widen it.
 pub fn effective_cap(host_cap: Option<u32>, client_limit: Option<u32>) -> Option<u32> {
@@ -773,6 +991,9 @@ pub struct NetConfig {
     /// session and restore the previous wallpaper/color when it ends. See
     /// [`crate::config::HostConfig::blank_wallpaper_during_session`].
     pub blank_wallpaper_during_session: bool,
+    /// Backstop ceiling (kbps) on lossless refinement traffic; `0` means the
+    /// measured headroom is the only limit. See [`tile_budget_kbps`].
+    pub tile_max_kbps: u32,
 }
 
 impl NetConfig {
@@ -788,6 +1009,7 @@ impl NetConfig {
             uac_clickthrough: cfg.uac_clickthrough,
             uac_arm_ttl_secs: cfg.uac_arm_ttl_secs,
             blank_wallpaper_during_session: cfg.blank_wallpaper_during_session,
+            tile_max_kbps: cfg.lossless_tile_max_kbps,
         }
     }
 }
@@ -1161,6 +1383,15 @@ struct ReleaseGuard(Arc<HostSession>);
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
         self.0.release_all_input();
+        // Stop refinement dead when the client goes away. The media pipeline is
+        // a singleton that outlives every connection, and `status_loop` — the
+        // only thing that ever lowers this — has just been aborted, so without
+        // this the media thread would carry on compressing and queueing strips
+        // at the departed client's measured budget, for a desktop nobody is
+        // watching. Those stale bytes would then be the first thing the *next*
+        // client's stream carried, ahead of its own `Reset`, competing with its
+        // connect keyframe.
+        self.0.set_tile_budget_kbps(0);
         tracing::info!("released all client-held input");
     }
 }
@@ -1189,7 +1420,7 @@ async fn handle_connection(inner: Arc<Inner>, incoming: quinn::Incoming) -> Resu
     )
     .await;
 
-    let (streams, client) = match handshake {
+    let (streams, client, negotiated_features) = match handshake {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             let locked = inner
@@ -1250,18 +1481,35 @@ async fn handle_connection(inner: Arc<Inner>, incoming: quinn::Incoming) -> Resu
         peer,
     });
 
-    let reason = run_session(&inner, conn, streams).await;
+    let reason = run_session(&inner, conn, streams, negotiated_features).await;
     tracing::info!(peer = %peer, "client disconnected: {reason}");
     inner.emit(NetEvent::ClientDisconnected { reason });
     Ok(())
 }
 
-fn host_hello() -> Hello {
+/// The host's reply to a client `Hello`, advertising the **intersection** of
+/// what the client asked for and what this host supports.
+///
+/// Answering with the intersection rather than the host's full capability set
+/// means the client's check is a single bit test, and neither side can end up
+/// believing a feature is on while the other thinks it is off. `offered` is
+/// derived from config, so an operator turning a feature off is indistinguishable
+/// from a host that never had it.
+fn host_hello(client_features: u64, offered: u64) -> Hello {
     Hello {
         version: PROTOCOL_VERSION,
-        features: 0,
+        features: client_features & offered,
         agent: concat!("directdesk-host ", env!("CARGO_PKG_VERSION")).to_string(),
     }
+}
+
+/// Feature bits this host is willing to turn on, given its configuration.
+fn offered_features(cfg: &NetConfig) -> u64 {
+    let mut bits = 0;
+    if cfg.pipeline.lossless_tiles_enabled {
+        bits |= directdesk_shared::protocol::features::LOSSLESS_TILES;
+    }
+    bits
 }
 
 /// Tell a second client the host is taken, in the framing it is expecting.
@@ -1270,7 +1518,9 @@ async fn reject_busy(conn: &Connection) {
     let _ = tokio::time::timeout(deadline, async {
         let mut streams = quic::accept_streams(conn).await?;
         let _ = quic::read_framed::<Hello>(&mut streams.control.1, MAX_AUTH_MSG).await;
-        quic::write_framed(&mut streams.control.0, &host_hello()).await?;
+        // A host that is turning this client away offers nothing: the session
+        // is about to be closed, so advertising capabilities would be noise.
+        quic::write_framed(&mut streams.control.0, &host_hello(0, 0)).await?;
         quic::write_framed(
             &mut streams.control.0,
             &AuthMsg::AuthFail {
@@ -1286,19 +1536,36 @@ async fn reject_busy(conn: &Connection) {
 
 /// Hello exchange plus the pairing-or-authentication branch.
 ///
-/// Returns the session's streams and the client record on success. Every error
-/// path has already told the client `AuthFail` with a deliberately vague
-/// reason: "not paired" and "bad signature" must not be distinguishable.
+/// Returns the session's streams, the client record, and the **negotiated
+/// feature bits** on success. Every error path has already told the client
+/// `AuthFail` with a deliberately vague reason: "not paired" and "bad
+/// signature" must not be distinguishable.
+///
+/// Ordering note that the whole tile feature rests on: the client writes its
+/// `Hello` blind, the host reads it *before* writing its own reply, and the
+/// client reads the host's reply before doing anything else. So both ends know
+/// the intersection before either acts on it, and the host opens the tile
+/// stream only to a client that asked for it.
 async fn authenticate(
     inner: &Arc<Inner>,
     conn: &Connection,
-) -> Result<(SessionStreams, TrustedPeer)> {
+) -> Result<(SessionStreams, TrustedPeer, u64)> {
     let mut streams = quic::accept_streams(conn).await?;
 
     let hello: Hello = quic::read_framed(&mut streams.control.1, MAX_AUTH_MSG).await?;
     directdesk_shared::protocol::validate_hello(&hello)?;
-    quic::write_framed(&mut streams.control.0, &host_hello()).await?;
-    tracing::debug!(agent = %hello.agent, "client hello accepted");
+    let negotiated = hello.features & offered_features(&inner.cfg);
+    quic::write_framed(
+        &mut streams.control.0,
+        &host_hello(hello.features, offered_features(&inner.cfg)),
+    )
+    .await?;
+    tracing::debug!(
+        agent = %hello.agent,
+        client_features = format_args!("{:#x}", hello.features),
+        negotiated = format_args!("{negotiated:#x}"),
+        "client hello accepted"
+    );
 
     let exporter = quic::channel_binding(conn)?;
     let (mut authenticator, challenge) = HostAuthenticator::start(&exporter)?;
@@ -1374,7 +1641,7 @@ async fn authenticate(
             fingerprint: peer.fingerprint_short(),
         });
     }
-    Ok((streams, peer))
+    Ok((streams, peer, negotiated))
 }
 
 /// The SPAKE2 exchange, then the client's proof of which key it owns.
@@ -1483,7 +1750,12 @@ struct VideoCounters {
 /// Drive one authenticated client until the connection ends.
 ///
 /// Returns the reason the session finished, for the log and the UI.
-async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStreams) -> String {
+async fn run_session(
+    inner: &Arc<Inner>,
+    conn: Connection,
+    streams: SessionStreams,
+    negotiated_features: u64,
+) -> String {
     let pipeline = match inner.ensure_pipeline().await {
         Ok(p) => p,
         Err(e) => {
@@ -1496,6 +1768,13 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
     };
     // Nothing below may return without this guard being dropped.
     let _release = ReleaseGuard(pipeline.clone());
+    // The pipeline is a singleton that outlives any one connection, so a
+    // reconnecting client inherits a grid that still believes the *previous*
+    // client's tiles are resident. This client's store is empty. Reset
+    // unconditionally — it costs one full refinement sweep on a screen we are
+    // about to send a keyframe for anyway, and skipping it means a permanently
+    // soft picture on every connection after the first.
+    pipeline.reset_tiles();
     // Bandwidth saver: blank the desktop to black for the life of this
     // session and restore it on every exit path (this function's `String`
     // return covers all of them — success, error, timeout, disconnect). A
@@ -1560,7 +1839,11 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
         stop.clone(),
     ));
 
-    let tasks = vec![
+    // Lossless refinement, only when BOTH ends asked for it. `negotiated_features`
+    // is already the intersection, so this is a single bit test — and a client
+    // that predates the feature never gets a stream opened at it.
+    let tile_counters = Arc::new(TileCounters::default());
+    let mut tasks = vec![
         tokio::spawn(input_loop(receivers.input, pipeline.clone())),
         tokio::spawn(control_loop(
             inner.clone(),
@@ -1577,6 +1860,8 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
             pipeline.clone(),
             adaptor,
             counters.clone(),
+            streaming.clone(),
+            tile_counters.clone(),
         )),
         tokio::spawn(event_loop(
             inner.clone(),
@@ -1584,6 +1869,15 @@ async fn run_session(inner: &Arc<Inner>, conn: Connection, streams: SessionStrea
             pipeline.clone(),
         )),
     ];
+
+    if negotiated_features & directdesk_shared::protocol::features::LOSSLESS_TILES != 0 {
+        tasks.push(tokio::spawn(tile_pump(
+            conn.clone(),
+            pipeline.tiles(),
+            stop.clone(),
+            tile_counters,
+        )));
+    }
 
     let reason = conn.closed().await.to_string();
 
@@ -1967,12 +2261,110 @@ fn apply_bitrate(inner: &Arc<Inner>, pipeline: &Arc<HostSession>, kbps: u32) {
 }
 
 /// Periodic host → client status, and the adaptive bitrate loop.
+/// How long the pump sleeps when the tile queue is empty. Tiles are a
+/// background trickle, not a paced real-time stream, so a coarse poll costs
+/// nothing and keeps this an ordinary abortable tokio task.
+const TILE_POLL_MS: u64 = 15;
+
+#[derive(Default)]
+struct TileCounters {
+    strips_sent: AtomicU64,
+    strips_dropped: AtomicU64,
+    bytes_sent: AtomicU64,
+    control_sent: AtomicU64,
+}
+
+/// Ship refinement messages to the client on the bulk unidirectional stream.
+///
+/// Lives in `tasks`, so it is aborted when the session ends. That is exactly
+/// right: an aborted pump simply stops renewing leases, every outstanding tile
+/// expires on the client, and the picture reverts to plain H.264. There is no
+/// cleanup to get wrong.
+///
+/// Failure policy throughout: **this task may degrade the picture, never the
+/// session.** Any stream error stops the pump and leaves the connection alive.
+/// Note what this task deliberately does **not** do: it never drops a message.
+///
+/// The budget is spent by the media thread *before* a strip is queued, because
+/// only the media thread owns the grid. If this task dropped a queued strip,
+/// the grid would already have recorded it as delivered (`commit_sent`), the
+/// hash guard would suppress every re-send, and that square of the screen would
+/// stay soft forever — the same class of bug as a reconnect inheriting a stale
+/// grid, and just as invisible in testing.
+///
+/// Congestion is therefore handled by *waiting*, not discarding: this task
+/// stalls, the bounded queue fills, and the media thread's `try_send` fails and
+/// calls `abandon`, which leaves the tile eligible for a later pass. Every link
+/// in that chain fails toward "send it again", never toward "assume it landed".
+async fn tile_pump(
+    conn: Connection,
+    tiles: CbReceiver<directdesk_shared::tiles::TileMsg>,
+    stop: Arc<AtomicBool>,
+    counters: Arc<TileCounters>,
+) {
+    use directdesk_shared::tiles::TileMsg;
+
+    let mut send = match quic::open_bulk(&conn).await {
+        Ok(s) => s,
+        Err(e) => {
+            // The client agreed to the feature but the stream would not open.
+            // Nothing else about the session is affected.
+            tracing::warn!("lossless tiles disabled for this session: {e}");
+            return;
+        }
+    };
+    tracing::info!("lossless tile stream open");
+
+    while !stop.load(Ordering::Relaxed) {
+        // Deliberately no congestion check here. Throttling happens twice
+        // already, both in places that can decline work rather than destroy it:
+        // `status_loop` zeroes the budget on any strain, and the media thread
+        // spends that budget before it plans a strip. A check *here* could only
+        // act on a message already dequeued — and dropping it would be the one
+        // failure this feature must not have. Congestion instead arrives as
+        // natural backpressure: `write_framed` awaits, this queue fills, and the
+        // media thread's `try_send` fails into `abandon`, which retries later.
+        let msg = match tiles.try_recv() {
+            Ok(m) => m,
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                tokio::time::sleep(Duration::from_millis(TILE_POLL_MS)).await;
+                continue;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        };
+
+        match &msg {
+            TileMsg::Strip { data, .. } => {
+                counters.strips_sent.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .bytes_sent
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+            _ => {
+                counters.control_sent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if let Err(e) = quic::write_framed(&mut send, &msg).await {
+            tracing::warn!("tile stream write failed, refinement off: {e}");
+            break;
+        }
+    }
+
+    // Best-effort tidy: a clean finish lets the client's reader end without
+    // logging an error. Failure here is irrelevant, the session owns the
+    // connection.
+    let _ = send.finish();
+}
+
 async fn status_loop(
     inner: Arc<Inner>,
     session: Arc<QuicSession>,
     pipeline: Arc<HostSession>,
     adaptor: Arc<Mutex<BitrateAdaptor>>,
     counters: Arc<VideoCounters>,
+    streaming: Arc<AtomicBool>,
+    tile_counters: Arc<TileCounters>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(STATUS_INTERVAL_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1981,6 +2373,8 @@ async fn status_loop(
     let mut prev_bytes = 0u64;
     let mut prev_backpressured = 0u64;
     let mut prev_now = inner.now_ms();
+    let mut tile_throttle = TileThrottle::new();
+    let mut prev_tile_bytes = 0u64;
     let mut intervals = 0u32;
 
     loop {
@@ -2122,6 +2516,57 @@ async fn status_loop(
         // starved by encode). It stalling while frames_sent races is the
         // signature of the input-priority bug.
         tracing::info!(input_injected = injected, frames_sent = sent, "host input diag");
+
+        // Refill the refinement allowance from this window's measurements. Done
+        // here because every input is already computed once per second and
+        // agrees with what the adaptor just decided — recomputing any of it
+        // elsewhere would risk the two disagreeing.
+        // What refinement actually spent over the window just closed. This is
+        // the evidence the ceiling is learned from, so it must be a matched
+        // delta over the same window as `delivery`, not a lifetime total.
+        let tile_bytes_now = tile_counters.bytes_sent.load(Ordering::Relaxed);
+        let tile_spent_kbps = {
+            // `delivery.dt_ms`, not `now - prev_now`: `prev_now` was already
+            // advanced above, so recomputing it here would always give zero.
+            let dt_ms = delivery.dt_ms.max(1);
+            let delta = tile_bytes_now.saturating_sub(prev_tile_bytes);
+            ((delta * 8) / dt_ms) as u32
+        };
+        prev_tile_bytes = tile_bytes_now;
+
+        let budget = tile_throttle.observe(
+            tile_spent_kbps,
+            adaptor.lock().current(),
+            media.bitrate_kbps,
+            pressure,
+            transport.loss,
+            oversized_keyframe,
+            streaming.load(Ordering::Relaxed),
+            inner.cfg.tile_max_kbps,
+        );
+        // Published to the media thread, which is the only place a strip can be
+        // dropped safely — it owns the grid, so it can decline to *plan* work
+        // rather than discard work it has already recorded as delivered.
+        pipeline.set_tile_budget_kbps(budget);
+
+        let tile_strips = tile_counters.strips_sent.load(Ordering::Relaxed);
+        if tile_strips > 0 || tile_counters.strips_dropped.load(Ordering::Relaxed) > 0 {
+            // Hazard 6's observable signature, logged together on purpose: if
+            // `backpressured` climbs while tile traffic flows and loss stays at
+            // zero, tiles are stealing the congestion window from video and the
+            // budget above is too generous.
+            tracing::info!(
+                tile_strips,
+                tile_dropped = tile_counters.strips_dropped.load(Ordering::Relaxed),
+                tile_kbytes = tile_counters.bytes_sent.load(Ordering::Relaxed) / 1024,
+                tile_spent_kbps,
+                tile_budget_kbps = budget,
+                tile_ceiling_kbps = tile_throttle.ceiling(),
+                backpressured,
+                loss = transport.loss,
+                "tile diag"
+            );
+        }
     }
 }
 
@@ -2760,10 +3205,373 @@ mod tests {
 
     #[test]
     fn host_hello_matches_the_contract() {
-        let h = host_hello();
+        let h = host_hello(0, 0);
         assert_eq!(h.version, PROTOCOL_VERSION);
         assert!(directdesk_shared::protocol::validate_hello(&h).is_ok());
         assert!(h.agent.starts_with("directdesk-host"));
+    }
+
+    #[test]
+    fn host_hello_advertises_the_intersection() {
+        use directdesk_shared::protocol::features::LOSSLESS_TILES;
+
+        // Both sides want it → on.
+        assert_eq!(
+            host_hello(LOSSLESS_TILES, LOSSLESS_TILES).features,
+            LOSSLESS_TILES
+        );
+        // Client asks, host is not configured for it → off. This is the case
+        // that must hold for rollout step 1, where the code ships inert.
+        assert_eq!(host_hello(LOSSLESS_TILES, 0).features, 0);
+        // Host offers, an older client never asked → off, and the host must
+        // therefore never open the stream.
+        assert_eq!(host_hello(0, LOSSLESS_TILES).features, 0);
+        // A client advertising bits this host has never heard of must not cause
+        // the host to echo them back as if it understood.
+        assert_eq!(host_hello(u64::MAX, LOSSLESS_TILES).features, LOSSLESS_TILES);
+    }
+
+    #[test]
+    fn tiles_never_spend_a_link_that_is_already_strained() {
+        // Every strain signal must zero the budget outright, not scale it.
+        // These are the exact inputs that would otherwise make the adaptor cut
+        // video bitrate and leave no trace of why.
+        assert_eq!(tile_budget_kbps(20_000, 2_000, 0.01, 0.0, false, true, 0), 0);
+        assert_eq!(tile_budget_kbps(20_000, 2_000, 0.0, 0.05, false, true, 0), 0);
+        assert_eq!(tile_budget_kbps(20_000, 2_000, 0.0, 0.0, true, true, 0), 0);
+        assert_eq!(tile_budget_kbps(20_000, 2_000, 0.0, 0.0, false, false, 0), 0);
+    }
+
+    #[test]
+    fn tiles_claim_only_a_quarter_of_demonstrated_headroom() {
+        // The static-screen case the feature exists for: the adaptor still has
+        // 20 Mbps allocated while a suppressed capture emits almost nothing.
+        assert_eq!(
+            tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 0),
+            5_000,
+            "a quarter of the measured gap, not the whole gap"
+        );
+        // No headroom means no tiles, never a negative or wrapped value.
+        assert_eq!(tile_budget_kbps(4_000, 8_000, 0.0, 0.0, false, true, 0), 0);
+        assert_eq!(tile_budget_kbps(0, 0, 0.0, 0.0, false, true, 0), 0);
+    }
+
+    #[test]
+    fn the_configured_ceiling_narrows_but_never_widens() {
+        // Same idiom as `effective_cap`: a cap may only lower the figure.
+        assert_eq!(tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 1_000), 1_000);
+        assert_eq!(tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 99_000), 5_000);
+        // 0 means "no explicit ceiling" — it must not mean "no bandwidth".
+        assert_eq!(tile_budget_kbps(20_000, 0, 0.0, 0.0, false, true, 0), 5_000);
+    }
+
+    #[test]
+    fn the_tile_ceiling_starts_conservative_and_climbs_additively() {
+        let mut t = TileThrottle::new();
+        assert_eq!(t.ceiling(), TILE_CEILING_MIN_KBPS);
+        // A huge gap must NOT be taken on trust: the ceiling is what binds
+        // until the link has actually carried that much without complaint.
+        let first = t.observe(0, 28_000, 0, 0.0, 0.0, false, true, 0);
+        assert_eq!(first, TILE_CEILING_MIN_KBPS);
+        // Spending the whole grant on a clean link is the evidence that earns
+        // the next step up.
+        let mut budget = first;
+        for _ in 0..8 {
+            budget = t.observe(budget, 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        assert!(budget > first, "a clean link must let refinement grow");
+    }
+
+    #[test]
+    fn a_grant_that_was_not_spent_is_no_evidence_the_link_would_carry_more() {
+        // Application-limited, not ceiling-limited: refinement had nothing to
+        // send. Raising the ceiling here would be inventing capacity from
+        // silence — and it is exactly how the learned value gets discarded.
+        let mut t = TileThrottle::new();
+        let before = t.ceiling();
+        for _ in 0..20 {
+            t.observe(0, 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        assert_eq!(t.ceiling(), before, "silence must not raise the ceiling");
+    }
+
+    #[test]
+    fn link_loss_without_backpressure_is_not_blamed_on_refinement() {
+        // A lossy link drops packets whether or not tiles are running. Reading
+        // that as "refinement overfilled the window" throttles it hardest on
+        // exactly the links where it was never the cause — measured as a third
+        // less refinement on a 3% link whose backpressure count was zero.
+        // The budget is still zeroed (loss means spend nothing), but the
+        // *learned* ceiling must survive.
+        let mut t = TileThrottle::new();
+        let mut budget = 0;
+        for _ in 0..10 {
+            budget = t.observe(budget, 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        let learned = t.ceiling();
+        assert!(learned > TILE_CEILING_MIN_KBPS);
+
+        // Pure packet loss, no backpressure at all.
+        assert_eq!(t.observe(budget, 28_000, 0, 0.0, 0.05, false, true, 0), 0);
+        assert_eq!(t.ceiling(), learned, "link loss must not lower the ceiling");
+
+        // Backpressure, on the other hand, does implicate refinement.
+        assert_eq!(t.observe(budget, 28_000, 0, 0.2, 0.0, false, true, 0), 0);
+        assert!(t.ceiling() < learned, "backpressure must lower it");
+    }
+
+    #[test]
+    fn a_window_that_was_granted_nothing_is_not_counted_as_a_refusal() {
+        // The recovery window after any strain is granted 0, so it necessarily
+        // spends 0. Treating that as "refinement declined its grant" would mean
+        // a link that strains every other window could never climb out of the
+        // floor, because every recovery window follows a zeroed one.
+        let mut t = TileThrottle::new();
+        // Strain immediately, so the ceiling is floored and the next window is
+        // a recovery one.
+        t.observe(2_000, 28_000, 0, 0.2, 0.0, false, true, 0);
+        let floored = t.ceiling();
+
+        // Clean window, but spent is 0 because the previous grant was 0.
+        let grant = t.observe(0, 28_000, 0, 0.0, 0.0, false, true, 0);
+        assert!(
+            t.ceiling() > floored,
+            "recovery stalled: ceiling stuck at {floored}"
+        );
+        assert!(grant > 0);
+    }
+
+    #[test]
+    fn probing_above_a_known_safe_level_creeps_rather_than_steps() {
+        // Overshoot is not symmetric with under-use: it costs the VIDEO a 30%
+        // multiplicative cut that takes seconds to recover, while under-use
+        // costs only refinement latency. A flat step also cannot converge below
+        // `STEP / (1 - BACKOFF)` of spare capacity — 1667 kbps at a 500 step,
+        // which is why a link with ~1550 spare sat on an exact fixed point.
+        let mut t = TileThrottle::new();
+        let mut budget = 0;
+        for _ in 0..12 {
+            budget = t.observe(budget, 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        // Establish a safe level by hurting it once.
+        t.observe(budget, 28_000, 0, 0.2, 0.0, false, true, 0);
+        let safe = t.ceiling();
+
+        // Climbing back through the safe level must switch from step to creep.
+        let mut prev = safe;
+        let mut budget = t.observe(0, 28_000, 0, 0.0, 0.0, false, true, 0);
+        for _ in 0..6 {
+            let before = t.ceiling();
+            budget = t.observe(budget, 28_000, 0, 0.0, 0.0, false, true, 0);
+            let grew = t.ceiling().saturating_sub(before);
+            assert!(
+                grew <= TILE_CEILING_STEP_KBPS,
+                "grew {grew} in one window from {before}"
+            );
+            prev = t.ceiling();
+        }
+        assert!(
+            prev < safe.saturating_add(TILE_CEILING_STEP_KBPS * 3),
+            "creeping above the safe level should be slow, reached {prev} from {safe}"
+        );
+    }
+
+    /// One window of an application-limited link: refinement can only spend
+    /// what it has work for, however much it is granted.
+    fn spend(grant: u32, work_available: u32) -> u32 {
+        grant.min(work_available)
+    }
+
+    #[test]
+    fn a_floored_ceiling_recovers_as_soon_as_there_is_work_to_prove_it() {
+        // The application-limited worry: growth requires refinement to spend
+        // its grant, but on a quiet screen there is nothing to send. If a
+        // strain event floors the ceiling, what lifts it again?
+        //
+        // Answer: work does — and the ceiling only *matters* when there is
+        // work, so it recovers exactly when it needs to.
+        let mut t = TileThrottle::new();
+        // Spending only 500 when strain hits backs off to 350, which clamps to
+        // the floor — the worst case for recovery.
+        t.observe(500, 28_000, 0, 0.2, 0.0, false, true, 0);
+        let floored = t.ceiling();
+        assert_eq!(floored, TILE_CEILING_MIN_KBPS);
+
+        // A quiet screen: almost nothing to refine. The ceiling does not climb
+        // — correctly, there is no evidence — and that costs nothing, because
+        // the trickle is nowhere near the grant anyway.
+        let mut grant = t.observe(0, 28_000, 0, 0.0, 0.0, false, true, 0);
+        for _ in 0..20 {
+            grant = t.observe(spend(grant, 40), 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        assert!(
+            grant >= 40,
+            "a quiet screen is never actually limited by the ceiling"
+        );
+
+        // Now the screen gets busy — a scroll, a window opening. Refinement has
+        // real work, spends its grant, and the ceiling climbs back out.
+        let before_busy = t.ceiling();
+        for _ in 0..12 {
+            grant = t.observe(spend(grant, 100_000), 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        assert!(
+            t.ceiling() > before_busy,
+            "a busy screen must lift a floored ceiling; stuck at {before_busy}"
+        );
+
+        // Recovery is deliberately at the CREEP rate, not the step rate: the
+        // backoff set `safe` to this level, so climbing past it is probing
+        // territory already known to hurt. ~64 kbps per second is slow — a few
+        // seconds of softer text — and that is the correct trade against
+        // re-triggering a 30% cut to the video bitrate, which costs far longer
+        // to undo. Pinned so nobody "optimises" it into a step.
+        let grew = t.ceiling() - before_busy;
+        assert!(
+            grew <= 12 * TILE_CEILING_CREEP_KBPS,
+            "recovery above the safe level must creep, grew {grew} in 12 windows"
+        );
+    }
+
+    #[test]
+    fn a_link_that_never_strains_is_still_bounded_by_the_gap() {
+        // `safe_kbps` starts at `u32::MAX`, so a link that never strains stays
+        // in fast-ramp mode forever. That must not run away — the gap is the
+        // backstop, and the configured cap narrows it further.
+        let mut t = TileThrottle::new();
+        let mut grant = 0;
+        for _ in 0..200 {
+            grant = t.observe(spend(grant, 100_000), 8_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        // gap = (8000 - 0) / 4 = 2000, and nothing may exceed it.
+        assert_eq!(grant, 2_000);
+
+        let mut t = TileThrottle::new();
+        let mut grant = 0;
+        for _ in 0..200 {
+            grant = t.observe(spend(grant, 100_000), 28_000, 0, 0.0, 0.0, false, true, 1_500);
+        }
+        assert_eq!(grant, 1_500, "the configured cap must still bind");
+    }
+
+    #[test]
+    fn the_ceiling_stops_climbing_once_it_outruns_the_gap() {
+        // The bug this rule fixes: the ceiling used to climb a flat step every
+        // clean window regardless, overtake the gap within ~2 windows, and stop
+        // binding — so the backoff's correct answer was thrown away and the
+        // budget reverted to the raw, unvalidated gap.
+        let mut t = TileThrottle::new();
+        // Small gap: a nearly-saturated link, so the gap binds, not the ceiling.
+        let small_target = 1_200; // gap = 1200/4 = 300 kbps
+        let mut budget = 0;
+        for _ in 0..40 {
+            budget = t.observe(budget, small_target, 0, 0.0, 0.0, false, true, 0);
+        }
+        assert_eq!(budget, 300, "the gap should bind here");
+        assert_eq!(
+            t.ceiling(),
+            TILE_CEILING_MIN_KBPS,
+            "the ceiling must not drift upward while the gap is what binds"
+        );
+    }
+
+    #[test]
+    fn strain_backs_the_ceiling_off_from_what_was_actually_spent() {
+        let mut t = TileThrottle::new();
+        for _ in 0..20 {
+            t.observe(3_000, 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        let before = t.ceiling();
+        assert!(before > 5_000, "should have climbed, got {before}");
+
+        // Backpressure while spending 2000 kbps: the ceiling must anchor to the
+        // level that did the damage, NOT to its own (much higher) value —
+        // otherwise it backs off 30% of a number the link never saw and keeps
+        // overshooting for many more windows.
+        assert_eq!(t.observe(2_000, 28_000, 0, 0.05, 0.0, false, true, 0), 0);
+        assert_eq!(t.ceiling(), 1_400);
+    }
+
+    #[test]
+    fn strain_with_no_tile_traffic_does_not_blame_refinement() {
+        // Video congested the link entirely on its own. That window says
+        // nothing about how much refinement the link would tolerate, so the
+        // learned ceiling must be left alone.
+        let mut t = TileThrottle::new();
+        for _ in 0..10 {
+            t.observe(1_000, 28_000, 0, 0.0, 0.0, false, true, 0);
+        }
+        let before = t.ceiling();
+        assert_eq!(t.observe(0, 28_000, 12_000, 0.4, 0.0, false, true, 0), 0);
+        assert_eq!(t.ceiling(), before);
+    }
+
+    #[test]
+    fn the_ceiling_converges_instead_of_sawtoothing() {
+        // The bug this class of test exists for: with a free-running gap the
+        // budget jumped straight back to a quarter of an un-validated 28 Mbps
+        // every time strain cleared, so it re-overshot forever. Model a link
+        // whose true spare is 2000 kbps and check the offered budget settles
+        // at or below it rather than oscillating over it.
+        // AIMD probes above the limit periodically — that is how it finds the
+        // limit at all, and the video adaptor does exactly the same. So the
+        // property is not "never overshoots", it is "never overshoots by
+        // much": the old free-running gap offered a quarter of an unvalidated
+        // 28 Mbps (7000 kbps against 2000 of real spare, a 3.5x overshoot),
+        // which is what cut the video bitrate. One additive step is not.
+        const TRUE_SPARE: u32 = 2_000;
+        let unvalidated = tile_budget_kbps(28_000, 0, 0.0, 0.0, false, true, 0);
+        assert!(
+            unvalidated > TRUE_SPARE * 3,
+            "precondition: the raw gap really is wildly optimistic here ({unvalidated})"
+        );
+
+        let mut t = TileThrottle::new();
+        let mut last = 0;
+        let mut worst = 0;
+        let mut best = 0;
+        for window in 0..80 {
+            let strained = last > TRUE_SPARE;
+            last = t.observe(
+                last,
+                28_000, // the adaptor's aspiration, never tested by a content-limited encoder
+                0,
+                if strained { 0.1 } else { 0.0 },
+                0.0,
+                false,
+                true,
+                0,
+            );
+            // Ignore the ramp; judge the steady state.
+            if window >= 20 {
+                worst = worst.max(last);
+                best = best.max(last.min(TRUE_SPARE));
+            }
+        }
+        assert!(
+            worst <= TRUE_SPARE + TILE_CEILING_STEP_KBPS,
+            "overshoot of {worst} exceeds one additive step above real spare"
+        );
+        // And it must still do useful work — a throttle that converges to zero
+        // would pass the assertion above while disabling the whole feature.
+        assert!(
+            best >= TRUE_SPARE / 2,
+            "throttle strangled refinement: best steady-state budget was {best}"
+        );
+    }
+
+    #[test]
+    fn offered_features_follow_config() {
+        use directdesk_shared::protocol::features::LOSSLESS_TILES;
+
+        let mut cfg = NetConfig::from_host_config(&crate::config::HostConfig::default().sanitized());
+        assert_eq!(
+            offered_features(&cfg) & LOSSLESS_TILES,
+            0,
+            "shipped default must offer nothing — rollout step 1 is byte-identical on the wire"
+        );
+        cfg.pipeline.lossless_tiles_enabled = true;
+        assert_eq!(offered_features(&cfg) & LOSSLESS_TILES, LOSSLESS_TILES);
     }
 
     #[test]

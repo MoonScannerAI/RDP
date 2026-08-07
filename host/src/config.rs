@@ -35,6 +35,33 @@ pub const MIN_TARGET_FPS: u32 = 1;
 /// Highest frame rate the encoder is ever asked for.
 pub const MAX_TARGET_FPS: u32 = 240;
 
+/// Bounds for the lossless-tile knobs (see the fields on [`HostConfig`]).
+///
+/// The settle floor is deliberately above `STATIC_SETTLE_MS` (700): the H.264
+/// settle keyframe should land *first*, so tiles refine on top of an already
+/// decent picture rather than racing it and spending bandwidth twice on the
+/// same region.
+pub const MIN_TILE_SETTLE_MS: u32 = 750;
+pub const MAX_TILE_SETTLE_MS: u32 = 10_000;
+/// A lease shorter than a couple of settle periods would expire tiles faster
+/// than they can be renewed, so the picture would visibly flicker between
+/// refined and H.264.
+pub const MIN_TILE_LEASE_MS: u32 = 1_500;
+pub const MAX_TILE_LEASE_MS: u32 = 30_000;
+/// deflate levels are 1..=9; 6 is the usual quality/CPU knee.
+pub const MIN_TILE_DEFLATE_LEVEL: u32 = 1;
+pub const MAX_TILE_DEFLATE_LEVEL: u32 = 9;
+/// Strips compressed per refinement pass. The pass runs on idle frames inside
+/// the existing frame-budget slack, so this bounds how much of that slack it
+/// may take before yielding back to capture.
+pub const MIN_TILES_PER_PASS: u32 = 1;
+pub const MAX_TILES_PER_PASS: u32 = 512;
+/// Hard ceiling on tile bandwidth. The real limiter is the dynamic budget
+/// computed in `status_loop` from the adaptor's spare headroom; this is only a
+/// backstop so a misconfiguration cannot starve the video it is meant to
+/// improve.
+pub const MAX_TILE_KBPS: u32 = 40_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostConfig {
@@ -84,6 +111,38 @@ pub struct HostConfig {
     ///
     /// [`sanitized`]: HostConfig::sanitized
     pub static_refine_quality: u32,
+    /// Opt-in: once a region of the desktop stops changing, re-send it
+    /// **losslessly** on a reliable side stream and composite it over the H.264
+    /// video, so static text converges to pixel-exact instead of staying at the
+    /// motion quantiser.
+    ///
+    /// Default `false` for the first installs. The host is remote, so the
+    /// staged rollout ships the code first and turns it on separately — a
+    /// binary that is byte-identical on the wire is a safe deploy, and a
+    /// config flip is trivially reversible where a bad binary is not. It only
+    /// ever activates when the client also advertises
+    /// [`features::LOSSLESS_TILES`], so an old client sees nothing regardless.
+    ///
+    /// [`features::LOSSLESS_TILES`]: directdesk_shared::protocol::features::LOSSLESS_TILES
+    pub lossless_tiles_enabled: bool,
+    /// How long (ms) a tile must sit unchanged before it is refined. Clamped
+    /// into `[MIN_TILE_SETTLE_MS, MAX_TILE_SETTLE_MS]`.
+    pub lossless_tile_settle_ms: u32,
+    /// Backstop ceiling (kbps) on tile traffic. `0` means "no explicit cap,
+    /// use only the dynamic budget".
+    pub lossless_tile_max_kbps: u32,
+    /// deflate level for tile payloads. Clamped to `1..=9`.
+    pub lossless_tile_deflate_level: u32,
+    /// How long (ms) a refined tile stays paintable without renewal.
+    ///
+    /// This is the fail-safe that bounds every failure the stream's own
+    /// ordering cannot cover — pump aborted, connection lost, host crashed, a
+    /// `Revoke` never delivered. No failure mode may show stale pixels for
+    /// longer than one lease, which is worth more than any bandwidth saving.
+    pub lossless_tile_lease_ms: u32,
+    /// Strips compressed per refinement pass. Clamped into
+    /// `[MIN_TILES_PER_PASS, MAX_TILES_PER_PASS]`.
+    pub lossless_tiles_per_pass: u32,
     /// Start with the window hidden in the tray. `--minimized` also sets this
     /// for one run without persisting it.
     pub start_minimized: bool,
@@ -124,6 +183,13 @@ impl Default for HostConfig {
             idle_repeat_ms: 250,
             static_settle_ms: crate::session::STATIC_SETTLE_MS,
             static_refine_quality: crate::mf_encoder::DEFAULT_STATIC_REFINE_QUALITY,
+            // Off by default: step 1 of the rollout ships this code inert.
+            lossless_tiles_enabled: false,
+            lossless_tile_settle_ms: 900,
+            lossless_tile_max_kbps: 8_000,
+            lossless_tile_deflate_level: 6,
+            lossless_tile_lease_ms: 4_000,
+            lossless_tiles_per_pass: 32,
             start_minimized: false,
             uac_clickthrough: false,
             uac_arm_ttl_secs: 20,
@@ -278,6 +344,32 @@ impl HostConfig {
         self.uac_arm_ttl_secs = self
             .uac_arm_ttl_secs
             .clamp(MIN_UAC_ARM_TTL_SECS, MAX_UAC_ARM_TTL_SECS);
+        self.lossless_tile_settle_ms = self
+            .lossless_tile_settle_ms
+            .clamp(MIN_TILE_SETTLE_MS, MAX_TILE_SETTLE_MS);
+        self.lossless_tile_lease_ms = self
+            .lossless_tile_lease_ms
+            .clamp(MIN_TILE_LEASE_MS, MAX_TILE_LEASE_MS);
+        self.lossless_tile_deflate_level = self
+            .lossless_tile_deflate_level
+            .clamp(MIN_TILE_DEFLATE_LEVEL, MAX_TILE_DEFLATE_LEVEL);
+        self.lossless_tiles_per_pass = self
+            .lossless_tiles_per_pass
+            .clamp(MIN_TILES_PER_PASS, MAX_TILES_PER_PASS);
+        // 0 stays 0 (no explicit cap — the dynamic budget is the real limiter),
+        // matching the `static_refine_quality` idiom above.
+        if self.lossless_tile_max_kbps != 0 {
+            self.lossless_tile_max_kbps = self.lossless_tile_max_kbps.min(MAX_TILE_KBPS);
+        }
+        // A lease must outlast the settle it is granted against, or a tile can
+        // expire before the next pass could possibly renew it and the region
+        // flickers between refined and H.264.
+        if self.lossless_tile_lease_ms < self.lossless_tile_settle_ms.saturating_mul(2) {
+            self.lossless_tile_lease_ms = self
+                .lossless_tile_settle_ms
+                .saturating_mul(2)
+                .min(MAX_TILE_LEASE_MS);
+        }
         self
     }
 
@@ -292,6 +384,11 @@ impl HostConfig {
             frame_queue_depth: 8,
             static_settle_ms: self.static_settle_ms,
             static_refine_quality: self.static_refine_quality,
+            lossless_tiles_enabled: self.lossless_tiles_enabled,
+            lossless_tile_settle_ms: self.lossless_tile_settle_ms,
+            lossless_tile_deflate_level: self.lossless_tile_deflate_level,
+            lossless_tile_lease_ms: self.lossless_tile_lease_ms,
+            lossless_tiles_per_pass: self.lossless_tiles_per_pass,
         }
     }
 }
@@ -383,6 +480,52 @@ mod tests {
         }
         .sanitized();
         assert_eq!(c.target_fps, MAX_TARGET_FPS);
+    }
+
+    #[test]
+    fn tile_knobs_are_clamped() {
+        let c = HostConfig {
+            lossless_tile_settle_ms: 1,
+            lossless_tile_lease_ms: 1,
+            lossless_tile_deflate_level: 99,
+            lossless_tiles_per_pass: 0,
+            lossless_tile_max_kbps: 999_999,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(c.lossless_tile_settle_ms, MIN_TILE_SETTLE_MS);
+        assert_eq!(c.lossless_tile_deflate_level, MAX_TILE_DEFLATE_LEVEL);
+        assert_eq!(c.lossless_tiles_per_pass, MIN_TILES_PER_PASS);
+        assert_eq!(c.lossless_tile_max_kbps, MAX_TILE_KBPS);
+    }
+
+    #[test]
+    fn tile_lease_always_outlasts_two_settles() {
+        // A lease shorter than the refresh cadence would expire tiles faster
+        // than the pass can renew them, so a static screen would visibly
+        // flicker between refined and H.264. The clamp must hold even when the
+        // settle is pushed to its own ceiling.
+        for settle in [MIN_TILE_SETTLE_MS, 900, 3_000, MAX_TILE_SETTLE_MS] {
+            let c = HostConfig {
+                lossless_tile_settle_ms: settle,
+                lossless_tile_lease_ms: MIN_TILE_LEASE_MS,
+                ..Default::default()
+            }
+            .sanitized();
+            assert!(
+                c.lossless_tile_lease_ms >= c.lossless_tile_settle_ms * 2
+                    || c.lossless_tile_lease_ms == MAX_TILE_LEASE_MS,
+                "settle {settle} left lease {} too short",
+                c.lossless_tile_lease_ms
+            );
+        }
+    }
+
+    #[test]
+    fn tiles_are_off_by_default() {
+        // Rollout step 1 ships this code inert: the first remote install must
+        // be byte-identical on the wire to what is already deployed.
+        assert!(!HostConfig::default().sanitized().lossless_tiles_enabled);
     }
 
     #[test]

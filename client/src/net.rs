@@ -78,9 +78,10 @@ use directdesk_shared::crypto::Ed25519Pub;
 use directdesk_shared::error::{Error, Result};
 use directdesk_shared::input::validate_event;
 use directdesk_shared::protocol::{
-    self, AuthMsg, ControlMsg, Hello, InputMsg, QualityMode, MAX_AUTH_MSG,
+    self, AuthMsg, ControlMsg, Hello, InputMsg, QualityMode, MAX_AUTH_MSG, MAX_CONTROL_MSG,
 };
 use directdesk_shared::stats::{ConnStats, TransportRoute};
+use directdesk_shared::tiles::TileMsg;
 use directdesk_shared::transport::quic::{self, QuicParams, SessionStreams};
 use directdesk_shared::transport::reassembly::ReassemblyConfig;
 use directdesk_shared::transport::session::{QuicSession, Session, SessionConfig, SessionEvent};
@@ -121,6 +122,12 @@ pub struct ConnectParams {
     pub max_width: u32,
     pub max_height: u32,
     pub preferred_fps: u32,
+    /// Ask the host for lossless refinement of settled regions.
+    ///
+    /// Only a request: the feature is on solely if the host echoes the bit
+    /// back, so leaving this true costs nothing against a host that does not
+    /// support it or has it switched off.
+    pub lossless_tiles: bool,
 }
 
 impl ConnectParams {
@@ -154,6 +161,7 @@ pub async fn run_client(
         state_tx,
         control_tx,
         mut input_rx,
+        tiles_tx,
         mut control_rx,
     } = endpoints;
 
@@ -201,6 +209,7 @@ pub async fn run_client(
             streams,
             route,
             paired_host,
+            lossless_tiles,
         } = match established {
             Ok(e) => e,
             Err(HandshakeError {
@@ -265,7 +274,7 @@ pub async fn run_client(
 
         // Bridge the driver's inbound receivers onto the UI's crossbeam senders.
         let closed = Arc::new(tokio::sync::Notify::new());
-        let fwd = vec![
+        let mut fwd = vec![
             tokio::spawn(forward_video(receivers.video, video_tx.clone())),
             tokio::spawn(forward_control(
                 receivers.control,
@@ -279,6 +288,18 @@ pub async fn run_client(
                 closed.clone(),
             )),
         ];
+
+        // Refinement tiles, only when the host agreed to send them. Spawned
+        // alongside the other bridges so it is aborted with them below; it is
+        // deliberately *not* given the `closed` notifier, because nothing that
+        // happens on the tile stream may end the session.
+        if lossless_tiles {
+            tracing::info!("host accepted lossless tile refinement");
+            fwd.push(tokio::spawn(forward_tiles(
+                session.connection().clone(),
+                tiles_tx.clone(),
+            )));
+        }
 
         // Outbound + lifecycle loop. Owns input_rx / control_rx across
         // reconnects (they cannot be cloned), so it lives here, not in a task.
@@ -467,6 +488,56 @@ async fn forward_events(
 }
 
 // ---------------------------------------------------------------------------
+// Lossless refinement tiles (host -> client, bulk uni stream)
+// ---------------------------------------------------------------------------
+
+/// Read the host's bulk stream of refinement tiles for as long as it lasts.
+///
+/// # This loop must never end the session
+///
+/// Every other stream loop in this file treats a decode or read error as fatal,
+/// and for control and input that is exactly right — losing them means losing
+/// the session's meaning. **Tiles are the opposite.** They are a bonus layer
+/// painted over a picture that is already correct, so a malformed message, a
+/// reset stream, or a host that never opens the stream at all must cost nothing
+/// beyond the refinement itself. This function therefore never touches
+/// `mark_closed`, never notifies `closed`, and never reports a `ConnectionState`
+/// — on any error it logs and returns, leaving the session fully alive with
+/// tiles simply off. Do not "fix" it to match the loops above it.
+///
+/// Overflow is dropped rather than awaited, exactly like [`forward_video`]:
+/// blocking here would back-pressure QUIC's receive window on a stream whose
+/// whole point is that it yields to everything else. Dropping is safe because
+/// tiles carry leases — a `Revoke` that never arrives expires on its own.
+async fn forward_tiles(conn: Connection, tx: crossbeam_channel::Sender<TileMsg>) {
+    // The host opens this only after the handshake, and only to a client that
+    // asked for it. If it never opens one, this simply stays pending until the
+    // task is aborted with the rest of the session's bridges.
+    let mut stream = match quic::accept_bulk(&conn).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("no tile stream from host: {e}; refinement disabled");
+            return;
+        }
+    };
+    let mut received: u64 = 0;
+    loop {
+        match quic::read_framed::<TileMsg>(&mut stream, MAX_CONTROL_MSG).await {
+            Ok(msg) => {
+                received += 1;
+                if tx.try_send(msg).is_err() {
+                    tracing::trace!("tile queue full at UI seam; message dropped");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(received, "tile stream ended: {e}; refinement disabled");
+                return;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Connect + handshake
 // ---------------------------------------------------------------------------
 
@@ -478,6 +549,9 @@ struct Established {
     route: TransportRoute,
     /// `Some` only when this attempt completed a fresh pairing.
     paired_host: Option<TrustedPeer>,
+    /// The host echoed `features::LOSSLESS_TILES`, so it intends to open the
+    /// bulk tile stream on this connection.
+    lossless_tiles: bool,
 }
 
 struct HandshakeError {
@@ -557,13 +631,21 @@ async fn connect_and_auth(
     let _ = state_tx.try_send(ConnectionState::Authenticating);
 
     // Phase 0 — Hello (client writes first).
+    //
+    // The client asks blind: it advertises what it can do before it has seen
+    // the host's reply. The host answers with the intersection, so anything we
+    // request here is off unless the host echoes it back.
+    let mut features = if want_pairing {
+        FEATURE_PAIRING_REQUEST
+    } else {
+        0
+    };
+    if params.lossless_tiles {
+        features |= protocol::features::LOSSLESS_TILES;
+    }
     let hello = Hello {
         version: protocol::PROTOCOL_VERSION,
-        features: if want_pairing {
-            FEATURE_PAIRING_REQUEST
-        } else {
-            0
-        },
+        features,
         agent: params.display_name.clone(),
     };
     if let Err(e) = quic::write_framed(&mut streams.control.0, &hello).await {
@@ -576,6 +658,9 @@ async fn connect_and_auth(
     if let Err(e) = protocol::validate_hello(&peer_hello) {
         return Err(HandshakeError::fatal(format!("host hello rejected: {e}")));
     }
+    // The host's reply *is* the intersection (`hello.features & offered`), so
+    // one bit test settles it: no need to re-check what we asked for.
+    let lossless_tiles = peer_hello.features & protocol::features::LOSSLESS_TILES != 0;
 
     // Phase 1 — the host always issues its ServerChallenge immediately after the
     // Hello exchange, before it knows which branch we want. Read it now; in both
@@ -625,6 +710,7 @@ async fn connect_and_auth(
         streams,
         route,
         paired_host,
+        lossless_tiles,
     })
 }
 
@@ -881,6 +967,24 @@ mod tests {
         assert_eq!(FEATURE_PAIRING_REQUEST & wire, 0);
     }
 
+    /// The tile stream is armed purely by the bit the *host* echoed back — the
+    /// intersection it computed — so a client that asked and was refused, and a
+    /// client that never asked, both end up with tiles off.
+    #[test]
+    fn tiles_are_armed_only_by_the_hosts_echoed_bit() {
+        let armed =
+            |features: u64| features & protocol::features::LOSSLESS_TILES != 0;
+        assert!(armed(protocol::features::LOSSLESS_TILES));
+        assert!(armed(
+            protocol::features::LOSSLESS_TILES | protocol::features::CLIPBOARD_TEXT
+        ));
+        assert!(!armed(0));
+        assert!(!armed(protocol::features::CLIPBOARD_TEXT));
+        // A host that never learned the flag cannot accidentally arm us via the
+        // handshake-only pairing hint, which lives well clear of the wire bits.
+        assert!(!armed(FEATURE_PAIRING_REQUEST));
+    }
+
     #[tokio::test]
     async fn literal_ip_resolves_without_dns() {
         let c = resolve_candidates("127.0.0.1", 47990).await;
@@ -899,6 +1003,7 @@ mod tests {
             max_width: 1920,
             max_height: 1080,
             preferred_fps: 60,
+            lossless_tiles: true,
         };
         match p.start_stream() {
             ControlMsg::StartStream {

@@ -12,6 +12,7 @@
 //! * [`session`]      — the channel seam between UI and transport.
 //! * [`connect`]      — supervisor that spawns/cancels the transport driver.
 //! * [`pipeline`]     — background decode / loopback-demo frame sources.
+//! * [`tiles`]        — lossless static-region tile store + compositor.
 //! * [`ui`]           — the eframe application shell.
 //! * [`config`]       — `%APPDATA%\DirectDesk\client.json` (no secrets).
 
@@ -23,4 +24,5 @@ pub mod net;
 pub mod pipeline;
 pub mod renderer;
 pub mod session;
+pub mod tiles;
 pub mod ui;

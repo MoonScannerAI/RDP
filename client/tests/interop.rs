@@ -166,6 +166,11 @@ fn pair_params(addr: SocketAddr, code: Option<&str>) -> ConnectParams {
         max_width: 1920,
         max_height: 1080,
         preferred_fps: 60,
+        // Advertise the bit: against a host with tiles switched off (the
+        // default, and what this test builds) the negotiated intersection is
+        // empty and no stream is ever opened — which is exactly the property
+        // the interop test should be exercising.
+        lossless_tiles: true,
     }
 }
 

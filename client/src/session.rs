@@ -22,6 +22,7 @@
 use crossbeam_channel::{bounded, Receiver, Sender};
 use directdesk_shared::protocol::{ControlMsg, InputMsg};
 use directdesk_shared::stats::{ConnStats, TransportRoute};
+use directdesk_shared::tiles::TileMsg;
 use directdesk_shared::video::EncodedFrame;
 use tokio::sync::mpsc;
 
@@ -29,6 +30,14 @@ use tokio::sync::mpsc;
 /// drains this eagerly and decodes **every** frame (P-frames reference their
 /// predecessors); this depth only absorbs scheduling jitter, never policy.
 pub const VIDEO_QUEUE_DEPTH: usize = 256;
+/// Refinement tiles buffered between transport and the tile thread.
+///
+/// Deep enough to swallow the burst the host emits when a busy screen settles,
+/// shallow enough that a wedged tile thread cannot grow an unbounded backlog:
+/// a strip is capped at `MAX_STRIP_ENCODED` (~49 KiB worst case), so this depth
+/// bounds the queue at a few MiB even if every message were incompressible.
+/// Overflow is dropped, never awaited — see `net::forward_tiles`.
+pub const TILE_QUEUE_DEPTH: usize = 256;
 /// Outbound input events. Deep enough that a stalled transport cannot make the
 /// UI thread block; overflow is dropped with a warning, never awaited.
 pub const INPUT_QUEUE_DEPTH: usize = 4096;
@@ -82,6 +91,14 @@ pub struct ClientSession {
     pub input_tx: mpsc::Sender<InputMsg>,
     /// Outbound control (StartStream, RequestKeyframe, QualityChange, …).
     pub control_tx: mpsc::Sender<ControlMsg>,
+
+    /// Inbound lossless refinement tiles. Drained by the pipeline's tile
+    /// thread, which is the only place a strip is decompressed.
+    ///
+    /// An ordinary inbound channel: the sending half rides in
+    /// [`TransportEndpoints`] like every other one, and `net::run_client` only
+    /// reads the stream when the host echoes `features::LOSSLESS_TILES`.
+    pub tiles_rx: Receiver<TileMsg>,
 }
 
 /// Transport-side channel endpoints. The transport wave plugs into exactly
@@ -92,6 +109,9 @@ pub struct TransportEndpoints {
     pub route_tx: Sender<Option<TransportRoute>>,
     pub state_tx: Sender<ConnectionState>,
     pub control_tx: Sender<ControlMsg>,
+    /// Refinement tiles, host -> UI. Bounded and lossy by design: a dropped
+    /// tile only means that square keeps showing H.264 for another pass.
+    pub tiles_tx: Sender<TileMsg>,
     pub input_rx: mpsc::Receiver<InputMsg>,
     pub control_rx: mpsc::Receiver<ControlMsg>,
 }
@@ -104,6 +124,7 @@ impl ClientSession {
         let (route_tx, route_rx) = bounded(STATUS_QUEUE_DEPTH);
         let (state_tx, state_rx) = bounded(STATUS_QUEUE_DEPTH);
         let (ctl_in_tx, ctl_in_rx) = bounded(CONTROL_QUEUE_DEPTH);
+        let (tiles_tx, tiles_rx) = bounded(TILE_QUEUE_DEPTH);
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_DEPTH);
         let (ctl_out_tx, ctl_out_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
 
@@ -116,6 +137,7 @@ impl ClientSession {
                 control_rx: ctl_in_rx,
                 input_tx,
                 control_tx: ctl_out_tx,
+                tiles_rx,
             },
             TransportEndpoints {
                 video_tx,
@@ -123,6 +145,7 @@ impl ClientSession {
                 route_tx,
                 state_tx,
                 control_tx: ctl_in_tx,
+                tiles_tx,
                 input_rx,
                 control_rx: ctl_out_rx,
             },
@@ -212,6 +235,40 @@ mod tests {
         }
         // Queue is now full: the next send returns false immediately.
         assert!(!send_input(&session.input_tx, InputMsg::ReleaseAll));
+    }
+
+    #[test]
+    fn tile_channel_round_trips_and_drops_when_full() {
+        let (session, transport) = ClientSession::new();
+        transport
+            .tiles_tx
+            .try_send(TileMsg::Reset {
+                width: 1920,
+                height: 1080,
+                edge: 64,
+            })
+            .unwrap();
+        assert!(matches!(
+            session.tiles_rx.try_recv().unwrap(),
+            TileMsg::Reset {
+                width: 1920,
+                height: 1080,
+                edge: 64
+            }
+        ));
+
+        // Overflow must be reported, never awaited: the transport drops the
+        // message rather than let a stalled tile thread back-pressure QUIC.
+        for _ in 0..TILE_QUEUE_DEPTH {
+            transport
+                .tiles_tx
+                .try_send(TileMsg::Revoke { ids: vec![0] })
+                .unwrap();
+        }
+        assert!(transport
+            .tiles_tx
+            .try_send(TileMsg::Revoke { ids: vec![1] })
+            .is_err());
     }
 
     #[test]

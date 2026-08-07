@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod secret;
 pub mod stats;
 pub mod svc_ipc;
+pub mod tiles;
 pub mod traits;
 pub mod transport;
 pub mod video;

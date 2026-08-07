@@ -174,6 +174,37 @@ pub enum SimEvent {
         /// Human-readable cause.
         reason: String,
     },
+    /// The shared congestion window had no room for a whole video frame, so the
+    /// host skipped it rather than shred the frame already in flight.
+    ///
+    /// This is the direct, observable signature of the tiles-vs-video coupling
+    /// hazard: it climbs while tile traffic flows even though the link is
+    /// dropping nothing. Only emitted when [`TileSim`](crate::TileSim) is
+    /// configured.
+    VideoBackpressured {
+        /// Virtual millisecond.
+        at_ms: u64,
+        /// Id of the frame that never reached the wire.
+        frame_id: u32,
+    },
+    /// A host status window closed: what it measured and what it granted.
+    ///
+    /// Mirrors one iteration of `host::net::status_loop`. Only emitted when
+    /// [`TileSim`](crate::TileSim) is configured.
+    TileWindow {
+        /// Virtual millisecond the window closed.
+        at_ms: u64,
+        /// Backpressure ratio measured over the window.
+        pressure: f32,
+        /// Tile bandwidth granted for the next window.
+        budget_kbps: u32,
+        /// The adaptor's target after observing this window.
+        adaptor_kbps: u32,
+        /// Video frames that reached the wire this window.
+        video_sent: u64,
+        /// Video frames the window had no room for.
+        video_backpressured: u64,
+    },
 }
 
 impl SimEvent {
@@ -198,7 +229,9 @@ impl SimEvent {
             | SimEvent::MuxDelivered { at_ms, .. }
             | SimEvent::MuxVideoDropped { at_ms, .. }
             | SimEvent::DatagramRejected { at_ms, .. }
-            | SimEvent::ControlRejected { at_ms, .. } => *at_ms,
+            | SimEvent::ControlRejected { at_ms, .. }
+            | SimEvent::VideoBackpressured { at_ms, .. }
+            | SimEvent::TileWindow { at_ms, .. } => *at_ms,
         }
     }
 }
@@ -521,6 +554,35 @@ impl EventLog {
             .iter()
             .filter_map(|e| match e {
                 SimEvent::MuxVideoDropped { frame_id, .. } => Some(*frame_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ids of video frames the shared congestion window had no room for.
+    #[must_use]
+    pub fn video_backpressured(&self) -> Vec<u32> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::VideoBackpressured { frame_id, .. } => Some(*frame_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every closed host status window as `(at_ms, pressure, budget_kbps)`.
+    #[must_use]
+    pub fn tile_windows(&self) -> Vec<(u64, f32, u32)> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                SimEvent::TileWindow {
+                    at_ms,
+                    pressure,
+                    budget_kbps,
+                    ..
+                } => Some((*at_ms, *pressure, *budget_kbps)),
                 _ => None,
             })
             .collect()

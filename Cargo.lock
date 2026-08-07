@@ -696,6 +696,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "ed25519-dalek",
+ "flate2",
  "hmac",
  "parking_lot",
  "postcard",
@@ -726,6 +727,7 @@ name = "directdesk-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "directdesk-host",
  "directdesk-shared",
  "tokio",
  "tracing",

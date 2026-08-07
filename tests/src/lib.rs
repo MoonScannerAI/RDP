@@ -54,6 +54,7 @@ pub mod host;
 pub mod mux;
 pub mod pump;
 pub mod sim;
+pub mod tiles;
 
 pub use client::{PresentSlot, SimClient};
 pub use config::{
@@ -70,6 +71,10 @@ pub use host::{input_seq, SimHost};
 pub use mux::{MuxConfig, MuxStats, ReliableMux};
 pub use pump::PumpCtx;
 pub use sim::{run, Sim};
+pub use tiles::{
+    TileEngine, TilePolicy, TileSim, TileStats, TileWindowRecord, DEFAULT_LINK_BURST_MS,
+    DEFAULT_TILE_MAX_KBPS, STATUS_INTERVAL_MS,
+};
 
 /// Panic unless two transcripts are identical, naming the first divergence.
 ///

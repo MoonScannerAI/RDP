@@ -7,6 +7,9 @@
 //! * [`spawn_demo_source`] — `--loopback-demo`: synthetic RGBA frames pushed
 //!   straight into the slot, bypassing H.264 entirely, so the whole UI / input
 //!   / render loop is exercisable with no network and no host.
+//!
+//! A third, optional thread — [`Pipeline::attach_tile_thread`] — feeds the
+//! lossless refinement store the decode thread composites from.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,12 +18,14 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use directdesk_shared::protocol::ControlMsg;
+use directdesk_shared::tiles::TileMsg;
 use directdesk_shared::traits::{Decoder, PixelFormat, RawFrame};
 use directdesk_shared::video::EncodedFrame;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::renderer::FrameSlot;
+use crate::tiles::{composite_tiles, Tile, TileStore};
 
 /// Shared status a background source publishes for the diagnostics panel.
 #[derive(Default)]
@@ -110,6 +115,16 @@ pub struct Pipeline {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     pub status: Arc<SourceStatus>,
+    /// Lossless refinement tiles the decode thread paints over each frame.
+    ///
+    /// Created here rather than handed in because the decode thread is spawned
+    /// from `main`, before the UI exists, and the store must be live from that
+    /// thread's first frame. The UI takes a clone via [`Pipeline::tiles`] to
+    /// invalidate it and to read the diagnostics gauges.
+    tiles: Arc<TileStore>,
+    /// Tints composited tiles so coverage is visible during bring-up. Read on
+    /// the decode thread once per frame, written by the UI toggle.
+    tile_highlight: Arc<AtomicBool>,
 }
 
 impl Pipeline {
@@ -118,7 +133,63 @@ impl Pipeline {
             stop,
             threads: Vec::new(),
             status,
+            tiles: Arc::new(TileStore::new()),
+            tile_highlight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The refinement store this pipeline composites from.
+    pub fn tiles(&self) -> Arc<TileStore> {
+        self.tiles.clone()
+    }
+
+    /// Whether composited tiles are being tinted.
+    pub fn tile_highlight(&self) -> bool {
+        self.tile_highlight.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tile_highlight(&self, on: bool) {
+        self.tile_highlight.store(on, Ordering::Relaxed);
+    }
+
+    /// Spawn the thread that applies inbound [`TileMsg`]s to the store.
+    ///
+    /// A thread of its own, not a branch of the decode loop, for two reasons.
+    /// Tile arrival is bursty and unbounded by the frame clock — a screen that
+    /// has just settled emits a wave of strips — and inflating those on the
+    /// paced real-time decode loop is how frames get dropped. It also keeps
+    /// untrusted, attacker-influenced input off the thread that owns the Media
+    /// Foundation decoder, whose COM state is thread-affine.
+    ///
+    /// Joins with the rest of the pipeline: it watches the same stop flag and
+    /// its handle goes on the same `threads` vec, so [`Pipeline::shutdown`]
+    /// (and therefore `Drop`) already covers it.
+    pub fn attach_tile_thread(&mut self, tiles_rx: Receiver<TileMsg>) {
+        let store = self.tiles.clone();
+        let stop = self.stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("directdesk-tiles".into())
+            .spawn(move || {
+                loop {
+                    match tiles_rx.recv_timeout(Duration::from_millis(100)) {
+                        // `apply` validates geometry, decompresses, and refuses
+                        // anything it does not like. Nothing it can return is
+                        // fatal, so its outcome is a counter, not control flow.
+                        Ok(msg) => {
+                            store.apply(msg);
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                tracing::info!("tile thread exiting");
+            })
+            .expect("spawn tile thread");
+        self.threads.push(handle);
     }
 
     pub fn shutdown(&mut self) {
@@ -149,6 +220,8 @@ pub fn spawn_decode_thread(
     let status = Arc::new(SourceStatus::default());
     let stop = Arc::new(AtomicBool::new(false));
     let mut pipeline = Pipeline::new(status.clone(), stop.clone());
+    let tiles = pipeline.tiles.clone();
+    let tile_highlight = pipeline.tile_highlight.clone();
 
     let handle = std::thread::Builder::new()
         .name("directdesk-decode".into())
@@ -172,6 +245,9 @@ pub fn spawn_decode_thread(
             };
 
             let mut gate = KeyframeGate::default();
+            // Hoisted so the per-frame cost of a snapshot is a memcpy of `Arc`
+            // pointers into an already-grown buffer, never an allocation.
+            let mut scratch: Vec<Arc<Tile>> = Vec::new();
 
             loop {
                 match video_rx.recv_timeout(Duration::from_millis(100)) {
@@ -209,7 +285,23 @@ pub fn spawn_decode_thread(
                         match decoder.decode(&frame) {
                             Ok(frames) => {
                                 let produced = frames.len();
-                                for raw in frames {
+                                for mut raw in frames {
+                                    // The tile overlay is *persistent* state
+                                    // while a decoded frame is transient — the
+                                    // decoder hands back a fresh buffer every
+                                    // time — so the live tile set has to be
+                                    // re-blitted onto every frame, right here,
+                                    // before the frame is published. Doing it
+                                    // downstream (in the presenter) would mean
+                                    // repainting on every *repaint* instead of
+                                    // every frame, and would put a pixel loop
+                                    // on the UI thread.
+                                    composite_onto(
+                                        &mut raw,
+                                        &tiles,
+                                        &mut scratch,
+                                        tile_highlight.load(Ordering::Relaxed),
+                                    );
                                     slot.publish(raw);
                                 }
                                 if produced > 0 {
@@ -247,6 +339,51 @@ pub fn spawn_decode_thread(
 
     pipeline.threads.push(handle);
     pipeline
+}
+
+/// Paint the live refinement tiles over one freshly decoded frame.
+///
+/// Split out of the decode loop so the format guard, the disarmed case and the
+/// reuse of `scratch` are testable without standing up a decoder. Returns
+/// `None` when nothing was painted at all (wrong pixel format, or the store is
+/// disarmed), so a caller can tell "no tiles" from "tiles, none of them valid".
+///
+/// Only `Rgba8` is touched. [`composite_tiles`] writes RGBA — the shared codec
+/// does the channel swap once, at admission — so blitting onto a `Bgra8` frame
+/// would transpose red and blue on every tile: a silent colour corruption
+/// rather than an error. Today's Media Foundation decoder always emits `Rgba8`
+/// (`renderer` still accepts either), and this guard makes that an assumption
+/// the compositor *states* rather than one it inherits.
+fn composite_onto(
+    frame: &mut RawFrame,
+    tiles: &TileStore,
+    scratch: &mut Vec<Arc<Tile>>,
+    highlight: bool,
+) -> Option<crate::tiles::CompositeStats> {
+    if frame.format != PixelFormat::Rgba8 {
+        return None;
+    }
+    // Drop anything whose lease has run out BEFORE snapshotting.
+    //
+    // Not an optimisation — a correctness requirement. The host stops revoking
+    // a tile once its lease lapses (`begin_pass` returns it to `Moving` with no
+    // revocation, on the stated assumption that the client has already dropped
+    // it). If we merely declined to paint it, a later `Renew` would revive
+    // pixels the host had written off. Expiry has to mean gone.
+    tiles.sweep_expired(frame.timestamp_ms);
+
+    // Snapshot `Arc` handles under the store's lock, then blit lock-free: the
+    // tile thread must never be blocked behind a pixel loop.
+    let size = tiles.snapshot_into(scratch)?;
+    Some(composite_tiles(
+        &mut frame.data,
+        frame.width,
+        frame.height,
+        frame.timestamp_ms,
+        size,
+        scratch,
+        highlight,
+    ))
 }
 
 /// `--loopback-demo`: synthetic RGBA frames at `fps`, no H.264 involved.
@@ -362,6 +499,163 @@ fn synth_frame(width: u32, height: u32, tick: u32, timestamp_ms: u32) -> RawFram
 #[cfg(test)]
 mod tests {
     use super::*;
+    use directdesk_shared::tiles::{compress_strip, TILE_EDGE};
+
+    /// A flat opaque frame, so any painted pixel is unmistakable.
+    fn rgba_frame(width: u32, height: u32, timestamp_ms: u32) -> RawFrame {
+        RawFrame {
+            width,
+            height,
+            format: PixelFormat::Rgba8,
+            data: vec![7u8; width as usize * height as usize * 4],
+            timestamp_ms,
+        }
+    }
+
+    /// A store armed for `w`x`h` holding one lossless tile at the origin.
+    fn store_with_one_tile(w: u32, h: u32) -> Arc<TileStore> {
+        let store = Arc::new(TileStore::new());
+        store.apply(TileMsg::Reset {
+            width: w,
+            height: h,
+            edge: TILE_EDGE,
+        });
+        // BGRA source; the shared codec swaps to RGBA at admission.
+        let src = vec![200u8; w as usize * h as usize * 4];
+        let (codec, data) =
+            compress_strip(&src, w as usize * 4, 0, 0, TILE_EDGE, TILE_EDGE, 6).unwrap();
+        let out = store.apply(TileMsg::Strip {
+            x: 0,
+            y: 0,
+            w: TILE_EDGE,
+            h: TILE_EDGE,
+            codec,
+            valid_from_ms: 0,
+            lease_ms: 10_000,
+            data,
+        });
+        assert_eq!(out.admitted, 1, "test fixture must admit its tile");
+        store
+    }
+
+    #[test]
+    fn composite_onto_is_a_noop_while_the_store_is_disarmed() {
+        // The overwhelmingly common case: no host support, or a session that
+        // has not been re-armed yet. It must not touch the decoded frame.
+        let store = TileStore::new();
+        let mut scratch = Vec::new();
+        let mut frame = rgba_frame(64, 64, 0);
+        let before = frame.data.clone();
+        assert!(composite_onto(&mut frame, &store, &mut scratch, false).is_none());
+        assert_eq!(frame.data, before);
+    }
+
+    #[test]
+    fn composite_onto_refuses_a_frame_that_is_not_rgba() {
+        let store = store_with_one_tile(64, 64);
+        let mut scratch = Vec::new();
+
+        let mut bgra = rgba_frame(64, 64, 5);
+        bgra.format = PixelFormat::Bgra8;
+        let before = bgra.data.clone();
+        assert!(composite_onto(&mut bgra, &store, &mut scratch, false).is_none());
+        assert_eq!(bgra.data, before, "a BGRA frame would be colour-swapped");
+
+        // The identical frame as RGBA *is* painted — so it is the format guard
+        // that stopped it above, not an empty store.
+        let mut rgba = rgba_frame(64, 64, 5);
+        let stats = composite_onto(&mut rgba, &store, &mut scratch, false).unwrap();
+        assert_eq!(stats.painted, 1);
+        assert_ne!(rgba.data, before);
+    }
+
+    #[test]
+    fn composite_onto_paints_live_tiles_and_reuses_the_scratch_buffer() {
+        let store = store_with_one_tile(128, 64);
+        let mut scratch = Vec::new();
+
+        let mut frame = rgba_frame(128, 64, 100);
+        let stats = composite_onto(&mut frame, &store, &mut scratch, false).unwrap();
+        assert_eq!(stats.painted, 1);
+        assert_eq!(stats.covered_px, u64::from(TILE_EDGE) * u64::from(TILE_EDGE));
+        // Inside the tile is the lossless colour; outside is the frame's own.
+        assert_eq!(&frame.data[0..4], &[200, 200, 200, 255]);
+        assert_eq!(frame.data[(64 * 4) as usize], 7);
+
+        // The snapshot buffer is reused, not regrown, on every subsequent frame.
+        let capacity = scratch.capacity();
+        assert_eq!(scratch.len(), 1);
+        for ts in 101..110 {
+            let mut next = rgba_frame(128, 64, ts);
+            composite_onto(&mut next, &store, &mut scratch, false).unwrap();
+        }
+        assert_eq!(scratch.len(), 1);
+        assert_eq!(scratch.capacity(), capacity, "steady state must not allocate");
+    }
+
+    #[test]
+    fn composite_onto_evicts_tiles_whose_lease_has_run_out() {
+        // A frame timestamped past the lease leaves the decoded picture alone —
+        // stale refinement is worse than none.
+        //
+        // And the tile is *evicted*, not merely skipped. The host stops
+        // revoking a tile once its lease lapses, on the stated assumption that
+        // the client has dropped it; leaving it resident would let a later
+        // `Renew` revive pixels the host had written off. So the assertion here
+        // is on `resident_tiles`, not on `skipped_expired` — by the time the
+        // blit runs there is nothing left to skip.
+        let store = store_with_one_tile(64, 64);
+        assert_eq!(store.resident_tiles(), 1);
+
+        let mut scratch = Vec::new();
+        let mut frame = rgba_frame(64, 64, 50_000);
+        let before = frame.data.clone();
+        let stats = composite_onto(&mut frame, &store, &mut scratch, false).unwrap();
+        assert_eq!(stats.painted, 0);
+        assert_eq!(stats.skipped_expired, 0);
+        assert_eq!(store.resident_tiles(), 0, "the lapsed tile must be gone");
+        assert_eq!(frame.data, before);
+    }
+
+    #[test]
+    fn tile_thread_applies_messages_and_stops_with_the_pipeline() {
+        let mut pipeline = Pipeline::new(
+            Arc::new(SourceStatus::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let tiles = pipeline.tiles();
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        pipeline.attach_tile_thread(rx);
+
+        assert!(!tiles.is_armed());
+        tx.send(TileMsg::Reset {
+            width: 128,
+            height: 64,
+            edge: TILE_EDGE,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !tiles.is_armed() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(tiles.is_armed(), "tile thread must have applied the Reset");
+        assert_eq!(tiles.store_size(), (128, 64));
+
+        // Shares the pipeline's stop flag, so this returns rather than hanging.
+        pipeline.shutdown();
+    }
+
+    #[test]
+    fn tile_highlight_defaults_off_and_round_trips() {
+        let pipeline = Pipeline::new(
+            Arc::new(SourceStatus::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(!pipeline.tile_highlight(), "a diagnostic aid is opt-in");
+        pipeline.set_tile_highlight(true);
+        assert!(pipeline.tile_highlight());
+    }
 
     #[test]
     fn synth_frame_is_well_formed_rgba() {

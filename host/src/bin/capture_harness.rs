@@ -96,6 +96,20 @@ struct Shared {
     ui_repaints: AtomicU32,
 }
 
+/// Render a frame's dirty/move rect list for the `--dirty` trace.
+///
+/// `NONE` is the case worth watching on real hardware: it means DXGI would not
+/// hand over the metadata, so the consumer must treat the whole surface as
+/// changed. A count (including `0`) means the driver answered and "nothing
+/// changed" can be trusted. Confusing the two is what this printout exists to
+/// catch.
+fn rect_state<T>(rects: &Option<Vec<T>>) -> String {
+    match rects {
+        Some(v) => v.len().to_string(),
+        None => "NONE".to_string(),
+    }
+}
+
 fn arg_seconds() -> Option<u64> {
     std::env::args()
         .skip_while(|a| a != "--seconds")
@@ -291,6 +305,7 @@ fn pipeline(shared: &Arc<Shared>) -> anyhow::Result<()> {
     let mut rgba = Vec::new();
     let mut reference: Vec<u8> = Vec::new();
     let verify = std::env::args().any(|a| a == "--verify");
+    let trace_dirty = std::env::args().any(|a| a == "--dirty");
 
     let mut win = Window::default();
     let mut seq = 0u64;
@@ -320,6 +335,16 @@ fn pipeline(shared: &Arc<Shared>) -> anyhow::Result<()> {
         let ms_capture = t_cap.elapsed().as_secs_f32() * 1000.0;
         tot_cap += 1;
         let ts = frame.timestamp_ms;
+
+        if trace_dirty {
+            println!(
+                "frame {tot_cap}: repeated={} dirty={} move={} accum={}",
+                frame.repeated,
+                rect_state(&frame.dirty_rects),
+                rect_state(&frame.move_rects),
+                frame.accumulated_frames
+            );
+        }
 
         // Keep an untouched copy of what we captured so the decoded picture can
         // be compared against ground truth rather than merely counted.

@@ -437,6 +437,7 @@ fn pair_params(addr: SocketAddr, code: &str) -> ConnectParams {
         max_width: 1920,
         max_height: 1080,
         preferred_fps: 60,
+        lossless_tiles: true,
     }
 }
 
@@ -720,6 +721,7 @@ async fn mismatched_spki_pin_is_rejected() {
         max_width: 1920,
         max_height: 1080,
         preferred_fps: 60,
+        lossless_tiles: true,
     };
     let (client, shutdown, client_task) = spawn_client(params, store);
 

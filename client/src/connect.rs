@@ -50,6 +50,14 @@ pub struct StreamCaps {
     pub max_width: u32,
     pub max_height: u32,
     pub preferred_fps: u32,
+    /// Ask hosts for lossless refinement of settled screen regions.
+    ///
+    /// A request only — the host answers with the intersection, so a host that
+    /// lacks the feature or has it switched off simply never opens the stream
+    /// and nothing changes. Default **true**: unlike background capture there
+    /// is no privacy or surprise cost, and against every host shipped so far it
+    /// is a no-op.
+    pub lossless_tiles: bool,
 }
 
 impl Default for StreamCaps {
@@ -63,6 +71,7 @@ impl Default for StreamCaps {
             // preference — indistinguishable from the user actually asking
             // for 60. 0 preserves today's behaviour bit-for-bit.
             preferred_fps: 0,
+            lossless_tiles: true,
         }
     }
 }
@@ -92,6 +101,7 @@ impl ConnectRequest {
             max_width: caps.max_width,
             max_height: caps.max_height,
             preferred_fps: caps.preferred_fps,
+            lossless_tiles: caps.lossless_tiles,
         }
     }
 }
@@ -115,6 +125,7 @@ pub struct ConnectSupervisor {
     route_tx: crossbeam_channel::Sender<Option<TransportRoute>>,
     state_tx: crossbeam_channel::Sender<ConnectionState>,
     control_in_tx: crossbeam_channel::Sender<ControlMsg>,
+    tiles_tx: crossbeam_channel::Sender<directdesk_shared::tiles::TileMsg>,
 
     // Outbound (UI -> transport). The pumps forward to whichever sender is
     // installed here; `None` means "no active connection, drop the message".
@@ -141,6 +152,7 @@ impl ConnectSupervisor {
             route_tx,
             state_tx,
             control_tx: control_in_tx,
+            tiles_tx,
             input_rx,
             control_rx,
         } = transport;
@@ -159,6 +171,7 @@ impl ConnectSupervisor {
             route_tx,
             state_tx,
             control_in_tx,
+            tiles_tx,
             input_target,
             control_target,
             current: None,
@@ -196,6 +209,7 @@ impl ConnectSupervisor {
             route_tx: self.route_tx.clone(),
             state_tx: self.state_tx.clone(),
             control_tx: self.control_in_tx.clone(),
+            tiles_tx: self.tiles_tx.clone(),
             input_rx,
             control_rx: control_out_rx,
         };

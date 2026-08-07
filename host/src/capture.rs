@@ -34,9 +34,9 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL, DXGI_ERROR_NOT_FOUND,
-    DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTPUT_DESC,
+    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL, DXGI_ERROR_MORE_DATA,
+    DXGI_ERROR_NOT_FOUND, DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_UNSUPPORTED,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTPUT_DESC,
 };
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::System::StationsAndDesktops::{
@@ -94,9 +94,31 @@ pub struct GpuFrame {
     /// True when this is a re-emission of the previous image because the
     /// desktop did not change within `repeat_after`.
     pub repeated: bool,
-    /// Regions changed since the previous frame. Empty on a repeat frame.
-    pub dirty_rects: Vec<RECT>,
-    pub move_rects: Vec<DXGI_OUTDUPL_MOVE_RECT>,
+    /// Regions changed since the previously emitted frame — **or `None`**.
+    ///
+    /// `None` and `Some(vec![])` mean opposite things and must never be
+    /// collapsed into "no rects":
+    ///
+    /// * `None` — *we cannot tell.* Either DXGI refused the metadata query, or
+    ///   the duplication was just rebuilt and its change history no longer
+    ///   describes the image we are handing out. **Treat the entire surface as
+    ///   changed.** Anything that caches per-region state — static-region
+    ///   refinement, tile hashing, damage-driven encoding — must invalidate
+    ///   everything on `None`. Reading `None` as "static" is how stale pixels
+    ///   get painted over a screen that really did change, and a transient
+    ///   driver hiccup is enough to trigger it.
+    /// * `Some(rects)` — DXGI answered, and the answer is complete. An empty
+    ///   vec genuinely means *nothing* changed, so a region may safely be
+    ///   marked settled.
+    ///
+    /// A repeat frame (`repeated == true`) carries `Some(vec![])`: it is a
+    /// byte-identical re-emission of the image already sent, so the delta
+    /// really is empty.
+    pub dirty_rects: Option<Vec<RECT>>,
+    /// Scroll/blit regions DXGI reported for this frame, under exactly the same
+    /// `None`-vs-`Some(vec![])` contract as [`Self::dirty_rects`]. The two lists
+    /// come from the same per-frame metadata block and fail together.
+    pub move_rects: Option<Vec<DXGI_OUTDUPL_MOVE_RECT>>,
     /// DDA's count of coalesced desktop updates.
     pub accumulated_frames: u32,
 }
@@ -135,8 +157,16 @@ pub struct DdaCapture {
     /// Re-emit the last image if the desktop has been idle this long. Keeps the
     /// encoder and downstream stats alive on a static screen. Default 33 ms.
     repeat_after: Duration,
-    dirty_scratch: Vec<u8>,
+    /// Reused destination for `GetFrameDirtyRects`. Typed as `RECT` rather than
+    /// bytes so the fill call cannot hand DXGI an under-aligned buffer.
+    dirty_scratch: Vec<RECT>,
     recreate_backoff: Option<Instant>,
+    /// Set every time duplication is (re)built. A fresh `IDXGIOutputDuplication`
+    /// has no memory of what the *previous* one had already shown the client, so
+    /// its first frame's dirty rects describe a delta against an image nobody
+    /// ever saw. The next real frame therefore reports `dirty_rects: None`
+    /// ("assume everything changed") instead of DXGI's misleading answer.
+    force_full_dirty: bool,
 }
 
 impl DdaCapture {
@@ -182,6 +212,9 @@ impl DdaCapture {
             repeat_after: Duration::from_millis(33),
             dirty_scratch: Vec::new(),
             recreate_backoff: None,
+            // No duplication exists yet, so nothing has been shown to anyone:
+            // the first frame we ever emit is by definition a full update.
+            force_full_dirty: true,
         };
         // Best-effort: a failure here is recoverable and retried in acquire().
         if let Err(e) = me.recreate_duplication() {
@@ -308,8 +341,17 @@ impl DdaCapture {
         // SAFETY: same device, identical BGRA descs — a straight full-surface copy.
         unsafe { self.context.CopyResource(&self.tex, &src) };
 
-        let dirty_rects = self.read_dirty_rects(&dupl);
-        let move_rects = self.read_move_rects(&dupl);
+        // Read the metadata even when we are about to discard it: both queries
+        // must be issued before ReleaseFrame, and issuing them keeps the driver
+        // on the same code path frame to frame.
+        let mut dirty_rects = self.read_dirty_rects(&dupl);
+        let mut move_rects = self.read_move_rects(&dupl);
+        if self.force_full_dirty {
+            // First frame after a (re)build — see `force_full_dirty`.
+            dirty_rects = None;
+            move_rects = None;
+            self.force_full_dirty = false;
+        }
 
         drop(_release);
 
@@ -378,8 +420,11 @@ impl DdaCapture {
             height: self.height,
             timestamp_ms: self.elapsed_ms(now),
             repeated: true,
-            dirty_rects: Vec::new(),
-            move_rects: Vec::new(),
+            // A repeat re-sends the exact image already emitted, so "nothing
+            // changed" is a fact we know first-hand — not a DXGI answer we
+            // failed to get. `Some(vec![])`, never `None`.
+            dirty_rects: Some(Vec::new()),
+            move_rects: Some(Vec::new()),
             accumulated_frames: 0,
         })
     }
@@ -421,6 +466,10 @@ impl DdaCapture {
                 self.dupl = Some(d);
                 self.state = CaptureState::Running;
                 self.recreate_backoff = None;
+                // The new duplication's dirty-rect history starts from *its*
+                // first frame, not from the last image we emitted. Force the
+                // next frame to declare a full update.
+                self.force_full_dirty = true;
                 Ok(())
             }
             Err(e) if e.code() == E_ACCESSDENIED => {
@@ -448,56 +497,95 @@ impl DdaCapture {
         }
     }
 
-    fn read_dirty_rects(&mut self, dupl: &IDXGIOutputDuplication) -> Vec<RECT> {
+    /// Read the dirty-rect list for the frame `dupl` currently holds.
+    ///
+    /// `None` means the query failed and the answer is unknowable; `Some` — even
+    /// `Some(vec![])` — means DXGI answered completely. See
+    /// [`GpuFrame::dirty_rects`] for why the caller may not merge the two.
+    ///
+    /// Both DXGI metadata getters take *byte* counts, not rect counts, and use
+    /// the standard two-phase "probe then fill" shape. Deciding which probe
+    /// outcome is a genuine empty result is the whole point of this function:
+    ///
+    /// * `Ok` with `needed == 0` — the call succeeded against a zero-byte
+    ///   buffer, which it can only do when there was nothing to write.
+    ///   Genuinely empty: `Some(vec![])`.
+    /// * `DXGI_ERROR_MORE_DATA` — the documented "your buffer is too small"
+    ///   reply; `needed` now holds the required size. Not a failure, proceed.
+    /// * any other error — the driver would not answer (lost access, invalid
+    ///   call, an out-of-contract refusal of the null probe buffer). We have no
+    ///   idea what changed, so we must say so.
+    ///
+    /// The old code returned an empty vec for that last case, which made a
+    /// transient driver failure indistinguishable from a static screen.
+    fn read_dirty_rects(&mut self, dupl: &IDXGIOutputDuplication) -> Option<Vec<RECT>> {
         let mut needed: u32 = 0;
-        // SAFETY: query size first with a zero-length buffer, then fill.
+        // SAFETY: `dupl` holds an acquired frame for the whole of both calls.
+        // Phase one passes a null buffer with a matching zero length, which is
+        // the documented size-probe form; phase two passes a buffer whose byte
+        // length is exactly the `size` argument, correctly aligned for `RECT`
+        // because the scratch is a `Vec<RECT>`. `written` is only trusted after
+        // the call reports success.
         unsafe {
-            if dupl
-                .GetFrameDirtyRects(0, std::ptr::null_mut(), &mut needed)
-                .is_err()
-                && needed == 0
-            {
-                return Vec::new();
+            match dupl.GetFrameDirtyRects(0, std::ptr::null_mut(), &mut needed) {
+                Ok(()) if needed == 0 => return Some(Vec::new()),
+                Ok(()) => {}
+                // A MORE_DATA that asks for zero bytes is self-contradictory;
+                // refuse to guess.
+                Err(e) if e.code() == DXGI_ERROR_MORE_DATA && needed > 0 => {}
+                Err(e) => {
+                    tracing::debug!("GetFrameDirtyRects probe failed ({:?})", e.code());
+                    return None;
+                }
             }
-            if needed == 0 {
-                return Vec::new();
-            }
-            self.dirty_scratch.resize(needed as usize, 0);
-            let ptr = self.dirty_scratch.as_mut_ptr() as *mut RECT;
+
+            // Round up so the buffer we pass is never shorter than `needed`.
+            let n = (needed as usize).div_ceil(std::mem::size_of::<RECT>());
+            self.dirty_scratch.clear();
+            self.dirty_scratch.resize(n, RECT::default());
+            let size = (n * std::mem::size_of::<RECT>()) as u32;
+            let ptr = self.dirty_scratch.as_mut_ptr();
             let mut written = 0u32;
-            if dupl.GetFrameDirtyRects(needed, ptr, &mut written).is_err() {
-                return Vec::new();
+            if let Err(e) = dupl.GetFrameDirtyRects(size, ptr, &mut written) {
+                tracing::debug!("GetFrameDirtyRects fill failed ({:?})", e.code());
+                return None;
             }
-            let count = written as usize / std::mem::size_of::<RECT>();
-            std::slice::from_raw_parts(ptr as *const RECT, count).to_vec()
+            let count = (written as usize / std::mem::size_of::<RECT>()).min(n);
+            Some(self.dirty_scratch[..count].to_vec())
         }
     }
 
-    fn read_move_rects(&mut self, dupl: &IDXGIOutputDuplication) -> Vec<DXGI_OUTDUPL_MOVE_RECT> {
+    /// Move rects for the current frame, under the same `None`-means-unknowable
+    /// contract as [`Self::read_dirty_rects`]; see there for the probe reasoning.
+    fn read_move_rects(
+        &mut self,
+        dupl: &IDXGIOutputDuplication,
+    ) -> Option<Vec<DXGI_OUTDUPL_MOVE_RECT>> {
+        const SZ: usize = std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
         let mut needed: u32 = 0;
-        // SAFETY: identical two-phase query as dirty rects.
+        // SAFETY: identical two-phase query as dirty rects — null buffer with a
+        // zero length to probe, then a correctly sized and aligned `Vec`.
         unsafe {
-            if dupl
-                .GetFrameMoveRects(0, std::ptr::null_mut(), &mut needed)
-                .is_err()
-                && needed == 0
-            {
-                return Vec::new();
+            match dupl.GetFrameMoveRects(0, std::ptr::null_mut(), &mut needed) {
+                Ok(()) if needed == 0 => return Some(Vec::new()),
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_MORE_DATA && needed > 0 => {}
+                Err(e) => {
+                    tracing::debug!("GetFrameMoveRects probe failed ({:?})", e.code());
+                    return None;
+                }
             }
-            if needed == 0 {
-                return Vec::new();
-            }
-            let n = needed as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+
+            let n = (needed as usize).div_ceil(SZ);
             let mut buf: Vec<DXGI_OUTDUPL_MOVE_RECT> = vec![DXGI_OUTDUPL_MOVE_RECT::default(); n];
             let mut written = 0u32;
-            if dupl
-                .GetFrameMoveRects(needed, buf.as_mut_ptr(), &mut written)
-                .is_err()
+            if let Err(e) = dupl.GetFrameMoveRects((n * SZ) as u32, buf.as_mut_ptr(), &mut written)
             {
-                return Vec::new();
+                tracing::debug!("GetFrameMoveRects fill failed ({:?})", e.code());
+                return None;
             }
-            buf.truncate(written as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>());
-            buf
+            buf.truncate((written as usize / SZ).min(n));
+            Some(buf)
         }
     }
 }

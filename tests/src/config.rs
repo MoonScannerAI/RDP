@@ -4,6 +4,8 @@ use directdesk_shared::netsim::NetParams;
 use directdesk_shared::protocol::QualityMode;
 use directdesk_shared::transport::reassembly::ReassemblyConfig;
 
+use crate::tiles::TileSim;
+
 /// Client → host, reliable: input events. Mirrors [`Channel::Input`].
 ///
 /// [`Channel::Input`]: directdesk_shared::protocol::Channel::Input
@@ -77,6 +79,12 @@ pub struct SimConfig {
     /// the gap only on a keyframe. Off by default so it can never perturb a
     /// row that isn't testing it.
     pub gate_delta_after_gap: bool,
+    /// Refinement tiles and the one congestion window they share with video
+    /// (see [`crate::tiles`]). `None` — the default — leaves the host on the
+    /// pre-existing path exactly: no capacity model, no status windows, and the
+    /// adaptor driven straight from each client loss report, which is what
+    /// every other row in the matrix asserts against.
+    pub tiles: Option<TileSim>,
 }
 
 /// A single deliberately damaged frame: encoded oversized, then has specific
@@ -131,6 +139,7 @@ impl Default for SimConfig {
             fec_block: 0,
             burst_injection: None,
             gate_delta_after_gap: false,
+            tiles: None,
         }
     }
 }

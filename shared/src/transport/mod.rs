@@ -50,6 +50,19 @@ pub const PRIORITY_CONTROL: i32 = 32;
 /// overtakes any bulk stream traffic.
 pub const PRIORITY_INPUT: i32 = 16;
 
+/// Stream priority for bulk background traffic: lossless refinement tiles.
+///
+/// Below the default (0) so tiles yield to every other stream. Note this orders
+/// tiles only against *streams* — it does **not** order them against the video
+/// datagrams, which share the same congestion window. That coupling has to be
+/// throttled in the application; priority alone will not do it.
+pub const PRIORITY_BULK: i32 = -16;
+
+// Bulk must never be able to overtake input or control. If someone "tidies"
+// these numbers, this is the tripwire.
+const _: () = assert!(PRIORITY_BULK < PRIORITY_INPUT);
+const _: () = assert!(PRIORITY_INPUT < PRIORITY_CONTROL);
+
 /// Encode the one-byte channel tag written at the head of each stream.
 pub fn channel_tag(channel: Channel) -> Result<u8> {
     let bytes = postcard::to_stdvec(&channel)?;

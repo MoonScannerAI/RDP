@@ -9,6 +9,10 @@ path = "src/lib.rs"
 
 [dependencies]
 directdesk-shared = { workspace = true }
+# The refinement-tile rows drive the host's *real* congestion policy —
+# `tile_budget_kbps`, `congestion_signal`, `WindowDelivery` — rather than a copy
+# of it, which is the only way a test of that policy can catch a change to it.
+directdesk-host = { path = "../host", default-features = false }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

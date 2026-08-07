@@ -34,6 +34,7 @@ use crate::frames::synth_payload;
 use crate::framing::{encode_frame_record, strip_length_prefix, FramedReader, MuxClass};
 use crate::mux::{MuxConfig, MuxStats, ReliableMux};
 use crate::pump::PumpCtx;
+use crate::tiles::{TileEngine, TileStats, TileWindowRecord};
 
 /// The host side of a simulated session.
 pub struct SimHost {
@@ -44,6 +45,10 @@ pub struct SimHost {
     input_reader: FramedReader,
     control_reader: FramedReader,
     mux: ReliableMux,
+    /// The shared congestion window and the status loop that governs the tile
+    /// budget. `None` for every row that is not about refinement tiles, which
+    /// leaves this host on exactly the path it had before they existed.
+    tiles: Option<TileEngine>,
     route: Route,
     frames_captured: u64,
     last_capture_ms: Option<u64>,
@@ -61,6 +66,7 @@ impl std::fmt::Debug for SimHost {
             .field("bitrate_kbps", &self.bitrate_kbps)
             .field("injected", &self.injector.events.len())
             .field("mux", &self.mux.stats())
+            .field("tiles", &self.tiles.as_ref().map(TileEngine::stats))
             .finish()
     }
 }
@@ -77,6 +83,9 @@ impl SimHost {
             cfg.mux_bytes_per_tick,
             cfg.mux_max_video_backlog,
         ));
+        let tiles = cfg
+            .tiles
+            .map(|tile_cfg| TileEngine::new(tile_cfg, cfg.tick_ms));
         Self {
             encoder: NullEncoder::new(),
             injector: MockInjector::default(),
@@ -84,6 +93,7 @@ impl SimHost {
             input_reader: FramedReader::control(),
             control_reader: FramedReader::control(),
             mux,
+            tiles,
             route: Route::Datagram,
             frames_captured: 0,
             last_capture_ms: None,
@@ -122,6 +132,26 @@ impl SimHost {
         self.mux.stats()
     }
 
+    /// Shared-window and refinement-tile counters, or the zero value on a row
+    /// that did not configure tiles.
+    #[must_use]
+    pub fn tile_stats(&self) -> TileStats {
+        self.tiles.as_ref().map(TileEngine::stats).unwrap_or_default()
+    }
+
+    /// Every host status window this run closed, in order. Empty unless
+    /// [`SimConfig::tiles`](crate::SimConfig::tiles) was set.
+    #[must_use]
+    pub fn tile_windows(&self) -> &[TileWindowRecord] {
+        self.tiles.as_ref().map_or(&[], TileEngine::windows)
+    }
+
+    /// The tile budget currently in force, in kbps.
+    #[must_use]
+    pub fn tile_budget_kbps(&self) -> u32 {
+        self.tiles.as_ref().map_or(0, TileEngine::budget_kbps)
+    }
+
     /// The quality mode in force.
     #[must_use]
     pub fn quality(&self) -> QualityMode {
@@ -137,11 +167,28 @@ impl SimHost {
     /// *not* an error: it is logged and the session continues, because a
     /// corrupt message must never be able to kill a host.
     pub fn pump(&mut self, ctx: &mut PumpCtx<'_>) -> Result<()> {
+        // Refill the shared congestion window and let carried-over tile bytes
+        // take their place in it *before* this tick's video is offered — that
+        // ordering is the coupling being tested; see [`crate::tiles`].
+        if let Some(engine) = self.tiles.as_mut() {
+            engine.begin_tick(ctx, &mut self.adaptor);
+            // The adaptor is driven by the engine's status window, so pick up
+            // any decision it made and put it where the encoder can see it.
+            let target = self.adaptor.current();
+            if target != self.bitrate_kbps {
+                self.bitrate_kbps = target;
+                self.encoder.set_bitrate(target)?;
+            }
+        }
         self.drain_input(ctx);
         self.drain_control(ctx)?;
         self.capture_and_send(ctx)?;
         if self.route == Route::Fallback {
             self.mux.pump(ctx, Endpoint::A)?;
+        }
+        // Tile bytes produced this tick queue behind this tick's video.
+        if let Some(engine) = self.tiles.as_mut() {
+            engine.end_tick();
         }
         Ok(())
     }
@@ -246,6 +293,15 @@ impl SimHost {
                     at_ms: ctx.now_ms,
                     loss: stats.loss,
                 });
+                // With a shared window configured the adaptor is driven once per
+                // status window from the full `congestion_signal` — loss *and*
+                // backpressure — exactly as `host::net::status_loop` does it.
+                // Observing here as well would drive it twice per report and
+                // hide the backpressure half entirely.
+                if let Some(engine) = self.tiles.as_mut() {
+                    engine.observe_peer_stats(stats.loss, stats.rtt_ms);
+                    return Ok(());
+                }
                 if let Some(kbps) = self.adaptor.observe(ctx.now_ms, stats.loss, stats.rtt_ms) {
                     self.bitrate_kbps = kbps;
                     self.encoder.set_bitrate(kbps)?;
@@ -336,6 +392,11 @@ impl SimHost {
             keyframe: encoded.keyframe,
             bytes: encoded.data.len(),
         });
+        // The encoder produced these bytes whether or not the link takes them;
+        // that is the `media_kbps` half of the tile headroom estimate.
+        if let Some(engine) = self.tiles.as_mut() {
+            engine.record_encoded(encoded.data.len());
+        }
 
         match self.route {
             Route::Datagram => {
@@ -348,6 +409,19 @@ impl SimHost {
                 if let Some(b) = &self.cfg.burst_injection {
                     if b.frame_id == encoded.frame_id {
                         withhold_burst_fragments(&mut fragments, b);
+                    }
+                }
+                // Offer the frame whole to the shared congestion window. A frame
+                // it cannot take is skipped entirely rather than partially sent
+                // — see `TileEngine::offer_video` for why partial is worse.
+                if let Some(engine) = self.tiles.as_mut() {
+                    let wire: usize = fragments.iter().map(Vec::len).sum();
+                    if !engine.offer_video(wire) {
+                        ctx.log.push(SimEvent::VideoBackpressured {
+                            at_ms: ctx.now_ms,
+                            frame_id: encoded.frame_id,
+                        });
+                        return Ok(());
                     }
                 }
                 for fragment in &fragments {

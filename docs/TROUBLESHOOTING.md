@@ -233,6 +233,55 @@ alone would suggest, work through:
    design targets minimizing the *added* latency on top of that RTT
    (encode/decode/pipeline overhead), not eliminating the RTT itself.
 
+## Small text looks soft / blurry
+
+Work through these in order — the first two are far more common than the third,
+and no encoder setting can compensate for either.
+
+1. **Check you are actually viewing at 1:1.** This is the usual culprit. If the
+   client window is not showing the host's desktop at exactly its native size,
+   the frame is *resampled after decode*, locally — nothing the host does can
+   fix that. Click **1:1** in the client toolbar; the readout beside it shows
+   the host resolution and the live scale, and the client log records
+   `scale 1.00x (1:1 exact)` when it is right. A scaled Windows display (say
+   150%) makes this easy to get wrong, because the window can look "full size"
+   while the video inside it is being stretched by a fractional factor.
+
+2. **Give it a moment to settle.** A still screen gets one extra keyframe
+   encoded at constant quality ~700 ms after motion stops
+   (`static_settle_ms` / `static_refine_quality` in the host config). During
+   scrolling, text is expected to be softer — that is rate control doing its
+   job.
+
+3. **Turn on lossless refinement** (`lossless_tiles_enabled: true` in the host
+   config; the client asks for it by default). Once a region stops changing the
+   host re-sends it pixel-exact on a side channel and the client composites it
+   over the video, so static text becomes bit-exact rather than merely
+   well-quantised. Both ends must support it — it is negotiated, and against a
+   host or client that does not have it nothing happens at all.
+
+   It costs bandwidth only out of *measured spare capacity*: the host spends a
+   quarter of the gap between the bitrate the adaptor has allocated and what
+   the encoder is actually producing, and stops entirely the moment there is
+   any packet loss or send backpressure. It should therefore never make video
+   worse. If you suspect it has, the host log's `tile diag` line prints
+   `tile_strips`, `tile_budget_kbps`, `backpressured` and `loss` together:
+   **`backpressured` climbing while tiles flow and `loss` stays at zero** is the
+   signature of tiles stealing bandwidth from video. Set
+   `lossless_tile_max_kbps` lower, or turn the feature off, and report it.
+
+   Other knobs (all host config, all clamped on load):
+   `lossless_tile_settle_ms` (default 900 — how long a region must be still
+   before it is refined), `lossless_tile_lease_ms` (4000 — how long a refined
+   tile stays valid without renewal; this is the fail-safe that bounds how long
+   a stale tile could ever be shown), `lossless_tile_deflate_level` (6) and
+   `lossless_tiles_per_pass` (32).
+
+   The client's diagnostics panel has a **Lossless tiles** window showing how
+   many tiles are resident and what share of the screen they cover, plus a
+   **highlight** toggle that tints refined regions so you can see exactly what
+   has converged.
+
 ## Quick reference: log file locations
 
 | Component | Log path |
