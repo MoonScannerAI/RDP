@@ -29,7 +29,7 @@ use directdesk_shared::video::{EncodedFrame, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAM
 use directdesk_shared::{Error, Result};
 use parking_lot::Mutex;
 
-use crate::capture::{pause_reason, DdaCapture};
+use crate::capture::{pause_reason, CaptureState, DdaCapture, GpuFrame};
 use crate::convert::{bgra_to_nv12, GpuConverter};
 use crate::input_inject::WinInjector;
 use crate::mf_encoder::{
@@ -724,6 +724,958 @@ impl StatsWindow {
     }
 }
 
+/// The media thread's capture-and-convert front end: everything between the
+/// desktop duplication and the encoder's input.
+///
+/// Owns what used to be six loose locals in [`media_thread`] — the duplication,
+/// the optional GPU colour converter and the flag saying whether it is still
+/// trusted, the two reusable CPU staging buffers, and the bit recording whether
+/// `cpu_bgra` describes the frame currently in hand.
+///
+/// They belong to one type because five of them are only meaningful relative to
+/// **one** texture — the one inside [`DdaCapture`] that
+/// [`DdaCapture::acquire`] overwrites in place on every call. `cpu_bgra` is a
+/// copy of it, `cpu_nv12` is a conversion of it, and `bgra_is_current` is the
+/// claim that the copy is still the current one. Holding them apart is what let
+/// that claim drift out of step with the pixels it describes; holding them
+/// together puts the invalidation and the buffers behind the same `&mut`.
+struct CaptureStage {
+    capture: DdaCapture,
+    /// `None` on hosts where the GPU colour converter could not be built at
+    /// all; the CPU fallback in [`Self::convert_and_submit`] then carries every
+    /// frame.
+    converter: Option<GpuConverter>,
+    /// The converter above is still *trusted*. Distinct from `converter.is_some()`:
+    /// a converter that exists but has failed once is latched off for the rest
+    /// of the session rather than being retried per frame.
+    gpu_convert_ok: bool,
+    /// Whole-frame BGRA staging buffer, reused so a busy desktop does not
+    /// allocate a megabyte per frame on the thread that must not miss a capture
+    /// deadline. Written by the CPU fallback, and read a second time by the
+    /// lossless refinement pass when `bgra_is_current` says it may be.
+    cpu_bgra: Vec<u8>,
+    /// NV12 staging buffer for encoders that will not take a texture. Reused
+    /// for the same reason as `cpu_bgra`.
+    cpu_nv12: Vec<u8>,
+    /// `cpu_bgra` holds the pixels of the frame currently in hand.
+    ///
+    /// Set only by the CPU fallback that fills the buffer, cleared only by
+    /// [`Self::acquire`]. **Read [`Self::acquire`]'s comment before touching
+    /// either half** — this field used to be a loop local whose falseness at
+    /// the top of each iteration the compiler guaranteed for free, and that
+    /// guarantee is now a hand-maintained one.
+    bgra_is_current: bool,
+}
+
+impl CaptureStage {
+    fn new(capture: DdaCapture, converter: Option<GpuConverter>) -> Self {
+        // Trusted to begin with iff it was built at all; the first failure in
+        // `convert_and_submit` latches it off for the rest of the session.
+        let gpu_convert_ok = converter.is_some();
+        Self {
+            capture,
+            converter,
+            gpu_convert_ok,
+            cpu_bgra: Vec::new(),
+            cpu_nv12: Vec::new(),
+            // Nothing has been captured, so nothing describes it. Every later
+            // value of this field is established by `acquire`.
+            bgra_is_current: false,
+        }
+    }
+
+    /// Take the next frame off the duplication.
+    ///
+    /// Same three-way contract as [`DdaCapture::acquire`]: `Ok(Some(_))` is a
+    /// new or deliberately repeated image, `Ok(None)` means nothing this
+    /// interval *or* a state the caller must inspect via [`Self::state`], and
+    /// `Err` likewise leaves the typed state authoritative.
+    fn acquire(&mut self, timeout_ms: u32) -> Result<Option<GpuFrame>> {
+        // FIRST statement. Unconditional, before the acquire it guards and
+        // before any path out of this function.
+        //
+        // This line replaces `let mut bgra_is_current = false;`, which used to
+        // sit inside the loop body. As a loop local the compiler re-created it
+        // false on every single iteration and no amount of editing the loop
+        // could get that wrong. As a field of a struct that outlives the loop,
+        // nothing enforces it any more — so the reset has to be pinned to
+        // something that cannot drift, and this is that something.
+        //
+        // It is pinned to `acquire` specifically, not to the top of the loop
+        // and never to a caller, because acquire is the exact instant the
+        // staged bytes stop describing reality. `readback_bgra` copies out of
+        // the capture's own texture, `cpu_bgra` is that copy, and a successful
+        // `DdaCapture::acquire` overwrites that texture in place (see
+        // `GpuFrame::texture`). One acquire, one truth.
+        //
+        // What a stale `true` would cost, if this were moved or delegated: the
+        // lossless refinement pass skips its readback, compresses the PREVIOUS
+        // frame's pixels, and ships them as pixel-exact tiles stamped with THIS
+        // frame's `valid_from_ms` — a perfect-looking rectangle of a screen
+        // region that has already changed, composited over live video and
+        // bounded only by the tile lease. It is the failure class of 9a1c90a:
+        // wrong on the wire, silent in every test in this repo.
+        self.bgra_is_current = false;
+        self.capture.acquire(timeout_ms)
+    }
+
+    /// The duplication's typed state — authoritative for [`pause_reason`] on
+    /// both the `Ok(None)` and the `Err` path.
+    fn state(&self) -> CaptureState {
+        self.capture.state()
+    }
+
+    /// Colour-convert one captured frame and hand it to the encoder.
+    ///
+    /// Tries the GPU converter first and falls back to a CPU BGRA readback plus
+    /// [`bgra_to_nv12`], latching `gpu_convert_ok` off the first time the GPU
+    /// path fails so a broken converter costs one warning rather than one per
+    /// frame. The CPU fallback is also what makes `cpu_bgra` current.
+    ///
+    /// `gpu_texture_input` is a parameter rather than a field because it is a
+    /// property of the *encoder's* negotiated input, not of the capture: it is
+    /// read a second time by the live frame-rate rebuild, which must reject a
+    /// replacement encoder that cannot take textures when the live one does.
+    fn convert_and_submit(
+        &mut self,
+        frame: &GpuFrame,
+        enc: &mut MfH264Encoder,
+        ts: u32,
+        gpu_texture_input: bool,
+    ) -> Result<Option<EncodedFrame>> {
+        'encode: {
+            if self.gpu_convert_ok {
+                if let Some(conv) = self.converter.as_mut() {
+                    match conv.convert(&frame.texture) {
+                        Ok(nv12_tex) => {
+                            if gpu_texture_input {
+                                break 'encode enc.submit(FrameInput::Texture(&nv12_tex), ts);
+                            }
+                            match conv.readback_nv12(&nv12_tex, &mut self.cpu_nv12) {
+                                Ok(()) => {
+                                    break 'encode enc.submit(FrameInput::Nv12(&self.cpu_nv12), ts)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("NV12 readback failed, dropping to CPU: {e}");
+                                    self.gpu_convert_ok = false;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("GPU convert failed, dropping to CPU path: {e}");
+                            self.gpu_convert_ok = false;
+                        }
+                    }
+                }
+            }
+            // CPU fallback: readback BGRA, convert, feed CPU NV12.
+            if let Err(e) = self.capture.readback_bgra(&mut self.cpu_bgra) {
+                break 'encode Err(e);
+            }
+            self.bgra_is_current = true;
+            let stride = frame.width as usize * 4;
+            if let Err(e) = bgra_to_nv12(
+                &self.cpu_bgra,
+                stride,
+                frame.width,
+                frame.height,
+                &mut self.cpu_nv12,
+            ) {
+                break 'encode Err(e);
+            }
+            enc.submit(FrameInput::Nv12(&self.cpu_nv12), ts)
+        }
+    }
+
+    /// The three pieces [`TileStage::refine`] needs, borrowed together.
+    ///
+    /// Returned as one split borrow rather than as a ready-made `&[u8]` because
+    /// the pass owns the decision itself: it reads back from `capture` only
+    /// when `bgra_is_current` is false, and it must be able to *skip its whole
+    /// pass* when that readback fails. Handing it a slice would move that
+    /// choice — and the readback's failure mode — out of the pass entirely.
+    fn tile_inputs(&mut self) -> (&mut DdaCapture, &mut Vec<u8>, bool) {
+        (&mut self.capture, &mut self.cpu_bgra, self.bgra_is_current)
+    }
+
+    /// The duplication itself, for [`rebuild_encoder`] — which needs the D3D
+    /// device and the capture geometry, and must not be able to disturb either.
+    fn capture(&self) -> &DdaCapture {
+        &self.capture
+    }
+}
+
+/// How the one settle keyframe of each idle period is bought, when static
+/// refinement is switched on.
+///
+/// Nested inside [`EncoderCtl`] rather than living beside it because all three
+/// fields are statements about the *live encoder's* rate-control mode, and the
+/// one that matters — `armed` — is only ever correct if the same type both sets
+/// it and clears it.
+struct RefinePolicy {
+    /// Quality the next refinement frame is encoded at; 0 = feature off.
+    quality: u32,
+    /// The encoder is currently parked in constant-quality mode. Exactly one
+    /// loop iteration long, by construction — see the restore at the top.
+    armed: bool,
+    /// A refinement frame has been submitted and we have not yet seen the
+    /// keyframe it produced, whose size we want to log and police.
+    pending: bool,
+}
+
+/// The media thread's encoder, and everything that steers it.
+///
+/// Owns what used to be six loose locals in [`media_thread`] (`encoder`,
+/// `cur_fps`, `cur_bitrate`, `frame_budget`, `gpu_texture_input`,
+/// and the three `refine_*` flags now behind [`RefinePolicy`]).
+///
+/// The first five belong together because a live frame-rate change *replaces
+/// the MFT*: `cur_fps`, `frame_budget` and the published `fps_now` are only
+/// true of the replacement if they are rewritten with it, and
+/// `gpu_texture_input` is the one property of the old encoder the replacement
+/// has to be checked against before the swap is allowed at all. Held apart,
+/// any of those four can be updated without the others and the loop goes on
+/// sleeping to a frame rate the encoder no longer runs at.
+///
+/// The refinement policy is here for a sharper reason. `armed` was set in the
+/// static-settle block and cleared some two hundred lines above it, in a
+/// 544-line function — far enough apart that the site that arms constant
+/// quality could not see the restore that bounds it to one iteration. Inside
+/// one type they are forty lines apart, and the restore has a name.
+struct EncoderCtl {
+    enc: MfH264Encoder,
+    /// Frame rate currently in force. Only ever changed together with `enc`
+    /// itself: MF pins the frame rate in the negotiated media type, so moving
+    /// it means a new encoder.
+    cur_fps: u32,
+    /// Bitrate currently in force — the *adaptor's*, not the config's. Kept so
+    /// an encoder rebuilt for a frame-rate change starts at the rate in force
+    /// rather than the one the config booted with.
+    cur_bitrate: u32,
+    /// One frame's wall-clock allowance at `cur_fps`; the loop sleeps out
+    /// whatever of it the iteration did not spend.
+    frame_budget: Duration,
+    /// The live encoder is fed D3D textures. A property of the *encoder's*
+    /// negotiated input, not of the capture, which is why a rebuild has to
+    /// re-check it before the swap.
+    gpu_texture_input: bool,
+    refine: RefinePolicy,
+}
+
+impl EncoderCtl {
+    fn new(enc: MfH264Encoder, cfg: &SessionConfig, gpu_texture_input: bool) -> Self {
+        let cur_fps = cfg.target_fps.max(1);
+        Self {
+            enc,
+            cur_fps,
+            cur_bitrate: cfg.bitrate_kbps.max(1),
+            frame_budget: self::frame_budget(cur_fps),
+            gpu_texture_input,
+            refine: RefinePolicy {
+                // Quality the next refinement frame is encoded at; 0 = feature
+                // off. Clamped here so a `SessionConfig` built by hand
+                // (selftest, tests, an out-of-range host.json that skipped
+                // `sanitized`) cannot ask for something silly.
+                quality: match cfg.static_refine_quality {
+                    0 => 0,
+                    q => q.clamp(MIN_STATIC_REFINE_QUALITY, MAX_STATIC_REFINE_QUALITY),
+                },
+                armed: false,
+                pending: false,
+            },
+        }
+    }
+
+    /// The frame rate currently in force, for the initial `fps_now` publish.
+    /// Every later publish is done by [`Self::apply_requests`], which is the
+    /// only thing that can change it.
+    fn fps(&self) -> u32 {
+        self.cur_fps
+    }
+
+    /// One frame's wall-clock allowance at the live frame rate.
+    fn frame_budget(&self) -> Duration {
+        self.frame_budget
+    }
+
+    // --- refinement restore (structural) ---------------------------------
+    //
+    // First statement of the loop body, before any `continue`, any error
+    // path and any early `break` can be reached, and unconditional. That is
+    // the whole guarantee: whatever happened on the iteration that armed it
+    // — the capture failed, the encode errored, the frame was dropped for
+    // want of an input credit, the encoder produced nothing — constant
+    // quality lasted that one iteration and no more.
+    //
+    // Getting this wrong is not a cosmetic bug. Left armed, the encoder
+    // ignores every mean/peak write, so the adaptor loses its only lever on
+    // a residential uplink at ~258 ms RTT and cannot back off from
+    // congestion. `MfH264Encoder::set_bitrate` forces the same restore as a
+    // second line of defence.
+    //
+    // Do NOT reimplement this as a `Drop` guard. It has been considered and it
+    // does not work here: the guard would have to hold `&mut` on the encoder
+    // for the entire loop body to be able to restore on the way out, and every
+    // other thing the body does to the encoder — the bitrate write, the fps
+    // rebuild that *replaces* it, the submit, the drain — needs that same
+    // `&mut`. A guard would either not compile or would have to hand the
+    // encoder back out through a `DerefMut`, at which point it guards nothing
+    // that this one line does not already guard, and hides it behind a
+    // destructor whose call site is invisible.
+    fn begin_frame(&mut self) {
+        if self.refine.armed {
+            self.refine.armed = false;
+            self.enc.end_static_refinement();
+        }
+    }
+
+    /// Consume the bitrate, frame-rate and keyframe requests the network thread
+    /// has posted, in that order.
+    ///
+    /// Take-and-clear on all three: a request that cannot be honoured this
+    /// iteration is dropped rather than retried, because the next one carries
+    /// the adaptor's newer opinion anyway.
+    fn apply_requests(&mut self, shared: &Shared, cfg: &SessionConfig, capture: &DdaCapture) {
+        let bitrate = shared.bitrate_req.swap(0, Ordering::Relaxed);
+        if bitrate > 0 {
+            let _ = self.enc.set_bitrate(bitrate);
+            // Remembered so an encoder rebuilt for a frame-rate change starts at
+            // the rate in force, not the one the config booted with.
+            self.cur_bitrate = bitrate;
+        }
+
+        // Live frame-rate change. MF pins the frame rate in the negotiated
+        // media type, so the only way to move it is a new encoder — but only
+        // the encoder: capture, the D3D device and the SessionDescription are
+        // unchanged, which is why this never touches build_pipeline.
+        //
+        // Build-then-swap: `self.enc` keeps the working MFT until the new one is
+        // fully constructed, so a vendor MFT that refuses to activate at the
+        // requested rate costs a log line and nothing else.
+        let want_fps = shared.fps_req.swap(0, Ordering::Relaxed);
+        if want_fps > 0 && want_fps != self.cur_fps {
+            let cur_fps = self.cur_fps;
+            match rebuild_encoder(cfg, capture, want_fps, self.cur_bitrate) {
+                Ok(mut new_encoder) => {
+                    // The requirement is one-directional. When the live pipeline
+                    // hands the encoder D3D textures, a replacement that cannot
+                    // take them would be fed the wrong input kind, so refuse. The
+                    // reverse is harmless: an encoder that *could* take textures
+                    // is perfectly happy being fed CPU NV12, which is what a
+                    // pipeline without a GPU converter does. Demanding equality
+                    // here would make the whole fps control inert on those hosts.
+                    if self.gpu_texture_input && !new_encoder.accepts_textures() {
+                        tracing::warn!(
+                            "refusing {cur_fps} -> {want_fps} fps: the live pipeline submits GPU \
+                             textures and the rebuilt encoder only accepts CPU NV12"
+                        );
+                    } else {
+                        // Carry numbering forward so the rebuild is invisible to
+                        // the receiver's reassembler instead of costing it a
+                        // resync_after adoption window plus a forced keyframe.
+                        new_encoder.resume_numbering_from(&self.enc);
+                        self.enc = new_encoder;
+                        self.cur_fps = want_fps;
+                        self.frame_budget = self::frame_budget(self.cur_fps);
+                        shared.fps_now.store(self.cur_fps, Ordering::Relaxed);
+                        // A brand-new encoder has no reference chain the client
+                        // can use; give it a fresh IDR immediately.
+                        shared.keyframe_req.store(true, Ordering::Relaxed);
+                        tracing::info!("encoder rebuilt at {} fps", self.cur_fps);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "could not rebuild the encoder at {want_fps} fps ({e}); staying at {cur_fps}"
+                ),
+            }
+        }
+
+        if shared.keyframe_req.swap(false, Ordering::Relaxed) {
+            self.enc.request_keyframe();
+        }
+    }
+
+    /// Ask the encoder for an IDR on the next submitted frame.
+    fn request_keyframe(&mut self) {
+        self.enc.request_keyframe();
+    }
+
+    /// Buy the next keyframe at a fixed *quality* instead of at the streaming
+    /// bitrate. A no-op when refinement is off or has been policed off.
+    ///
+    /// Arming is bounded to exactly one iteration by [`Self::begin_frame`] —
+    /// the two are forty lines apart in this file for that reason.
+    fn arm_refinement(&mut self) {
+        if self.refine.quality > 0 {
+            let s = self.enc.begin_static_refinement(self.refine.quality);
+            self.refine.armed = true;
+            self.refine.pending = true;
+            tracing::debug!(
+                quality = s.quality,
+                min_qp = s.min_qp,
+                max_qp = s.max_qp,
+                "static refinement armed"
+            );
+        }
+    }
+
+    /// One frame came out of the encoder. Logs and polices the refinement
+    /// keyframe, if this is it.
+    ///
+    /// `pending` is cleared ONLY under the `ef.keyframe` test, exactly as it was
+    /// when this lived inline: a refinement that produces no keyframe leaves it
+    /// latched, so the *next* keyframe — whatever produced it — is the one
+    /// measured. That is current behaviour and it is preserved deliberately, not
+    /// by accident; it is not something to "fix" without deciding to.
+    fn note_output(&mut self, ef: &EncodedFrame) {
+        if !ef.keyframe {
+            return;
+        }
+        // The refinement's whole effect is "this frame is bigger and
+        // sharper". Log the size at INFO so host.log alone answers
+        // whether it worked — a refinement that comes out the same size
+        // as an ordinary IDR means the MFT ignored the mode (the
+        // software encoder does), and one that comes out huge is about
+        // to be policed below.
+        if self.refine.pending {
+            self.refine.pending = false;
+            let bytes = ef.data.len();
+            tracing::info!(
+                bytes,
+                quality = self.refine.quality,
+                ceiling = STATIC_REFINE_MAX_BYTES,
+                "static refinement keyframe emitted"
+            );
+            let next = adapt_refine_quality(self.refine.quality, bytes, STATIC_REFINE_MAX_BYTES);
+            if next != self.refine.quality {
+                if next == 0 {
+                    tracing::warn!(
+                        bytes,
+                        "refinement frames stay oversized at the lowest quality; \
+                         disabling static refinement for this session"
+                    );
+                } else {
+                    tracing::warn!(
+                        bytes,
+                        from = self.refine.quality,
+                        to = next,
+                        "refinement frame exceeded its size ceiling; lowering quality"
+                    );
+                }
+                self.refine.quality = next;
+            }
+        }
+    }
+
+    /// Colour-convert one captured frame through `cap` and submit it.
+    ///
+    /// The encoder's negotiated input kind is the encoder's business, so
+    /// `gpu_texture_input` is supplied from here rather than by the caller —
+    /// which is also what stops a live frame-rate rebuild from changing the
+    /// input kind out from under a call site that hard-coded the old one.
+    fn submit(
+        &mut self,
+        cap: &mut CaptureStage,
+        frame: &GpuFrame,
+        ts: u32,
+    ) -> Result<Option<EncodedFrame>> {
+        cap.convert_and_submit(frame, &mut self.enc, ts, self.gpu_texture_input)
+    }
+
+    /// The next frame the hardware encoder has ready, if any.
+    fn poll_output(&mut self) -> Option<EncodedFrame> {
+        self.enc.poll_output()
+    }
+}
+
+/// When the desktop last started being unchanged, and whether this idle period
+/// has already had its one settle keyframe.
+///
+/// Owns what used to be three loose locals in [`media_thread`] (`static_since`,
+/// `settle_sent`, `settle_delay`). They belong to one type because `sent` is
+/// meaningless except relative to the `since` it latches — clearing one without
+/// the other either spends a second settle keyframe inside one idle period, or
+/// spends none at all for the rest of the session.
+///
+/// --- static-scene settle ---------------------------------------------
+///
+/// A repeated frame is coded as an all-skip P-frame, which reproduces the
+/// previous picture exactly. That is bandwidth-perfect and quality-frozen:
+/// whatever the *one* frame that drew the current screen achieved is what
+/// the user stares at forever. If that frame landed right after a scroll,
+/// with rate control still paying off the burst, the text stays soft and
+/// nothing in the pipeline will ever refine it.
+///
+/// So once the screen has genuinely settled, send exactly ONE keyframe,
+/// then latch until the desktop actually changes again.
+///
+/// The older note here warned that forcing an IDR on *every* keepalive
+/// pulsed visibly on coloured backgrounds. That was real, and it was a
+/// property of periodic re-encoding under CBR: each IDR re-quantized the
+/// whole image to a different fixed bit budget, so the image breathed. Two
+/// things remove it. One IDR per idle period cannot be periodic — there is
+/// no second one to differ from — and under peak-constrained VBR with a QP
+/// ceiling (see mf_encoder) the settle frame is encoded at better quality
+/// than the frame it replaces, not merely differently. A single step up in
+/// sharpness is what we want the user to see.
+struct SettleWatch {
+    since: Option<Instant>,
+    sent: bool,
+    delay: Duration,
+}
+
+impl SettleWatch {
+    fn new(cfg: &SessionConfig) -> Self {
+        Self {
+            since: None,
+            sent: false,
+            delay: Duration::from_millis(cfg.static_settle_ms as u64),
+        }
+    }
+
+    /// Fold one captured frame in, and answer whether this is the moment to
+    /// spend this idle period's one settle keyframe.
+    ///
+    /// `now` is the loop's own tick, not the frame timestamp: the settle is
+    /// measured on the wall clock the frame budget is measured on, so it means
+    /// the same thing whatever the capture's timestamps do.
+    ///
+    /// The decision itself stays in the free [`should_settle`] below — that
+    /// function is what this file's tests drive directly, and it keeps its
+    /// signature.
+    fn observe(&mut self, repeated: bool, now: Instant) -> bool {
+        if !repeated {
+            self.since = None;
+            self.sent = false;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        if !should_settle(since.elapsed(), self.delay, self.sent) {
+            return false;
+        }
+        self.sent = true;
+        true
+    }
+
+    /// How long the desktop has been unchanged, for the log line that follows a
+    /// `true` from [`Self::observe`]. Zero when nothing is being timed.
+    fn static_for(&self) -> Duration {
+        self.since.map(|s| s.elapsed()).unwrap_or_default()
+    }
+}
+
+/// The lossless tile refinement side stream: the grid, its wiring, and every
+/// accumulator a pass carries between frames.
+///
+/// Owns what used to be seven loose locals in [`media_thread`] (`grid`,
+/// `dirty_scratch`, `move_scratch`, `tile_win`, `tile_win_start`,
+/// `revoke_retry`, `tile_bucket`) and the twelve-parameter `tile_refine_pass`
+/// that had to thread all of them back together on every idle frame.
+///
+/// They belong to one type because three of them are state the grid explicitly
+/// cannot hold. `revoke_retry` is "revoked, but not yet told" — the grid has
+/// already forgotten those ids (see [`drain_revocations`]) and no host-side
+/// state but this one can express them. `bucket` is allowance carried *across*
+/// passes, so a per-pass share smaller than one strip still adds up to
+/// something sendable. `win` is the diagnostic that says whether any of it is
+/// working. Held apart, each of them is one more `&mut` in a parameter list
+/// long enough to have needed `#[allow(clippy::too_many_arguments)]` — and a
+/// list that long is one where two same-typed arguments can be swapped and
+/// still compile.
+///
+/// Constructing it is the *whole* feature switch: [`Self::new`] answers `None`
+/// when `lossless_tiles_enabled` is off, exactly as the `Option<TileGrid>` this
+/// replaces did. Every tile branch in the loop is guarded by that option, so a
+/// session with the feature off allocates no grid, never reads pixels back for
+/// tiles, never compresses anything and never touches `tiles_tx`. The cost on
+/// the media thread is one null check per frame.
+struct TileStage {
+    grid: TileGrid,
+    /// The media thread's handle on the shared state, held for the three
+    /// atomics this side stream reads: `tiles_reset_req` (take-and-clear, and
+    /// re-armed here whenever a control message could not be queued) and the
+    /// `tile_budget_kbps`/`fps_now` pair the per-pass byte allowance is derived
+    /// from.
+    shared: Arc<Shared>,
+    /// A *clone* of the media thread's sender rather than a move out of
+    /// [`MediaChannels`]: that keeps the media thread holding the only sender
+    /// for the whole session even when this stage is never built. Moving it in
+    /// would drop it on the `None` path and disconnect the tile queue at
+    /// startup instead of simply never feeding it.
+    tiles_tx: Sender<TileMsg>,
+    /// Reusable translation buffers for DXGI's per-frame change report. Held
+    /// across frames so a busy desktop does not allocate two vectors per frame
+    /// on the thread that must not miss a capture deadline.
+    dirty_scratch: Vec<DirtyRect>,
+    move_scratch: Vec<MoveRect>,
+    /// Activity since the last diagnostic line, and when that window opened.
+    win: TileWindow,
+    win_start: Instant,
+    /// Tile ids whose `Revoke` the queue refused. See [`drain_revocations`]:
+    /// the grid cannot hold them for us, so this is the only place they survive
+    /// between passes.
+    revoke_retry: Vec<u32>,
+    /// Carried-over tile allowance; see [`tile_bucket_cap`].
+    bucket: usize,
+    /// How long (ms) a tile must sit unchanged before it is eligible.
+    settle_ms: u32,
+    /// How long (ms) a refined tile stays paintable without renewal.
+    lease_ms: u32,
+    /// deflate level for tile payloads, clamped once at construction.
+    level: u8,
+    /// Strips one pass may plan, before the queue and bandwidth limits.
+    per_pass: u32,
+}
+
+impl TileStage {
+    /// Build the side stream, or answer `None` when the feature is off — which
+    /// is the entire switch; see the type's doc.
+    ///
+    /// `tiles_tx` is borrowed and cloned rather than moved out of
+    /// [`MediaChannels`] for the reason recorded on the field.
+    fn new(
+        cfg: &SessionConfig,
+        shared: Arc<Shared>,
+        tiles_tx: &Sender<TileMsg>,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        if !cfg.lossless_tiles_enabled {
+            return None;
+        }
+        Some(Self {
+            // The grid is armed on the capture clock, but no frame has been
+            // captured yet, so it is stamped at 0 and immediately re-armed for
+            // real: `Shared` starts `tiles_reset_req` set, so the first frame
+            // through the loop issues a `Reset` at that frame's own timestamp.
+            grid: TileGrid::new(width, height, 0),
+            shared,
+            tiles_tx: tiles_tx.clone(),
+            dirty_scratch: Vec::new(),
+            move_scratch: Vec::new(),
+            win: TileWindow::default(),
+            win_start: Instant::now(),
+            revoke_retry: Vec::new(),
+            bucket: 0,
+            settle_ms: cfg.lossless_tile_settle_ms,
+            lease_ms: cfg.lossless_tile_lease_ms,
+            // Clamped once here rather than once per pass, in the same spirit
+            // as [`EncoderCtl::new`]'s quality clamp: a `SessionConfig` built
+            // by hand cannot ask deflate for a level it does not have.
+            level: cfg.lossless_tile_deflate_level.clamp(1, 9) as u8,
+            per_pass: cfg.lossless_tiles_per_pass,
+        })
+    }
+
+    /// Fold one captured frame's change report into the grid, then put whatever
+    /// that retracted on the wire.
+    ///
+    /// `frame` is borrowed rather than pre-digested because the dirty and move
+    /// rects die with it: this must run while the frame is still in hand, and
+    /// before the encoder has seen it. The call site's comment is the
+    /// specification for both halves of that.
+    fn mark_frame(&mut self, frame: &GpuFrame, resumed: bool, ts: u32) {
+        // Geometry before content. Tile ids are `row * cols + col` on both
+        // sides, so an id minted against the old grid width aliases a live
+        // tile at the new one; the client must be re-armed before any strip
+        // for the new geometry can arrive.
+        //
+        // The reset request is consumed unconditionally (take-and-clear, the
+        // same idiom as `keyframe_req`) because a resize rebuilds the grid
+        // from scratch, which is a strict superset of what a reset does —
+        // leaving the flag set would only buy a redundant reset next frame.
+        let want_reset = self.shared.tiles_reset_req.swap(false, Ordering::Relaxed);
+        let rearm = match self.grid.resize(frame.width, frame.height, ts) {
+            Some(msg) => Some(msg),
+            None if want_reset => Some(self.grid.reset(ts)),
+            None => None,
+        };
+        if let Some(msg) = rearm {
+            self.win.note_control(&msg);
+            match send_tile_control(&self.tiles_tx, msg) {
+                // A `Reset` is the maximal revoke: it retracts every tile
+                // the client holds, so anything still waiting in
+                // `revoke_retry` has just been superseded by something
+                // strictly stronger.
+                Ok(()) => self.revoke_retry.clear(),
+                Err(_) => {
+                    // The grid now believes the client holds nothing while
+                    // the client still holds the previous generation's
+                    // tiles. Re-arm the request so the next frame retries;
+                    // until it lands the client's stale tiles are bounded by
+                    // their lease. `revoke_retry` is deliberately *not*
+                    // cleared here — nothing has been retracted yet.
+                    self.shared.tiles_reset_req.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        if resumed {
+            // Coming back from the secure desktop, the picture underneath a
+            // just-dismissed UAC dialog may be anything at all, and the
+            // duplication we resumed on has no memory of what the client was
+            // last shown. Do not believe the first change report — mark
+            // everything, exactly as `capture` does for the video path.
+            self.grid.mark_all_dirty(ts);
+        } else {
+            let dirty = translate_dirty(frame.dirty_rects.as_deref(), &mut self.dirty_scratch);
+            let moves = translate_moves(frame.move_rects.as_deref(), &mut self.move_scratch);
+            self.grid.mark_frame(dirty, moves, ts);
+        }
+
+        // Retract stale tiles *now*, not at the next refinement pass.
+        //
+        // [`Self::refine`] only runs on idle frames, so a revocation queued
+        // here would otherwise sit unsent for the entire duration of a
+        // scroll or a window drag, and the client would go on compositing
+        // pixels the host has already repainted — over live video, for as
+        // long as the motion lasts. That is precisely the failure the whole
+        // design works hardest to avoid, so this drain is unconditional.
+        //
+        // It is nearly free in steady state: once nothing is `Refined` or
+        // `Settling` the grid stops queueing revocations at all, so a long
+        // scroll costs one message on its first frame and nothing after.
+        drain_revocations(
+            &mut self.grid,
+            &self.tiles_tx,
+            &mut self.win,
+            &mut self.revoke_retry,
+            &self.shared.tiles_reset_req,
+            ts,
+        );
+    }
+
+    /// One lossless refinement pass: send pixel-exact strips for everything
+    /// that has settled, renew the leases about to run out, and retract
+    /// whatever re-verification found stale.
+    ///
+    /// The pass structure is the one specified in [`crate::tiles`]'s module doc
+    /// and deviating from it is not safe: every plan handed out by
+    /// `plan_strips` claims its tiles, so every plan must be resolved by
+    /// `commit_sent` or `abandon` before this function returns, or the next
+    /// pass revokes them.
+    ///
+    /// **Where this is called from is part of its contract.** It reads pixels
+    /// back out of the capture's own texture, which the next
+    /// [`CaptureStage::acquire`] overwrites in place, so it must run after the
+    /// encode of the frame it is describing and before the next acquire. See
+    /// the call site, and see `acquire` for the flag that makes the skipped
+    /// readback below safe.
+    fn refine(&mut self, cap: &mut CaptureStage, now_ms: u32) {
+        // Bytes of tile payload the network layer's measured spare bandwidth
+        // affords this pass. `0` means send nothing. Taken from the *live*
+        // frame rate rather than the configured one, so lowering fps does not
+        // silently multiply tile traffic per pass.
+        let pass_bytes = tile_pass_bytes(
+            self.shared.tile_budget_kbps.load(Ordering::Relaxed),
+            self.shared.fps_now.load(Ordering::Relaxed),
+        );
+        let (capture, cpu_bgra, bgra_is_current) = cap.tile_inputs();
+
+        // ONE whole-frame readback, never a map per tile.
+        //
+        // This looks wasteful and is not. Each `Map` on a staging texture is a
+        // CPU/GPU synchronisation point, so the per-map cost dominates completely:
+        // a single 1080p BGRA transfer runs ~2-4 ms, while the ~120 sub-rect maps
+        // a tile-at-a-time extraction would need run ~12-24 ms — and would not fit
+        // in the frame budget's idle slack at all. There is deliberately no
+        // per-tile `CopySubresourceRegion` path.
+        //
+        // Skipped outright when the CPU convert fallback already staged this very
+        // frame into this very buffer.
+        if !bgra_is_current {
+            if let Err(e) = capture.readback_bgra(cpu_bgra) {
+                tracing::debug!("tile readback failed; skipping this refinement pass: {e}");
+                return;
+            }
+        }
+
+        // `readback_bgra` produces a tightly-packed buffer at the capture's own
+        // dimensions, which is what the grid was sized from.
+        let (width, height) = self.grid.dimensions();
+        let stride = width as usize * 4;
+        let want = stride.saturating_mul(height as usize);
+        if want == 0 || cpu_bgra.len() < want {
+            // Checked once here rather than discovered per strip: a short buffer
+            // makes every hash and every compress fail individually, which would
+            // burn the whole pass planning and abandoning work that cannot succeed.
+            tracing::debug!(
+                got = cpu_bgra.len(),
+                want,
+                "tile readback does not match the grid; skipping the pass"
+            );
+            return;
+        }
+        let bgra: &[u8] = &cpu_bgra[..];
+        let lease_ms = self.lease_ms;
+        let level = self.level;
+        let capacity = self.tiles_tx.capacity().unwrap_or(usize::MAX);
+
+        // -- strips ------------------------------------------------------------
+        // Two independent limits, and both must hold: the queue must keep room for
+        // a revocation, and the link must have the bandwidth to spare. A zero
+        // bandwidth budget plans nothing but still runs the pass below, because
+        // `plan_strips` calls `begin_pass` and that is what expires leases and
+        // sweeps unresolved tiles — freezing the state machine under congestion is
+        // exactly when stale pixels would linger.
+        self.bucket = self
+            .bucket
+            .saturating_add(pass_bytes)
+            .min(tile_bucket_cap(pass_bytes));
+        let allowance = self.bucket;
+        let budget = if allowance == 0 {
+            0
+        } else {
+            strip_budget(
+                self.per_pass,
+                self.tiles_tx.len(),
+                capacity,
+                TILE_QUEUE_REVOKE_RESERVE,
+            )
+        };
+        let mut spent_bytes = 0usize;
+        // Called even when the budget is zero. `plan_strips` runs `begin_pass`
+        // first, and that is what expires leases and sweeps tiles whose fate was
+        // never reported — skipping it under backpressure would freeze the state
+        // machine exactly when it most needs to move.
+        let plans = self.grid.plan_strips(now_ms, self.settle_ms, budget);
+        let mut stalled = false;
+        for plan in &plans {
+            if stalled {
+                // The queue filled mid-pass. Everything still claimed has to be
+                // released explicitly: a plan left `Settling` is revoked at the
+                // start of the next pass, which spends a revocation retracting a
+                // tile the client was never sent.
+                self.grid.abandon(plan);
+                continue;
+            }
+            let Some(hashes) = hash_plan_tiles(bgra, stride, plan) else {
+                // Cannot hash means cannot suppress the next re-send safely, so do
+                // not send at all — the tile stays on H.264 and is retried.
+                self.grid.abandon(plan);
+                continue;
+            };
+            let (codec, data) =
+                match compress_strip(bgra, stride, plan.x, plan.y, plan.w, plan.h, level) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("tile strip compress failed: {e}");
+                        self.grid.abandon(plan);
+                        continue;
+                    }
+                };
+            let wire = data.len() as u64;
+            // Spend the bandwidth budget here, BEFORE queueing — the only point at
+            // which a strip can still be declined safely. Past `try_send` the grid
+            // records it as delivered, so anything downstream that discarded it
+            // would leave that square soft until the client reconnects.
+            if spent_bytes.saturating_add(data.len()) > allowance {
+                self.grid.abandon(plan);
+                self.win.budget_held += 1;
+                stalled = true;
+                continue;
+            }
+            let msg = TileMsg::Strip {
+                x: plan.x,
+                y: plan.y,
+                w: plan.w,
+                h: plan.h,
+                codec,
+                valid_from_ms: now_ms,
+                lease_ms,
+                data,
+            };
+            // `commit_sent` happens ONLY after the message is actually queued.
+            // Recording a strip as delivered when it never left this thread is how
+            // a tile goes permanently soft: the recorded hash then makes
+            // `strip_matches_sent` suppress the very re-send the client needs.
+            if self.tiles_tx.try_send(msg).is_ok() {
+                self.grid.commit_sent(plan, &hashes, now_ms, lease_ms);
+                spent_bytes = spent_bytes.saturating_add(wire as usize);
+                self.bucket = self.bucket.saturating_sub(wire as usize);
+                self.win.strips += 1;
+                self.win.wire_bytes += wire;
+                self.win.raw_bytes += u64::from(plan.w) * u64::from(plan.h) * 3;
+            } else {
+                self.grid.abandon(plan);
+                self.win.backpressured += 1;
+                stalled = true;
+            }
+        }
+
+        // -- renewals ----------------------------------------------------------
+        //
+        // Re-hash before extending a lease. A blind renew would extend the life of
+        // pixels nobody re-checked, so one dirty rect the driver failed to report
+        // would become permanently wrong pixels — the exact outcome leases exist to
+        // bound. The budget is recomputed because the strips above just consumed
+        // queue slots, and a `Renew` occupies a slot like anything else.
+        let budget = strip_budget(
+            self.per_pass,
+            self.tiles_tx.len(),
+            capacity,
+            TILE_QUEUE_REVOKE_RESERVE,
+        );
+        for plan in self
+            .grid
+            .plan_reverify(now_ms, renew_lead_ms(lease_ms), budget)
+        {
+            let Some(hashes) = hash_plan_tiles(bgra, stride, &plan) else {
+                self.grid.mark_tiles_dirty(plan.ids(), now_ms);
+                continue;
+            };
+            if !self.grid.strip_matches_sent(&plan, &hashes) {
+                // The pixels moved without the driver saying so. Back to `Moving`,
+                // and `touch` queues the revoke the drain below sends. These tiles
+                // were stamped at `now_ms`, so they cannot have been in this pass's
+                // strips — there is no strip-then-revoke of the same tile here.
+                self.grid.mark_tiles_dirty(plan.ids(), now_ms);
+                continue;
+            }
+            let valid_through_ms = now_ms.wrapping_add(lease_ms);
+            let renew = TileMsg::Renew {
+                ids: plan.ids().to_vec(),
+                valid_through_ms,
+            };
+            if self.tiles_tx.try_send(renew).is_err() {
+                // Not renewed and nothing to retract: an unrenewed lease simply
+                // runs out, the client drops the tile itself, and `begin_pass` puts
+                // it back in `Moving` for a fresh send. Stop — the queue is full.
+                break;
+            }
+            self.grid.commit_renewed(plan.ids(), valid_through_ms);
+            self.win.renewed += plan.tiles();
+        }
+
+        // -- revocations -------------------------------------------------------
+        //
+        // Last, and never dropped. Catches what the renewal sweep just marked, plus
+        // (belt and braces) anything `begin_pass` swept up because a previous pass
+        // failed to resolve a plan. Anything the queue still refuses is held in
+        // `revoke_retry` and goes out at the top of the next frame.
+        drain_revocations(
+            &mut self.grid,
+            &self.tiles_tx,
+            &mut self.win,
+            &mut self.revoke_retry,
+            &self.shared.tiles_reset_req,
+            now_ms,
+        );
+    }
+
+    /// Publish a window of refinement activity and open the next one, once
+    /// [`TILE_REPORT_EVERY`] has elapsed. Runs on every frame the feature is
+    /// on, not only the idle ones a pass runs on, so a screen in constant
+    /// motion still reports the revocations it is generating.
+    fn maybe_log(&mut self) {
+        if self.win_start.elapsed() >= TILE_REPORT_EVERY {
+            log_tile_window(&self.win, self.grid.stats());
+            self.win = TileWindow::default();
+            self.win_start = Instant::now();
+        }
+    }
+}
+
 /// Every channel endpoint the media thread holds.
 ///
 /// Bundled so [`media_thread`]'s signature describes what the thread *is* — a
@@ -760,7 +1712,7 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
     };
 
     let built = build_pipeline(&cfg);
-    let (mut capture, mut converter, mut encoder, desc) = match built {
+    let (capture, converter, encoder, desc) = match built {
         Ok(v) => v,
         Err(e) => {
             shared.set_state(SessionState::Failed(e.to_string()));
@@ -780,35 +1732,13 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
         return;
     }
 
-    let mut cur_fps = cfg.target_fps.max(1);
-    let mut cur_bitrate = cfg.bitrate_kbps.max(1);
-    let mut frame_budget = frame_budget(cur_fps);
-    shared.fps_now.store(cur_fps, Ordering::Relaxed);
-    let mut cpu_bgra: Vec<u8> = Vec::new();
-    let mut cpu_nv12: Vec<u8> = Vec::new();
-    let mut gpu_convert_ok = converter.is_some();
-    let gpu_texture_input = desc.gpu_encode_input;
+    let mut enc = EncoderCtl::new(encoder, &cfg, desc.gpu_encode_input);
+    shared.fps_now.store(enc.fps(), Ordering::Relaxed);
+    let mut cap = CaptureStage::new(capture, converter);
 
     let mut stats = StatsWindow::new();
+    let mut settle = SettleWatch::new(&cfg);
     let mut paused_since: Option<Instant> = None;
-    // When the desktop last started being unchanged, and whether this idle
-    // period has already had its one settle keyframe.
-    let mut static_since: Option<Instant> = None;
-    let mut settle_sent = false;
-    let settle_delay = Duration::from_millis(cfg.static_settle_ms as u64);
-    // Quality the next refinement frame is encoded at; 0 = feature off. Clamped
-    // here so a `SessionConfig` built by hand (selftest, tests, an out-of-range
-    // host.json that skipped `sanitized`) cannot ask for something silly.
-    let mut refine_quality = match cfg.static_refine_quality {
-        0 => 0,
-        q => q.clamp(MIN_STATIC_REFINE_QUALITY, MAX_STATIC_REFINE_QUALITY),
-    };
-    // The encoder is currently parked in constant-quality mode. Exactly one
-    // loop iteration long, by construction — see the restore at the top.
-    let mut refine_armed = false;
-    // A refinement frame has been submitted and we have not yet seen the
-    // keyframe it produced, whose size we want to log and police.
-    let mut refine_pending = false;
 
     // --- lossless tile refinement state ------------------------------------
     //
@@ -817,112 +1747,29 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
     // `lossless_tiles_enabled == false` allocates no grid, never reads pixels
     // back for tiles, never compresses anything and never touches `tiles_tx`.
     // The cost on the media thread is one null check per frame.
-    //
-    // The grid is armed on the capture clock, but no frame has been captured
-    // yet, so it is stamped at 0 and immediately re-armed for real: `Shared`
-    // starts `tiles_reset_req` set, so the first frame through the loop issues
-    // a `Reset` at that frame's own timestamp.
-    let mut grid = cfg
-        .lossless_tiles_enabled
-        .then(|| TileGrid::new(desc.width, desc.height, 0));
-    // Reusable translation buffers for DXGI's per-frame change report. Held
-    // out here so a busy desktop does not allocate two vectors per frame on
-    // the thread that must not miss a capture deadline.
-    let mut dirty_scratch: Vec<DirtyRect> = Vec::new();
-    let mut move_scratch: Vec<MoveRect> = Vec::new();
-    let mut tile_win = TileWindow::default();
-    let mut tile_win_start = Instant::now();
-    // Tile ids whose `Revoke` the queue refused. See [`drain_revocations`]: the
-    // grid cannot hold them for us, so this is the only place they survive
-    // between passes.
-    let mut revoke_retry: Vec<u32> = Vec::new();
-    // Carried-over tile allowance; see `tile_bucket_cap`.
-    let mut tile_bucket: usize = 0;
+    let mut tiles = TileStage::new(
+        &cfg,
+        shared.clone(),
+        &chans.tiles_tx,
+        desc.width,
+        desc.height,
+    );
 
     while !shared.stop.load(Ordering::Relaxed) {
+        // FIRST statement of the loop body, unconditional, before any `continue`
+        // or `break` can be reached. Read [`EncoderCtl::begin_frame`] before
+        // moving, guarding or deferring this line.
+        enc.begin_frame();
+
         let tick = Instant::now();
 
-        // --- refinement restore (structural) ---------------------------------
-        //
-        // First statement of the loop body, before any `continue`, any error
-        // path and any early `break` can be reached, and unconditional. That is
-        // the whole guarantee: whatever happened on the iteration that armed it
-        // — the capture failed, the encode errored, the frame was dropped for
-        // want of an input credit, the encoder produced nothing — constant
-        // quality lasted that one iteration and no more.
-        //
-        // Getting this wrong is not a cosmetic bug. Left armed, the encoder
-        // ignores every mean/peak write, so the adaptor loses its only lever on
-        // a residential uplink at ~258 ms RTT and cannot back off from
-        // congestion. `MfH264Encoder::set_bitrate` forces the same restore as a
-        // second line of defence.
-        if refine_armed {
-            refine_armed = false;
-            encoder.end_static_refinement();
-        }
+        enc.apply_requests(&shared, &cfg, cap.capture());
 
-        let bitrate = shared.bitrate_req.swap(0, Ordering::Relaxed);
-        if bitrate > 0 {
-            let _ = encoder.set_bitrate(bitrate);
-            // Remembered so an encoder rebuilt for a frame-rate change starts at
-            // the rate in force, not the one the config booted with.
-            cur_bitrate = bitrate;
-        }
-
-        // Live frame-rate change. MF pins the frame rate in the negotiated
-        // media type, so the only way to move it is a new encoder — but only
-        // the encoder: capture, the D3D device and the SessionDescription are
-        // unchanged, which is why this never touches build_pipeline.
-        //
-        // Build-then-swap: `encoder` keeps the working MFT until the new one is
-        // fully constructed, so a vendor MFT that refuses to activate at the
-        // requested rate costs a log line and nothing else.
-        let want_fps = shared.fps_req.swap(0, Ordering::Relaxed);
-        if want_fps > 0 && want_fps != cur_fps {
-            match rebuild_encoder(&cfg, &capture, want_fps, cur_bitrate) {
-                Ok(mut new_encoder) => {
-                    // The requirement is one-directional. When the live pipeline
-                    // hands the encoder D3D textures, a replacement that cannot
-                    // take them would be fed the wrong input kind, so refuse. The
-                    // reverse is harmless: an encoder that *could* take textures
-                    // is perfectly happy being fed CPU NV12, which is what a
-                    // pipeline without a GPU converter does. Demanding equality
-                    // here would make the whole fps control inert on those hosts.
-                    if gpu_texture_input && !new_encoder.accepts_textures() {
-                        tracing::warn!(
-                            "refusing {cur_fps} -> {want_fps} fps: the live pipeline submits GPU \
-                             textures and the rebuilt encoder only accepts CPU NV12"
-                        );
-                    } else {
-                        // Carry numbering forward so the rebuild is invisible to
-                        // the receiver's reassembler instead of costing it a
-                        // resync_after adoption window plus a forced keyframe.
-                        new_encoder.resume_numbering_from(&encoder);
-                        encoder = new_encoder;
-                        cur_fps = want_fps;
-                        frame_budget = self::frame_budget(cur_fps);
-                        shared.fps_now.store(cur_fps, Ordering::Relaxed);
-                        // A brand-new encoder has no reference chain the client
-                        // can use; give it a fresh IDR immediately.
-                        shared.keyframe_req.store(true, Ordering::Relaxed);
-                        tracing::info!("encoder rebuilt at {cur_fps} fps");
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    "could not rebuild the encoder at {want_fps} fps ({e}); staying at {cur_fps}"
-                ),
-            }
-        }
-
-        if shared.keyframe_req.swap(false, Ordering::Relaxed) {
-            encoder.request_keyframe();
-        }
-
-        let acquired = capture.acquire(8);
+        let acquired = cap.acquire(8);
         let frame = match acquired {
             Ok(Some(f)) => f,
             Ok(None) => {
-                if let Some(reason) = pause_reason(capture.state()) {
+                if let Some(reason) = pause_reason(cap.state()) {
                     enter_pause(&shared, &chans.ctl_tx, &mut paused_since, reason);
                 } else if paused_since.is_some() {
                     paused_since = None;
@@ -940,13 +1787,13 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
                 continue;
             }
             Err(e) => {
-                // `capture.state()` — not `e`'s text — is authoritative here:
+                // `cap.state()` — not `e`'s text — is authoritative here:
                 // `acquire`/`recreate_duplication` always set `self.state`
                 // before returning an error, so `pause_reason` sees the same
                 // typed state the `Ok(None)` arm above does. See
                 // `pause_reason`'s doc comment for why the error message
                 // itself must not be parsed for this.
-                if let Some(reason) = pause_reason(capture.state()) {
+                if let Some(reason) = pause_reason(cap.state()) {
                     enter_pause(&shared, &chans.ctl_tx, &mut paused_since, reason);
                     std::thread::sleep(Duration::from_millis(100));
                 } else {
@@ -963,7 +1810,7 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
         if resumed {
             shared.set_state(SessionState::Running);
             // The desktop we return to may differ wildly; force a fresh IDR.
-            encoder.request_keyframe();
+            enc.request_keyframe();
             // Open a fresh statistics window before this frame is counted into
             // it. The pause was almost certainly served by the `Err` arm above
             // (the secure desktop makes `acquire` fail, it does not make it
@@ -990,178 +1837,42 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
         //
         // It also has to be here for a second reason: the dirty rects die with
         // `frame`, which is dropped below.
-        if let Some(g) = grid.as_mut() {
-            // Geometry before content. Tile ids are `row * cols + col` on both
-            // sides, so an id minted against the old grid width aliases a live
-            // tile at the new one; the client must be re-armed before any strip
-            // for the new geometry can arrive.
-            //
-            // The reset request is consumed unconditionally (take-and-clear, the
-            // same idiom as `keyframe_req`) because a resize rebuilds the grid
-            // from scratch, which is a strict superset of what a reset does —
-            // leaving the flag set would only buy a redundant reset next frame.
-            let want_reset = shared.tiles_reset_req.swap(false, Ordering::Relaxed);
-            let rearm = match g.resize(frame.width, frame.height, ts) {
-                Some(msg) => Some(msg),
-                None if want_reset => Some(g.reset(ts)),
-                None => None,
-            };
-            if let Some(msg) = rearm {
-                tile_win.note_control(&msg);
-                match send_tile_control(&chans.tiles_tx, msg) {
-                    // A `Reset` is the maximal revoke: it retracts every tile
-                    // the client holds, so anything still waiting in
-                    // `revoke_retry` has just been superseded by something
-                    // strictly stronger.
-                    Ok(()) => revoke_retry.clear(),
-                    Err(_) => {
-                        // The grid now believes the client holds nothing while
-                        // the client still holds the previous generation's
-                        // tiles. Re-arm the request so the next frame retries;
-                        // until it lands the client's stale tiles are bounded by
-                        // their lease. `revoke_retry` is deliberately *not*
-                        // cleared here — nothing has been retracted yet.
-                        shared.tiles_reset_req.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
-
-            if resumed {
-                // Coming back from the secure desktop, the picture underneath a
-                // just-dismissed UAC dialog may be anything at all, and the
-                // duplication we resumed on has no memory of what the client was
-                // last shown. Do not believe the first change report — mark
-                // everything, exactly as `capture` does for the video path.
-                g.mark_all_dirty(ts);
-            } else {
-                let dirty = translate_dirty(frame.dirty_rects.as_deref(), &mut dirty_scratch);
-                let moves = translate_moves(frame.move_rects.as_deref(), &mut move_scratch);
-                g.mark_frame(dirty, moves, ts);
-            }
-
-            // Retract stale tiles *now*, not at the next refinement pass.
-            //
-            // The pass below only runs on idle frames, so a revocation queued
-            // here would otherwise sit unsent for the entire duration of a
-            // scroll or a window drag, and the client would go on compositing
-            // pixels the host has already repainted — over live video, for as
-            // long as the motion lasts. That is precisely the failure the whole
-            // design works hardest to avoid, so this drain is unconditional.
-            //
-            // It is nearly free in steady state: once nothing is `Refined` or
-            // `Settling` the grid stops queueing revocations at all, so a long
-            // scroll costs one message on its first frame and nothing after.
-            drain_revocations(
-                g,
-                &chans.tiles_tx,
-                &mut tile_win,
-                &mut revoke_retry,
-                &shared.tiles_reset_req,
-                ts,
-            );
+        if let Some(tiles) = tiles.as_mut() {
+            tiles.mark_frame(&frame, resumed, ts);
         }
 
         // --- static-scene settle ---------------------------------------------
         //
-        // A repeated frame is coded as an all-skip P-frame, which reproduces the
-        // previous picture exactly. That is bandwidth-perfect and quality-frozen:
-        // whatever the *one* frame that drew the current screen achieved is what
-        // the user stares at forever. If that frame landed right after a scroll,
-        // with rate control still paying off the burst, the text stays soft and
-        // nothing in the pipeline will ever refine it.
-        //
-        // So once the screen has genuinely settled, send exactly ONE keyframe,
-        // then latch until the desktop actually changes again.
-        //
-        // The older note here warned that forcing an IDR on *every* keepalive
-        // pulsed visibly on coloured backgrounds. That was real, and it was a
-        // property of periodic re-encoding under CBR: each IDR re-quantized the
-        // whole image to a different fixed bit budget, so the image breathed. Two
-        // things remove it. One IDR per idle period cannot be periodic — there is
-        // no second one to differ from — and under peak-constrained VBR with a QP
-        // ceiling (see mf_encoder) the settle frame is encoded at better quality
-        // than the frame it replaces, not merely differently. A single step up in
-        // sharpness is what we want the user to see.
-        if repeated {
-            let since = *static_since.get_or_insert(tick);
-            if should_settle(since.elapsed(), settle_delay, settle_sent) {
-                settle_sent = true;
-                encoder.request_keyframe();
-                // ...and, if refinement is on, buy that one keyframe at a fixed
-                // *quality* instead of at the streaming bitrate. Without this
-                // the settle IDR is still quantized to fit the mean, which on a
-                // detailed 1080p screen leaves it about as soft as the picture
-                // it replaced — the actual gap against an MJPEG KVM.
-                //
-                // Deliberately reusing the existing `settle_sent` latch as the
-                // one-per-idle-period mechanism rather than adding a second: a
-                // refinement that repeated would be periodic re-quantization,
-                // which is the visible "breathing" this design already rejects.
-                if refine_quality > 0 {
-                    let s = encoder.begin_static_refinement(refine_quality);
-                    refine_armed = true;
-                    refine_pending = true;
-                    tracing::debug!(
-                        quality = s.quality,
-                        min_qp = s.min_qp,
-                        max_qp = s.max_qp,
-                        "static refinement armed"
-                    );
-                }
-                tracing::debug!(
-                    "desktop static for {} ms; sending one settle keyframe",
-                    since.elapsed().as_millis()
-                );
-            }
-        } else {
-            static_since = None;
-            settle_sent = false;
+        // One keyframe per idle period, and no more. See [`SettleWatch`] for why
+        // a still desktop is otherwise frozen at whatever quality the single
+        // frame that drew it happened to achieve.
+        if settle.observe(repeated, tick) {
+            enc.request_keyframe();
+            // ...and, if refinement is on, buy that one keyframe at a fixed
+            // *quality* instead of at the streaming bitrate. Without this
+            // the settle IDR is still quantized to fit the mean, which on a
+            // detailed 1080p screen leaves it about as soft as the picture
+            // it replaced — the actual gap against an MJPEG KVM.
+            //
+            // Deliberately reusing the existing settle latch as the
+            // one-per-idle-period mechanism rather than adding a second: a
+            // refinement that repeated would be periodic re-quantization,
+            // which is the visible "breathing" this design already rejects.
+            enc.arm_refinement();
+            tracing::debug!(
+                "desktop static for {} ms; sending one settle keyframe",
+                settle.static_for().as_millis()
+            );
         }
 
         // --- convert + encode -------------------------------------------------
         //
-        // Set when the CPU fallback below stages this very frame into
-        // `cpu_bgra`, so the refinement pass can reuse those bytes instead of
-        // paying for a second whole-frame readback of pixels it already has.
-        let mut bgra_is_current = false;
-        let encoded = 'encode: {
-            if gpu_convert_ok {
-                if let Some(conv) = converter.as_mut() {
-                    match conv.convert(&frame.texture) {
-                        Ok(nv12_tex) => {
-                            if gpu_texture_input {
-                                break 'encode encoder.submit(FrameInput::Texture(&nv12_tex), ts);
-                            }
-                            match conv.readback_nv12(&nv12_tex, &mut cpu_nv12) {
-                                Ok(()) => {
-                                    break 'encode encoder.submit(FrameInput::Nv12(&cpu_nv12), ts)
-                                }
-                                Err(e) => {
-                                    tracing::warn!("NV12 readback failed, dropping to CPU: {e}");
-                                    gpu_convert_ok = false;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("GPU convert failed, dropping to CPU path: {e}");
-                            gpu_convert_ok = false;
-                        }
-                    }
-                }
-            }
-            // CPU fallback: readback BGRA, convert, feed CPU NV12.
-            if let Err(e) = capture.readback_bgra(&mut cpu_bgra) {
-                break 'encode Err(e);
-            }
-            bgra_is_current = true;
-            let stride = frame.width as usize * 4;
-            if let Err(e) =
-                bgra_to_nv12(&cpu_bgra, stride, frame.width, frame.height, &mut cpu_nv12)
-            {
-                break 'encode Err(e);
-            }
-            encoder.submit(FrameInput::Nv12(&cpu_nv12), ts)
-        };
+        // `&mut cap` and `&frame` coexist here because `GpuFrame` is owned — it
+        // holds its own reference to the texture and borrows nothing from
+        // `DdaCapture`. The stage's `bgra_is_current` bookkeeping happens
+        // inside; see [`CaptureStage::acquire`] for what clears it and why the
+        // reset lives there and nowhere else.
+        let encoded = enc.submit(&mut cap, &frame, ts);
 
         drop(frame);
 
@@ -1195,41 +1906,10 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
                 .fetch_add(ef.data.len() as u64, Ordering::Relaxed);
             if ef.keyframe {
                 shared.counters.keyframes.fetch_add(1, Ordering::Relaxed);
-                // The refinement's whole effect is "this frame is bigger and
-                // sharper". Log the size at INFO so host.log alone answers
-                // whether it worked — a refinement that comes out the same size
-                // as an ordinary IDR means the MFT ignored the mode (the
-                // software encoder does), and one that comes out huge is about
-                // to be policed below.
-                if refine_pending {
-                    refine_pending = false;
-                    let bytes = ef.data.len();
-                    tracing::info!(
-                        bytes,
-                        quality = refine_quality,
-                        ceiling = STATIC_REFINE_MAX_BYTES,
-                        "static refinement keyframe emitted"
-                    );
-                    let next = adapt_refine_quality(refine_quality, bytes, STATIC_REFINE_MAX_BYTES);
-                    if next != refine_quality {
-                        if next == 0 {
-                            tracing::warn!(
-                                bytes,
-                                "refinement frames stay oversized at the lowest quality; \
-                                 disabling static refinement for this session"
-                            );
-                        } else {
-                            tracing::warn!(
-                                bytes,
-                                from = refine_quality,
-                                to = next,
-                                "refinement frame exceeded its size ceiling; lowering quality"
-                            );
-                        }
-                        refine_quality = next;
-                    }
-                }
             }
+            // Logs and polices the refinement keyframe. Self-gated on
+            // `ef.keyframe` — see [`EncoderCtl::note_output`].
+            enc.note_output(&ef);
             if let Err(full) = chans.frames_tx.try_send(ef) {
                 // Queue full: evict the oldest so the consumer always gets the
                 // freshest picture, then re-send. Without the retry the *newest*
@@ -1238,7 +1918,7 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
                 shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
                 let _ = chans.frames_tx.try_send(full.into_inner());
             }
-            ready = encoder.poll_output();
+            ready = enc.poll_output();
         }
         stats.note_pipeline(elapsed, emitted);
 
@@ -1264,36 +1944,17 @@ fn media_thread(cfg: SessionConfig, shared: Arc<Shared>, chans: MediaChannels) {
         // exchange the pass can never compete with a frame that has real work
         // to do. Note that this gate covers only the *expensive* half —
         // revocations are drained unconditionally at the top of the loop.
-        if let Some(g) = grid.as_mut() {
+        if let Some(tiles) = tiles.as_mut() {
             if repeated {
-                tile_refine_pass(
-                    g,
-                    &mut capture,
-                    &mut cpu_bgra,
-                    bgra_is_current,
-                    &chans.tiles_tx,
-                    &cfg,
-                    ts,
-                    tile_pass_bytes(
-                        shared.tile_budget_kbps.load(Ordering::Relaxed),
-                        shared.fps_now.load(Ordering::Relaxed),
-                    ),
-                    &mut tile_bucket,
-                    &mut tile_win,
-                    &mut revoke_retry,
-                    &shared.tiles_reset_req,
-                );
+                tiles.refine(&mut cap, ts);
             }
-            if tile_win_start.elapsed() >= TILE_REPORT_EVERY {
-                log_tile_window(&tile_win, g.stats());
-                tile_win = TileWindow::default();
-                tile_win_start = Instant::now();
-            }
+            tiles.maybe_log();
         }
 
         let spent = tick.elapsed();
-        if spent < frame_budget {
-            std::thread::sleep(frame_budget - spent);
+        let budget = enc.frame_budget();
+        if spent < budget {
+            std::thread::sleep(budget - spent);
         }
     }
 
@@ -1626,215 +2287,6 @@ fn log_tile_window(win: &TileWindow, stats: GridStats) {
             "lossless tiles holding"
         );
     }
-}
-
-/// One lossless refinement pass: send pixel-exact strips for everything that
-/// has settled, renew the leases about to run out, and retract whatever
-/// re-verification found stale.
-///
-/// The pass structure is the one specified in [`crate::tiles`]'s module doc and
-/// deviating from it is not safe: every plan handed out by `plan_strips` claims
-/// its tiles, so every plan must be resolved by `commit_sent` or `abandon`
-/// before this function returns, or the next pass revokes them.
-#[allow(clippy::too_many_arguments)]
-fn tile_refine_pass(
-    grid: &mut TileGrid,
-    capture: &mut DdaCapture,
-    cpu_bgra: &mut Vec<u8>,
-    bgra_is_current: bool,
-    tiles_tx: &Sender<TileMsg>,
-    cfg: &SessionConfig,
-    now_ms: u32,
-    // Bytes of tile payload the network layer's measured spare bandwidth
-    // affords this pass. `0` means send nothing.
-    pass_bytes: usize,
-    // Carried-over allowance, so a per-pass share smaller than one strip still
-    // adds up to something sendable. See `tile_bucket_cap`.
-    bucket: &mut usize,
-    win: &mut TileWindow,
-    // Revocations a previous pass could not queue, carried by the media thread
-    // across frames. See [`drain_revocations`].
-    revoke_retry: &mut Vec<u32>,
-    reset_req: &AtomicBool,
-) {
-    // ONE whole-frame readback, never a map per tile.
-    //
-    // This looks wasteful and is not. Each `Map` on a staging texture is a
-    // CPU/GPU synchronisation point, so the per-map cost dominates completely:
-    // a single 1080p BGRA transfer runs ~2-4 ms, while the ~120 sub-rect maps
-    // a tile-at-a-time extraction would need run ~12-24 ms — and would not fit
-    // in the frame budget's idle slack at all. There is deliberately no
-    // per-tile `CopySubresourceRegion` path.
-    //
-    // Skipped outright when the CPU convert fallback already staged this very
-    // frame into this very buffer.
-    if !bgra_is_current {
-        if let Err(e) = capture.readback_bgra(cpu_bgra) {
-            tracing::debug!("tile readback failed; skipping this refinement pass: {e}");
-            return;
-        }
-    }
-
-    // `readback_bgra` produces a tightly-packed buffer at the capture's own
-    // dimensions, which is what the grid was sized from.
-    let (width, height) = grid.dimensions();
-    let stride = width as usize * 4;
-    let want = stride.saturating_mul(height as usize);
-    if want == 0 || cpu_bgra.len() < want {
-        // Checked once here rather than discovered per strip: a short buffer
-        // makes every hash and every compress fail individually, which would
-        // burn the whole pass planning and abandoning work that cannot succeed.
-        tracing::debug!(
-            got = cpu_bgra.len(),
-            want,
-            "tile readback does not match the grid; skipping the pass"
-        );
-        return;
-    }
-    let bgra: &[u8] = &cpu_bgra[..];
-    let lease_ms = cfg.lossless_tile_lease_ms;
-    let level = cfg.lossless_tile_deflate_level.clamp(1, 9) as u8;
-    let capacity = tiles_tx.capacity().unwrap_or(usize::MAX);
-
-    // -- strips ------------------------------------------------------------
-    // Two independent limits, and both must hold: the queue must keep room for
-    // a revocation, and the link must have the bandwidth to spare. A zero
-    // bandwidth budget plans nothing but still runs the pass below, because
-    // `plan_strips` calls `begin_pass` and that is what expires leases and
-    // sweeps unresolved tiles — freezing the state machine under congestion is
-    // exactly when stale pixels would linger.
-    *bucket = bucket
-        .saturating_add(pass_bytes)
-        .min(tile_bucket_cap(pass_bytes));
-    let allowance = *bucket;
-    let budget = if allowance == 0 {
-        0
-    } else {
-        strip_budget(
-            cfg.lossless_tiles_per_pass,
-            tiles_tx.len(),
-            capacity,
-            TILE_QUEUE_REVOKE_RESERVE,
-        )
-    };
-    let mut spent_bytes = 0usize;
-    // Called even when the budget is zero. `plan_strips` runs `begin_pass`
-    // first, and that is what expires leases and sweeps tiles whose fate was
-    // never reported — skipping it under backpressure would freeze the state
-    // machine exactly when it most needs to move.
-    let plans = grid.plan_strips(now_ms, cfg.lossless_tile_settle_ms, budget);
-    let mut stalled = false;
-    for plan in &plans {
-        if stalled {
-            // The queue filled mid-pass. Everything still claimed has to be
-            // released explicitly: a plan left `Settling` is revoked at the
-            // start of the next pass, which spends a revocation retracting a
-            // tile the client was never sent.
-            grid.abandon(plan);
-            continue;
-        }
-        let Some(hashes) = hash_plan_tiles(bgra, stride, plan) else {
-            // Cannot hash means cannot suppress the next re-send safely, so do
-            // not send at all — the tile stays on H.264 and is retried.
-            grid.abandon(plan);
-            continue;
-        };
-        let (codec, data) =
-            match compress_strip(bgra, stride, plan.x, plan.y, plan.w, plan.h, level) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::debug!("tile strip compress failed: {e}");
-                    grid.abandon(plan);
-                    continue;
-                }
-            };
-        let wire = data.len() as u64;
-        // Spend the bandwidth budget here, BEFORE queueing — the only point at
-        // which a strip can still be declined safely. Past `try_send` the grid
-        // records it as delivered, so anything downstream that discarded it
-        // would leave that square soft until the client reconnects.
-        if spent_bytes.saturating_add(data.len()) > allowance {
-            grid.abandon(plan);
-            win.budget_held += 1;
-            stalled = true;
-            continue;
-        }
-        let msg = TileMsg::Strip {
-            x: plan.x,
-            y: plan.y,
-            w: plan.w,
-            h: plan.h,
-            codec,
-            valid_from_ms: now_ms,
-            lease_ms,
-            data,
-        };
-        // `commit_sent` happens ONLY after the message is actually queued.
-        // Recording a strip as delivered when it never left this thread is how
-        // a tile goes permanently soft: the recorded hash then makes
-        // `strip_matches_sent` suppress the very re-send the client needs.
-        if tiles_tx.try_send(msg).is_ok() {
-            grid.commit_sent(plan, &hashes, now_ms, lease_ms);
-            spent_bytes = spent_bytes.saturating_add(wire as usize);
-            *bucket = bucket.saturating_sub(wire as usize);
-            win.strips += 1;
-            win.wire_bytes += wire;
-            win.raw_bytes += u64::from(plan.w) * u64::from(plan.h) * 3;
-        } else {
-            grid.abandon(plan);
-            win.backpressured += 1;
-            stalled = true;
-        }
-    }
-
-    // -- renewals ----------------------------------------------------------
-    //
-    // Re-hash before extending a lease. A blind renew would extend the life of
-    // pixels nobody re-checked, so one dirty rect the driver failed to report
-    // would become permanently wrong pixels — the exact outcome leases exist to
-    // bound. The budget is recomputed because the strips above just consumed
-    // queue slots, and a `Renew` occupies a slot like anything else.
-    let budget = strip_budget(
-        cfg.lossless_tiles_per_pass,
-        tiles_tx.len(),
-        capacity,
-        TILE_QUEUE_REVOKE_RESERVE,
-    );
-    for plan in grid.plan_reverify(now_ms, renew_lead_ms(lease_ms), budget) {
-        let Some(hashes) = hash_plan_tiles(bgra, stride, &plan) else {
-            grid.mark_tiles_dirty(plan.ids(), now_ms);
-            continue;
-        };
-        if !grid.strip_matches_sent(&plan, &hashes) {
-            // The pixels moved without the driver saying so. Back to `Moving`,
-            // and `touch` queues the revoke the drain below sends. These tiles
-            // were stamped at `now_ms`, so they cannot have been in this pass's
-            // strips — there is no strip-then-revoke of the same tile here.
-            grid.mark_tiles_dirty(plan.ids(), now_ms);
-            continue;
-        }
-        let valid_through_ms = now_ms.wrapping_add(lease_ms);
-        let renew = TileMsg::Renew {
-            ids: plan.ids().to_vec(),
-            valid_through_ms,
-        };
-        if tiles_tx.try_send(renew).is_err() {
-            // Not renewed and nothing to retract: an unrenewed lease simply
-            // runs out, the client drops the tile itself, and `begin_pass` puts
-            // it back in `Moving` for a fresh send. Stop — the queue is full.
-            break;
-        }
-        grid.commit_renewed(plan.ids(), valid_through_ms);
-        win.renewed += plan.tiles();
-    }
-
-    // -- revocations -------------------------------------------------------
-    //
-    // Last, and never dropped. Catches what the renewal sweep just marked, plus
-    // (belt and braces) anything `begin_pass` swept up because a previous pass
-    // failed to resolve a plan. Anything the queue still refuses is held in
-    // `revoke_retry` and goes out at the top of the next frame.
-    drain_revocations(grid, tiles_tx, win, revoke_retry, reset_req, now_ms);
 }
 
 fn enter_pause(
