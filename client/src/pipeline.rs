@@ -110,6 +110,26 @@ impl KeyframeGate {
     }
 }
 
+/// Pump `rx` into `on_item` until it disconnects or `stop` is set.
+///
+/// The shape shared by every background thread in this file: a 100ms
+/// `recv_timeout` poll so the stop flag is noticed promptly without a busy
+/// loop, a `Timeout` is not itself a reason to stop, and a disconnected
+/// sender always is.
+fn recv_until_stopped<T>(rx: &Receiver<T>, stop: &AtomicBool, mut on_item: impl FnMut(T)) {
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(item) => on_item(item),
+            Err(RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 /// Owns the background threads and stops them on drop.
 pub struct Pipeline {
     stop: Arc<AtomicBool>,
@@ -170,22 +190,12 @@ impl Pipeline {
         let handle = std::thread::Builder::new()
             .name("directdesk-tiles".into())
             .spawn(move || {
-                loop {
-                    match tiles_rx.recv_timeout(Duration::from_millis(100)) {
-                        // `apply` validates geometry, decompresses, and refuses
-                        // anything it does not like. Nothing it can return is
-                        // fatal, so its outcome is a counter, not control flow.
-                        Ok(msg) => {
-                            store.apply(msg);
-                        }
-                        Err(RecvTimeoutError::Timeout) => {
-                            if stop.load(Ordering::Relaxed) {
-                                break;
-                            }
-                        }
-                        Err(RecvTimeoutError::Disconnected) => break,
-                    }
-                }
+                recv_until_stopped(&tiles_rx, &stop, |msg| {
+                    // `apply` validates geometry, decompresses, and refuses
+                    // anything it does not like. Nothing it can return is
+                    // fatal, so its outcome is a counter, not control flow.
+                    store.apply(msg);
+                });
                 tracing::info!("tile thread exiting");
             })
             .expect("spawn tile thread");
@@ -226,117 +236,165 @@ pub fn spawn_decode_thread(
     let handle = std::thread::Builder::new()
         .name("directdesk-decode".into())
         .spawn(move || {
-            let mut decoder: Option<Box<dyn Decoder>> = match crate::decoder::new_decoder() {
-                Ok(d) => {
-                    #[cfg(windows)]
-                    status.set_description(
-                        "MF H.264 (CLSID_MSH264DecoderMFT), NV12→RGBA8 BT.709 limited".to_string(),
-                    );
-                    #[cfg(not(windows))]
-                    status.set_description("H.264 decoder".to_string());
-                    Some(d)
-                }
-                Err(e) => {
-                    tracing::error!("decoder unavailable: {e}");
-                    status.set_description("unavailable".to_string());
-                    status.set_error(Some(e.to_string()));
-                    None
-                }
-            };
-
-            let mut gate = KeyframeGate::default();
-            // Hoisted so the per-frame cost of a snapshot is a memcpy of `Arc`
-            // pointers into an already-grown buffer, never an allocation.
-            let mut scratch: Vec<Arc<Tile>> = Vec::new();
-
-            loop {
-                match video_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(frame) => {
-                        let Some(decoder) = decoder.as_mut() else {
-                            continue;
-                        };
-
-                        let (admitted, request_keyframe_now) =
-                            gate.admit(frame.frame_id, frame.keyframe);
-                        if !admitted {
-                            status.record_frame_gated();
-                            tracing::debug!(
-                                frame_id = frame.frame_id,
-                                keyframe = frame.keyframe,
-                                "dropping delta frame after gap; awaiting IDR"
-                            );
-                            if request_keyframe_now {
-                                // Entering the wait: flush the stale reference
-                                // chain once and ask for a fresh IDR. Same
-                                // mechanism as the decode-error path below —
-                                // `try_send` never blocks this thread, and a
-                                // full control queue already has a keyframe
-                                // request pending.
-                                decoder.flush();
-                                if let Err(err) = control_tx.try_send(ControlMsg::RequestKeyframe) {
-                                    tracing::warn!("keyframe request dropped: {err}");
-                                }
-                            }
-                            continue;
-                        }
-
-                        match decoder.decode(&frame) {
-                            Ok(frames) => {
-                                let produced = frames.len();
-                                for mut raw in frames {
-                                    // The tile overlay is *persistent* state
-                                    // while a decoded frame is transient — the
-                                    // decoder hands back a fresh buffer every
-                                    // time — so the live tile set has to be
-                                    // re-blitted onto every frame, right here,
-                                    // before the frame is published. Doing it
-                                    // downstream (in the presenter) would mean
-                                    // repainting on every *repaint* instead of
-                                    // every frame, and would put a pixel loop
-                                    // on the UI thread.
-                                    composite_onto(
-                                        &mut raw,
-                                        &tiles,
-                                        &mut scratch,
-                                        tile_highlight.load(Ordering::Relaxed),
-                                    );
-                                    slot.publish(raw);
-                                }
-                                if produced > 0 {
-                                    repaint();
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(frame_id = frame.frame_id, "decode failed: {e}");
-                                status.set_error(Some(e.to_string()));
-                                // Corrupt state: only a fresh IDR can recover.
-                                // Flushing alone drops the bad reference chain
-                                // but leaves the decoder starved until the host
-                                // happens to send a keyframe — so ask for one.
-                                // `try_send` never blocks this thread; a full
-                                // control queue already has a keyframe request
-                                // pending, so dropping this one is harmless.
-                                decoder.flush();
-                                if let Err(err) = control_tx.try_send(ControlMsg::RequestKeyframe) {
-                                    tracing::warn!("keyframe request dropped: {err}");
-                                }
-                            }
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
+            let mut decode_loop =
+                DecodeLoop::new(status, tiles, tile_highlight, slot, control_tx, repaint);
+            recv_until_stopped(&video_rx, &stop, |frame| decode_loop.handle_frame(frame));
             tracing::info!("decode thread exiting");
         })
         .expect("spawn decode thread");
 
     pipeline.threads.push(handle);
     pipeline
+}
+
+/// Per-frame decode state, owned by the decode thread for its whole life.
+///
+/// Splitting this out of the thread closure turns what was the deepest
+/// nesting in the crate — closure -> loop -> match recv -> Ok arm -> match
+/// decode -> Ok arm -> for -> if let Err — into a thin `recv`/stop loop
+/// ([`recv_until_stopped`]) plus one shallow method. [`DecodeLoop::handle_frame`]
+/// is the whole per-frame pipeline: keyframe-gate, decode, composite live
+/// refinement tiles, publish. It is callable directly from tests with a
+/// `NullDecoder` or a small scripted double, with no Media Foundation and no
+/// channel involved.
+struct DecodeLoop<R> {
+    /// `None` when the decoder failed to construct (e.g. a platform without
+    /// Media Foundation); every frame is then a no-op, same as before this
+    /// type existed.
+    decoder: Option<Box<dyn Decoder>>,
+    gate: KeyframeGate,
+    /// Hoisted so the per-frame cost of a snapshot is a memcpy of `Arc`
+    /// pointers into an already-grown buffer, never an allocation.
+    scratch: Vec<Arc<Tile>>,
+    status: Arc<SourceStatus>,
+    tiles: Arc<TileStore>,
+    tile_highlight: Arc<AtomicBool>,
+    control_tx: mpsc::Sender<ControlMsg>,
+    slot: Arc<FrameSlot>,
+    repaint: R,
+}
+
+impl<R: Fn() + Send + 'static> DecodeLoop<R> {
+    fn new(
+        status: Arc<SourceStatus>,
+        tiles: Arc<TileStore>,
+        tile_highlight: Arc<AtomicBool>,
+        slot: Arc<FrameSlot>,
+        control_tx: mpsc::Sender<ControlMsg>,
+        repaint: R,
+    ) -> Self {
+        let decoder: Option<Box<dyn Decoder>> = match crate::decoder::new_decoder() {
+            Ok(d) => {
+                #[cfg(windows)]
+                status.set_description(
+                    "MF H.264 (CLSID_MSH264DecoderMFT), NV12→RGBA8 BT.709 limited".to_string(),
+                );
+                #[cfg(not(windows))]
+                status.set_description("H.264 decoder".to_string());
+                Some(d)
+            }
+            Err(e) => {
+                tracing::error!("decoder unavailable: {e}");
+                status.set_description("unavailable".to_string());
+                status.set_error(Some(e.to_string()));
+                None
+            }
+        };
+        Self {
+            decoder,
+            gate: KeyframeGate::default(),
+            scratch: Vec::new(),
+            status,
+            tiles,
+            tile_highlight,
+            control_tx,
+            slot,
+            repaint,
+        }
+    }
+
+    /// Handle one received encoded frame end to end.
+    ///
+    /// Keyframe-gates it, decodes it, composites the live refinement tiles
+    /// onto every decoded picture, and publishes each to the slot. A gate
+    /// gap and a decode error both recover the same way: flush the decoder
+    /// and ask the host for a fresh keyframe (see
+    /// [`flush_and_request_keyframe`]).
+    fn handle_frame(&mut self, frame: EncodedFrame) {
+        let Some(decoder) = self.decoder.as_mut() else {
+            return;
+        };
+
+        let (admitted, request_keyframe_now) = self.gate.admit(frame.frame_id, frame.keyframe);
+        if !admitted {
+            self.status.record_frame_gated();
+            tracing::debug!(
+                frame_id = frame.frame_id,
+                keyframe = frame.keyframe,
+                "dropping delta frame after gap; awaiting IDR"
+            );
+            if request_keyframe_now {
+                // Entering the wait: flush the stale reference chain once
+                // and ask for a fresh IDR. `request_keyframe_now` is only
+                // true on the transition into waiting, so a stalled sender
+                // is asked once, not on every dropped frame.
+                flush_and_request_keyframe(&mut **decoder, &self.control_tx);
+            }
+            return;
+        }
+
+        match decoder.decode(&frame) {
+            Ok(frames) => {
+                let produced = frames.len();
+                for mut raw in frames {
+                    // The tile overlay is *persistent* state while a
+                    // decoded frame is transient — the decoder hands back a
+                    // fresh buffer every time — so the live tile set has to
+                    // be re-blitted onto every frame, right here, before
+                    // the frame is published. Doing it downstream (in the
+                    // presenter) would mean repainting on every *repaint*
+                    // instead of every frame, and would put a pixel loop on
+                    // the UI thread.
+                    composite_onto(
+                        &mut raw,
+                        &self.tiles,
+                        &mut self.scratch,
+                        self.tile_highlight.load(Ordering::Relaxed),
+                    );
+                    self.slot.publish(raw);
+                }
+                if produced > 0 {
+                    (self.repaint)();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(frame_id = frame.frame_id, "decode failed: {e}");
+                self.status.set_error(Some(e.to_string()));
+                // Corrupt state: only a fresh IDR can recover. Flushing
+                // alone drops the bad reference chain but leaves the
+                // decoder starved until the host happens to send a
+                // keyframe — so ask for one.
+                flush_and_request_keyframe(&mut **decoder, &self.control_tx);
+            }
+        }
+    }
+}
+
+/// Flush the decoder's stale reference chain and ask the host for a fresh
+/// IDR keyframe.
+///
+/// The one recovery move for both ways [`DecodeLoop::handle_frame`] can find
+/// itself unable to proceed: a keyframe-gate gap (frames lost in flight) and
+/// a decode error (Media Foundation rejected a frame outright). Either way,
+/// flushing alone would leave the decoder starved until the host happens to
+/// send a keyframe on its own, so ask for one explicitly. `try_send` never
+/// blocks this thread; a full control queue already has a keyframe request
+/// pending, so dropping this one is harmless.
+fn flush_and_request_keyframe(decoder: &mut dyn Decoder, control_tx: &mpsc::Sender<ControlMsg>) {
+    decoder.flush();
+    if let Err(err) = control_tx.try_send(ControlMsg::RequestKeyframe) {
+        tracing::warn!("keyframe request dropped: {err}");
+    }
 }
 
 /// Paint the live refinement tiles over one freshly decoded frame.
@@ -497,7 +555,10 @@ fn synth_frame(width: u32, height: u32, tick: u32, timestamp_ms: u32) -> RawFram
 #[cfg(test)]
 mod tests {
     use super::*;
+    use directdesk_shared::error::Error;
     use directdesk_shared::tiles::{compress_strip, TILE_EDGE};
+    use directdesk_shared::traits::NullDecoder;
+    use std::collections::VecDeque;
 
     /// A flat opaque frame, so any painted pixel is unmistakable.
     fn rgba_frame(width: u32, height: u32, timestamp_ms: u32) -> RawFrame {
@@ -620,6 +681,147 @@ mod tests {
         assert_eq!(stats.skipped_expired, 0);
         assert_eq!(store.resident_tiles(), 0, "the lapsed tile must be gone");
         assert_eq!(frame.data, before);
+    }
+
+    /// Decoder test double: pops one canned response per call and counts
+    /// `flush()`, so `DecodeLoop::handle_frame`'s error-recovery path is
+    /// pinned without Media Foundation. `NullDecoder` (shared crate) covers
+    /// the always-succeeds case; this covers the always-fails one.
+    struct ScriptedDecoder {
+        responses: VecDeque<directdesk_shared::error::Result<Vec<RawFrame>>>,
+        flushes: Arc<AtomicU64>,
+    }
+
+    impl Decoder for ScriptedDecoder {
+        fn decode(
+            &mut self,
+            frame: &EncodedFrame,
+        ) -> directdesk_shared::error::Result<Vec<RawFrame>> {
+            self.responses.pop_front().unwrap_or_else(|| {
+                panic!(
+                    "ScriptedDecoder ran out of scripted responses for frame {}",
+                    frame.frame_id
+                )
+            })
+        }
+
+        fn flush(&mut self) {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Assemble a [`DecodeLoop`] directly from its fields, bypassing
+    /// `DecodeLoop::new`'s `crate::decoder::new_decoder()` call so tests can
+    /// hand it a test double instead of the real Media Foundation decoder.
+    fn decode_loop_for_test<R: Fn() + Send + 'static>(
+        decoder: Box<dyn Decoder>,
+        status: Arc<SourceStatus>,
+        control_tx: mpsc::Sender<ControlMsg>,
+        slot: Arc<FrameSlot>,
+        repaint: R,
+    ) -> DecodeLoop<R> {
+        DecodeLoop {
+            decoder: Some(decoder),
+            gate: KeyframeGate::default(),
+            scratch: Vec::new(),
+            status,
+            tiles: Arc::new(TileStore::new()),
+            tile_highlight: Arc::new(AtomicBool::new(false)),
+            control_tx,
+            slot,
+            repaint,
+        }
+    }
+
+    #[test]
+    fn handle_frame_decodes_and_forwards_a_normal_frame() {
+        // The common case: an admitted frame decodes cleanly and its output
+        // reaches the slot with no keyframe request along the way.
+        let slot = Arc::new(FrameSlot::new());
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let mut decode_loop = decode_loop_for_test(
+            Box::new(NullDecoder),
+            Arc::new(SourceStatus::default()),
+            control_tx,
+            slot.clone(),
+            || {},
+        );
+
+        decode_loop.handle_frame(EncodedFrame {
+            frame_id: 1,
+            keyframe: true,
+            timestamp_ms: 42,
+            data: vec![9, 9, 9, 9],
+        });
+
+        assert_eq!(slot.decoded_count(), 1);
+        let (frame, _gen, _arrived) = slot.take_newer_than(0).expect("a frame was published");
+        assert_eq!(frame.data, vec![9, 9, 9, 9]);
+        assert_eq!(frame.timestamp_ms, 42);
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a clean decode must not ask for a keyframe"
+        );
+    }
+
+    #[test]
+    fn handle_frame_on_decode_error_flushes_and_requests_a_keyframe() {
+        // Corrupt decoder state can only be recovered by a fresh IDR:
+        // flushing alone would leave the decoder starved until the host
+        // happens to send one, so the error path must also ask for it.
+        let flushes = Arc::new(AtomicU64::new(0));
+        let decoder = ScriptedDecoder {
+            responses: VecDeque::from(vec![Err(Error::Decoder("boom".into()))]),
+            flushes: flushes.clone(),
+        };
+        let status = Arc::new(SourceStatus::default());
+        let slot = Arc::new(FrameSlot::new());
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let mut decode_loop = decode_loop_for_test(
+            Box::new(decoder),
+            status.clone(),
+            control_tx,
+            slot.clone(),
+            || {},
+        );
+
+        // Keyframe so the frame clears the gate and actually reaches decode().
+        decode_loop.handle_frame(EncodedFrame {
+            frame_id: 1,
+            keyframe: true,
+            timestamp_ms: 0,
+            data: vec![],
+        });
+
+        assert_eq!(
+            flushes.load(Ordering::Relaxed),
+            1,
+            "must flush on decode error"
+        );
+        assert!(
+            matches!(control_rx.try_recv(), Ok(ControlMsg::RequestKeyframe)),
+            "must ask the host for a fresh IDR"
+        );
+        assert_eq!(slot.decoded_count(), 0, "nothing was produced to publish");
+        assert!(status.error().is_some());
+    }
+
+    #[test]
+    fn recv_until_stopped_breaks_on_the_next_tick_once_stop_is_set() {
+        // Pins the loop shape shared by both background threads in this
+        // file (folded here from the near-identical recv_timeout blocks
+        // that used to live in the tile thread and the decode thread): once
+        // `stop` is set, the call must return on the next 100ms timeout
+        // tick rather than hang waiting for a sender — no disconnect
+        // required.
+        let (tx, rx) = crossbeam_channel::unbounded::<u32>();
+        let stop = AtomicBool::new(true);
+        let mut received = Vec::new();
+
+        recv_until_stopped(&rx, &stop, |item| received.push(item));
+
+        assert!(received.is_empty(), "must not block waiting for an item");
+        drop(tx); // kept alive across the call so this is Timeout, not Disconnected
     }
 
     #[test]
