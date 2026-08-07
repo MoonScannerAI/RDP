@@ -9,16 +9,25 @@ not "probably fine, just untested."
 
 ## Protocol-level stubs (real enum variants, no working implementation)
 
+- **TCP/TLS fallback and route racing are written but unwired.**
+  `directdesk_shared::transport::{tcp, race}` are complete and unit-tested,
+  but **no binary selects them** — the client's `connect_race` is QUIC-only
+  by decision, so `TransportRoute::DirectTcp` is never produced and a
+  UDP-blackholing network still fails outright. Turning it on is a wiring
+  change behind the `transport-race` cargo feature, not new implementation
+  work.
 - **UDP hole punching** (`TransportRoute::UdpHolePunched`) is a defined
   route in the protocol and route-priority list, but there is **no
   implementation behind it**. It is never actually attempted. NAT traversal
-  in this MVP works only via explicit port forwarding, direct public
-  addressing, or the TCP fallback — not via hole punching. See
+  in this MVP works only via explicit port forwarding or direct public
+  addressing — not via hole punching, and not via the TCP fallback while
+  that stays unwired (see above). See
   [NETWORK_SETUP.md](NETWORK_SETUP.md).
 - **Relay** (`TransportRoute::Relayed`) is a defined route and a real,
   honestly-labeled UI state, but **no relay server exists anywhere in this
-  deployment**. If direct connectivity (including the TCP fallback) fails,
-  the connection fails — it does not silently fall back to a relay that
+  deployment**. If direct connectivity fails (and the TCP fallback is not
+  wired up to be tried at all — see above), the connection fails — it
+  does not silently fall back to a relay that
   isn't there, and it will never mislabel a relayed hop as direct (that's
   a design invariant, not just a current-state fact — see
   `TransportRoute::is_direct()` and its test in `shared/src/stats.rs`).

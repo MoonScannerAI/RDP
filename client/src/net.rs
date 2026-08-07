@@ -3,10 +3,12 @@
 //! This is the seam between [`crate::session::TransportEndpoints`] (the UI-facing
 //! channels) and the real network. [`run_client`] owns the whole lifecycle:
 //!
-//! 1. **Connect** — QUIC route racing (IPv4 → IPv6). TCP fallback is deferred:
-//!    `shared::transport::{tcp,race}` do not exist yet, so this is QUIC-only
-//!    behind the [`connect_race`] seam that a `race::connect` can later slot
-//!    into. See the `TODO(race)` marker.
+//! 1. **Connect** — QUIC route racing (IPv4 → IPv6). The TCP/TLS fallback and
+//!    the staggered racer both exist and are unit-tested in
+//!    `directdesk_shared::transport::{tcp, race}`; they are simply not selected
+//!    by any binary. This client is QUIC-only *by decision*, behind the
+//!    [`connect_race`] seam that `race::connect` slots into once the
+//!    `transport-race` cargo feature is enabled. See the `TODO(race)` marker.
 //! 2. **Handshake** — a `Hello` exchange, then either SPAKE2 pairing (when a
 //!    code is supplied) or steady-state mutual authentication against the pinned
 //!    host identity. On a pin/signature mismatch the connection is refused: that
@@ -603,7 +605,8 @@ async fn connect_and_auth(
         }
     };
 
-    // Resolve + race candidate routes (QUIC-only for now).
+    // Resolve + race candidate routes (QUIC-only by decision, not by absence —
+    // see `connect_race`).
     let candidates = resolve_candidates(&params.host, params.udp_port).await;
     if candidates.is_empty() {
         return Err(HandshakeError::recoverable(format!(
@@ -888,10 +891,12 @@ async fn resolve_candidates(host: &str, port: u16) -> Vec<SocketAddr> {
 /// The QUIC-only route race. Tries each candidate in order with a per-attempt
 /// timeout; the first to complete the QUIC handshake wins.
 ///
-/// TODO(race): when `directdesk_shared::transport::race` lands, delegate here so
-/// this also stages the TCP/TLS fallback (`transport::tcp`) in parallel. Those
-/// modules do not exist yet, so this is deliberately QUIC-only and never labels
-/// a TCP route as UDP.
+/// TODO(race): `directdesk_shared::transport::race` and `::tcp` are written and
+/// unit-tested — what is missing is the wiring, not the dependency. Delegating
+/// here would stage the TCP/TLS fallback in parallel with the QUIC attempts.
+/// That is a deliberate decision to leave off until the `transport-race` cargo
+/// feature is enabled, so this stays QUIC-only and never labels a TCP route as
+/// UDP.
 async fn connect_race(
     candidates: &[SocketAddr],
     pinning: &ServerPinning,
