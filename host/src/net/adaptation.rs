@@ -139,6 +139,73 @@ impl WindowDelivery {
     }
 }
 
+/// Turns the session's raw, monotonically-increasing counters into one
+/// [`WindowDelivery`] per status tick, and tracks how many ticks have run so
+/// the overrun diagnostic knows when it can be trusted (see
+/// [`OVERRUN_WARMUP_INTERVALS`] / [`OVERRUN_MIN_FRAMES`]).
+///
+/// Holds nothing but the previous tick's raw counters and a tick count — no
+/// clock of its own, no socket, no lock. `close` is the only way to move it
+/// forward, and there is no way to read the current window without also
+/// consuming it, which is exactly what `status_loop` does once per tick.
+#[derive(Debug, Clone)]
+pub(crate) struct StatusWindow {
+    prev_sent: u64,
+    prev_bytes: u64,
+    prev_backpressured: u64,
+    prev_now: u64,
+    intervals: u32,
+}
+
+impl StatusWindow {
+    /// `now` seeds the first window's `dt_ms` against the moment the session
+    /// actually started, not zero.
+    pub(crate) fn new(now: u64) -> Self {
+        Self {
+            prev_sent: 0,
+            prev_bytes: 0,
+            prev_backpressured: 0,
+            prev_now: now,
+            intervals: 0,
+        }
+    }
+
+    /// Close out one status window: fold this tick's raw lifetime counters
+    /// into a matched delta against the previous tick, and report whether the
+    /// stream is warm enough for the overrun ratio to mean anything.
+    pub(crate) fn close(
+        &mut self,
+        now: u64,
+        sent: u64,
+        bytes: u64,
+        backpressured: u64,
+    ) -> (WindowDelivery, bool) {
+        let win_sent = sent.saturating_sub(self.prev_sent);
+        let win_backpressured = backpressured.saturating_sub(self.prev_backpressured);
+        let delivery = WindowDelivery {
+            sent: win_sent,
+            offered: win_sent + win_backpressured,
+            bytes: bytes.saturating_sub(self.prev_bytes),
+            dt_ms: now.saturating_sub(self.prev_now),
+        };
+        self.prev_sent = sent;
+        self.prev_bytes = bytes;
+        self.prev_backpressured = backpressured;
+        self.prev_now = now;
+        self.intervals = self.intervals.saturating_add(1);
+
+        // The encoder-vs-carried "overrun" is only a trustworthy congestion
+        // signal once the stream has run a few windows AND actually sent a
+        // meaningful number of frames this window. Before that (start-up, or a
+        // window where the stream just stopped) the encoder bitrate is
+        // measured over a full interval while the link carried almost
+        // nothing, and their ratio is a window artifact that would drive the
+        // adaptor down for no reason.
+        let warm = self.intervals > OVERRUN_WARMUP_INTERVALS && win_sent >= OVERRUN_MIN_FRAMES;
+        (delivery, warm)
+    }
+}
+
 /// The single congestion number the [`BitrateAdaptor`] observes for one window.
 ///
 /// `loss` is the transport's real, matched-window application-level loss — the
@@ -156,6 +223,25 @@ impl WindowDelivery {
 pub fn congestion_signal(loss: f32, backpressure: f32, overrun: f32, warm: bool) -> f32 {
     let overrun = if warm { overrun } else { 0.0 };
     loss.max(backpressure).max(overrun).clamp(0.0, 1.0)
+}
+
+/// The congestion number for one status window: [`congestion_signal`], with a
+/// keyframe the fragmenter refused overriding every measured signal outright.
+///
+/// Nothing of a refused keyframe reached the wire, and the next IDR would be
+/// the same size unless the bitrate comes down — that outranks a `loss` or
+/// `backpressure` reading that has not caught up to the stall yet.
+pub(crate) fn window_congestion(
+    loss: f32,
+    delivery: WindowDelivery,
+    overrun: f32,
+    warm: bool,
+    oversized_keyframe: bool,
+) -> f32 {
+    if oversized_keyframe {
+        return 1.0;
+    }
+    congestion_signal(loss, delivery.backpressure_ratio(), overrun, warm)
 }
 
 /// Loss above this fraction means the link is already hurting; refinement
@@ -1055,6 +1141,100 @@ mod tests {
         assert!((congestion_signal(0.0, 0.0, 0.9, true) - 0.9).abs() < 1e-6);
         // Real loss wins whenever it is larger, warm or not.
         assert!((congestion_signal(0.5, 0.1, 0.2, true) - 0.5).abs() < 1e-6);
+    }
+
+    // -- StatusWindow --------------------------------------------------------
+
+    #[test]
+    fn status_window_first_tick_has_no_previous_sample() {
+        // Nothing came before, so `saturating_sub` against a zero baseline
+        // makes the whole lifetime counter this window's delta rather than
+        // underflowing.
+        let mut w = StatusWindow::new(0);
+        let (delivery, warm) = w.close(1_000, 60, 120_000, 0);
+        assert_eq!(delivery.sent, 60);
+        assert_eq!(delivery.offered, 60, "nothing was backpressured yet");
+        assert_eq!(delivery.bytes, 120_000);
+        assert_eq!(
+            delivery.dt_ms, 1_000,
+            "measured against the seed passed to new()"
+        );
+        assert!(!warm, "a single interval can never be warm");
+    }
+
+    #[test]
+    fn status_window_warm_gate_needs_both_intervals_and_frames() {
+        let mut w = StatusWindow::new(0);
+        let mut now = 0u64;
+        let mut sent = 0u64;
+
+        // Below OVERRUN_WARMUP_INTERVALS closes: never warm, even though every
+        // window here sends plenty of frames.
+        for i in 1..=OVERRUN_WARMUP_INTERVALS {
+            now += 1_000;
+            sent += 100;
+            let (_, warm) = w.close(now, sent, 0, 0);
+            assert!(
+                !warm,
+                "interval {i} of {OVERRUN_WARMUP_INTERVALS} must not be warm"
+            );
+        }
+
+        // Past the interval count now, but this window sent too few frames to
+        // trust the overrun ratio.
+        now += 1_000;
+        sent += OVERRUN_MIN_FRAMES - 1;
+        let (_, warm) = w.close(now, sent, 0, 0);
+        assert!(!warm, "win_sent below OVERRUN_MIN_FRAMES must not be warm");
+
+        // Enough intervals AND enough frames sent this window: now it's warm.
+        now += 1_000;
+        sent += OVERRUN_MIN_FRAMES;
+        let (_, warm) = w.close(now, sent, 0, 0);
+        assert!(warm, "past warm-up with enough frames sent must be warm");
+    }
+
+    #[test]
+    fn status_window_delta_matches_a_normal_tick() {
+        let mut w = StatusWindow::new(0);
+        w.close(1_000, 100, 1_000_000, 5); // seed a previous sample
+        let (delivery, _) = w.close(2_000, 160, 1_500_000, 10);
+        assert_eq!(
+            delivery,
+            WindowDelivery {
+                sent: 60,
+                offered: 65,
+                bytes: 500_000,
+                dt_ms: 1_000,
+            }
+        );
+    }
+
+    // -- window_congestion ---------------------------------------------------
+
+    #[test]
+    fn window_congestion_lets_an_oversized_keyframe_override_everything() {
+        // Even an otherwise pristine window must read as full congestion:
+        // nothing of the refused keyframe reached the wire.
+        let clean = WindowDelivery {
+            sent: 60,
+            offered: 60,
+            bytes: 1_000_000,
+            dt_ms: 1_000,
+        };
+        assert_eq!(window_congestion(0.0, clean, 0.0, true, true), 1.0);
+    }
+
+    #[test]
+    fn window_congestion_matches_congestion_signal_when_not_oversized() {
+        let d = WindowDelivery {
+            sent: 45,
+            offered: 60,
+            bytes: 1_000_000,
+            dt_ms: 1_000,
+        };
+        let expected = congestion_signal(0.02, d.backpressure_ratio(), 0.3, true);
+        assert_eq!(window_congestion(0.02, d, 0.3, true, false), expected);
     }
 
     // -- M5: bitrate caps --------------------------------------------------
