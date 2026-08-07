@@ -61,6 +61,12 @@
 //! after a capture gap (glitch, endpoint switch, silence suppression), telling
 //! the receiver to reset its jitter buffer rather than try to bridge the hole.
 
+/// The receiver-side network-domain jitter buffer: reorder window, adaptive
+/// depth, and clock-drift correction. Everything in this file describes what a
+/// packet *is*; everything in [`jitter`] describes what to do with a stream of
+/// them that arrives out of order, late, or not at all.
+pub mod jitter;
+
 use crate::error::{Error, Result};
 
 /// Re-exported, not redefined. The bit's meaning is a property of the *shared*
@@ -90,6 +96,23 @@ pub const AUDIO_FLAGS_MASK: u8 = FLAG_AUDIO | FLAG_DISCONTINUITY;
 /// Largest AAC-LC access unit we will send or accept. A 1024-sample AAC-LC
 /// frame at 256 kbit/s is well under 1 KiB; this is a generous cap that still
 /// keeps header + payload inside any plausible QUIC datagram limit.
+///
+/// # It is a bitrate ceiling, and the sender's config knows it
+///
+/// An access unit is a fixed 1024 samples per channel, so this byte cap is
+/// exactly a cap on the sender's bitrate: `1024 * 8` bits per unit works out to
+/// 384 kbit/s at 48 kHz and 352.8 kbit/s at 44.1 kHz. **Above that every single
+/// frame fails [`encode_packet`]**, which is not an audible degradation but
+/// total silence, reported only as a repeating per-frame warning on the host.
+///
+/// The host therefore clamps its configured audio bitrate below that crossing
+/// point, and asserts the relationship at compile time
+/// (`host::config::MAX_SYSTEM_AUDIO_KBPS`) so the two cannot be re-sized
+/// independently. Raising this constant is a **wire change**: a receiver that
+/// predates the raise rejects the larger packet in [`decode_packet`], so the
+/// audio simply vanishes for that peer with the loss looking like ordinary
+/// packet loss. Append-only reasoning applies here as much as it does to the
+/// format codes.
 pub const MAX_AUDIO_PAYLOAD: usize = 1024;
 
 /// The audio flags byte must sit exactly where the video flags byte sits, or
@@ -110,8 +133,14 @@ const _: () = assert!(AUDIO_HEADER_LEN > AUDIO_FORMAT_OFFSET);
 /// the receiver has to be able to configure its output device for whatever
 /// arrives, and a one-byte enumerated code is both smaller on the wire and
 /// impossible to fill with a nonsense sample rate. An endpoint whose native mix
-/// is something else (96 kHz, 5.1) is resampled/downmixed at the host before it
-/// reaches this layer.
+/// is something else (96 kHz, 5.1, ...) is never resampled or downmixed into
+/// this set — the host's `classify_mix_format` (`host::audio_capture`) refuses
+/// it outright, logs what it found, and that session simply runs with audio
+/// off. Silently reinterpreting six channels as two, or 96 kHz samples as 48,
+/// would produce a stream at the wrong pitch and the wrong speed — audible,
+/// but with nothing to say why — which is worse than no stream at all. This
+/// enum is therefore never asked to represent a format it cannot: whatever
+/// reaches this layer is already one of the four wire formats below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
     /// 48 kHz, 2 channels — the overwhelmingly common Windows default.
@@ -199,6 +228,60 @@ pub struct AudioPacket<'a> {
     pub format: AudioFormat,
     /// Exactly one raw AAC-LC access unit, 1..=[`MAX_AUDIO_PAYLOAD`] bytes.
     pub payload: &'a [u8],
+}
+
+/// One audio packet, owned rather than borrowed.
+///
+/// [`AudioPacket`] borrows its payload out of the datagram buffer — the
+/// receive loop's own scratch space, reused for the next read the instant this
+/// one returns — so anything that must survive past the current iteration
+/// needs its own copy. That is true for both of this crate's audio consumers:
+/// [`jitter::AudioJitterBuffer`] holds packets across the reorder window, and
+/// the transport session driver hands one to the application after the
+/// datagram that produced it is already gone (an allocation of at most
+/// [`MAX_AUDIO_PAYLOAD`] bytes per ~20 ms of audio — a rounding error next to
+/// the per-frame allocations the video path already makes). Building one
+/// copies only on acceptance: [`jitter::AudioJitterBuffer::push`] discards a
+/// duplicate or a late arrival before ever calling [`Self::from_packet`], so
+/// neither costs an allocation.
+///
+/// The header fields are carried through verbatim rather than being flattened
+/// into "just the bytes": `format` may change mid-session, `discontinuity`
+/// tells the player to reset its jitter buffer instead of concealing a hole of
+/// unknown length, and `capture_ms` shares a clock with the video fragment
+/// header's `timestamp_ms` — which is what makes A/V sync possible at all. See
+/// the module docs above for why each of those is per-packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioFrame {
+    /// Wrapping sequence number. Gaps mean loss; never an index into anything.
+    pub seq: u32,
+    /// Host capture timestamp, milliseconds, wraps. Same clock as the video
+    /// fragment header's `timestamp_ms`, which is what makes A/V sync possible;
+    /// carried through untouched, since it is the caller's to act on.
+    pub capture_ms: u32,
+    /// First packet after a capture gap — see [`FLAG_DISCONTINUITY`]. Delivered
+    /// as-is so a caller that isn't watching a push/receive outcome directly
+    /// can still see it.
+    pub discontinuity: bool,
+    /// Format of *this* packet; may differ from its neighbours. See the module
+    /// docs for why format is per-packet.
+    pub format: AudioFormat,
+    /// Exactly one raw AAC-LC access unit.
+    pub data: Vec<u8>,
+}
+
+impl AudioFrame {
+    /// Copy a borrowed packet into owned form.
+    #[must_use]
+    pub fn from_packet(packet: &AudioPacket<'_>) -> Self {
+        Self {
+            seq: packet.seq,
+            capture_ms: packet.capture_ms,
+            discontinuity: packet.discontinuity,
+            format: packet.format,
+            data: packet.payload.to_vec(),
+        }
+    }
 }
 
 /// Serialize one audio packet into a datagram.
