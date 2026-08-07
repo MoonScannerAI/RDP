@@ -1054,6 +1054,20 @@ impl TcpSession {
         let (input_out_tx, input_out_rx) = mpsc::channel(config.input_capacity);
         let (input_in_tx, input_in_rx) = mpsc::channel(config.input_capacity);
         let (video_in_tx, video_in_rx) = mpsc::channel(config.video_capacity);
+        // Audio never arrives on this transport, so the sender is dropped the
+        // moment it is made and `rx.audio` is closed from the start.
+        //
+        // Not a policy choice and not affected by `SessionConfig::receive_audio`
+        // — the same limitation `receive_video` has here, for the same reason.
+        // Audio is a *datagram* format (see `crate::audio`), and TCP has no
+        // datagram path at all: `encode_media_segments` muxes video inline on
+        // the one byte stream that also carries control and input, and there is
+        // no segment kind on that stream for an AAC access unit. A caller that
+        // asks a `TcpSession` for audio therefore gets a receiver that says
+        // `None` immediately, rather than one that waits forever for packets
+        // this transport is structurally unable to deliver.
+        let (audio_in_tx, audio_in_rx) = mpsc::channel(config.audio_capacity);
+        drop(audio_in_tx);
         let (events_tx, events_rx) = mpsc::channel(config.control_capacity);
 
         let shared = Arc::new(Shared {
@@ -1112,6 +1126,7 @@ impl TcpSession {
             control: control_in_rx,
             input: input_in_rx,
             video: video_in_rx,
+            audio: audio_in_rx,
             events: events_rx,
         };
         Ok((session, receivers))

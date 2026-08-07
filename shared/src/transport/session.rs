@@ -10,7 +10,7 @@
 //! | control writer | out | drains the control queue onto the control stream |
 //! | control reader | in | decodes control messages, answers `Ping`, matches `Pong` |
 //! | input writer / reader | both | same, for [`InputMsg`] |
-//! | video receiver | in | reassembles datagrams, requests keyframes on loss |
+//! | datagram receiver | in | demuxes audio from video, reassembles video, requests keyframes on loss |
 //! | heartbeat | out | periodic `Ping` for liveness and RTT |
 //! | stats sampler | — | turns `Connection::stats()` into [`ConnStats`] |
 //!
@@ -28,6 +28,18 @@
 //! Senders fragment with [`crate::video::fragment_frame_fec`] and call
 //! [`Connection::send_datagram`] themselves.
 //!
+//! # One datagram path, two kinds of media
+//!
+//! Audio and video share the unreliable QUIC datagram path, so
+//! `datagram_recv_loop` — the only `read_datagram` caller in the workspace —
+//! is also the demux. Every datagram is classified by
+//! [`crate::audio::is_audio_datagram`] *before* anything parses it, and audio
+//! is routed to its own channel rather than into the video [`Reassembler`].
+//!
+//! The classification is unconditional; only delivery is gated on
+//! [`SessionConfig::receive_audio`]. See the comment at the demux itself for
+//! why both of those properties are load-bearing rather than stylistic.
+//!
 //! # Why a trait
 //!
 //! The TCP/TLS fallback in a later milestone has to present the same interface,
@@ -44,6 +56,9 @@
 //! - Inbound video is **droppable**: a full receive queue drops the reassembled
 //!   frame and warns. A video frame that arrives late is worth less than
 //!   nothing, because it delays the one behind it.
+//! - Inbound audio is **droppable** for the same reason: a full queue drops the
+//!   packet and warns. Twenty milliseconds of audio delivered late is a
+//!   deepening lip-sync offset, not a recovered sound.
 //!
 //! # Time
 //!
@@ -62,6 +77,7 @@ use quinn::{Connection, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::audio::{self, AudioFrame};
 use crate::error::{Error, Result};
 use crate::protocol::{ControlMsg, InputMsg};
 use crate::stats::{ConnStats, TransportRoute};
@@ -99,6 +115,13 @@ pub struct SessionConfig {
     pub input_capacity: usize,
     /// Queue depth for inbound video frames.
     pub video_capacity: usize,
+    /// Queue depth for inbound audio packets.
+    ///
+    /// Counted in packets, not milliseconds: at ~20 ms per AAC-LC access unit
+    /// the default 32 is a little over half a second of slack, which is far
+    /// more than a healthy consumer needs and still small enough that a stalled
+    /// one cannot hoard audio the player would never have used anyway.
+    pub audio_capacity: usize,
     /// Reassembly policy for inbound video.
     pub reassembly: ReassemblyConfig,
     /// Whether to run the inbound video path at all.
@@ -123,6 +146,32 @@ pub struct SessionConfig {
     /// build, so a link here would be a broken-intra-doc-link warning that
     /// `tools/check.ps1` does not run `cargo doc` to catch.)
     pub receive_video: bool,
+
+    /// Whether to **deliver** inbound audio to the application.
+    ///
+    /// Audio is one-directional like video — the host captures its own render
+    /// endpoint and sends, the client plays — but unlike video it defaults to
+    /// `false`, because it is negotiated per session by a feature bit and costs
+    /// the receiving side a decoder and an output device. A session that never
+    /// asked for audio should not be handed packets it would only drop.
+    ///
+    /// **This gates delivery only, never the demux.** `datagram_recv_loop`
+    /// classifies every datagram with [`crate::audio::is_audio_datagram`]
+    /// whatever this is set to; with the flag off, audio is routed away from
+    /// the video path and then discarded rather than queued. Gating the
+    /// classification instead would send audio into [`Reassembler::push`] on
+    /// any session that did not negotiate it, where it would be refused by
+    /// `FragHeader::decode` and counted as `fragments_rejected` — a diagnostic
+    /// that reads as video corruption for something that is nothing of the
+    /// kind, and that sits one widened flag mask away from being far worse
+    /// (see [`crate::video::FLAG_AUDIO`]).
+    ///
+    /// QUIC only. `transport::tcp::TcpSession` carries media inline on the same
+    /// byte stream as control and input and has no datagram path at all, so it
+    /// can never see an audio datagram and this flag has no effect there.
+    /// (Deliberately not an intra-doc link, for the reason given on
+    /// [`SessionConfig::receive_video`].)
+    pub receive_audio: bool,
 }
 
 impl Default for SessionConfig {
@@ -134,16 +183,28 @@ impl Default for SessionConfig {
             input_capacity: 256,
             // Small on purpose: a deep video queue is just latency in disguise.
             video_capacity: 8,
+            audio_capacity: 32,
             reassembly: ReassemblyConfig::default(),
             receive_video: true,
+            receive_audio: false,
         }
     }
 }
 
 impl SessionConfig {
     /// Reject configurations that would deadlock or spin.
+    ///
+    /// Every capacity is checked, including `audio_capacity`: a zero is not a
+    /// tolerable "no queue" setting but an immediate panic inside
+    /// [`tokio::sync::mpsc::channel`], which would take down whichever task
+    /// called [`QuicSession::start`] rather than returning an error the caller
+    /// could report.
     pub fn validate(&self) -> Result<()> {
-        if self.control_capacity == 0 || self.input_capacity == 0 || self.video_capacity == 0 {
+        if self.control_capacity == 0
+            || self.input_capacity == 0
+            || self.video_capacity == 0
+            || self.audio_capacity == 0
+        {
             return Err(Error::Invalid(
                 "session queue capacities must be non-zero".into(),
             ));
@@ -162,6 +223,10 @@ pub struct SessionReceivers {
     /// Inbound reassembled video frames. Yields `None` immediately when the
     /// session was started with [`SessionConfig::receive_video`] off.
     pub video: mpsc::Receiver<EncodedFrame>,
+    /// Inbound audio packets. Yields `None` immediately when the session was
+    /// started with [`SessionConfig::receive_audio`] off — which is the
+    /// default, so most sessions see a closed receiver here.
+    pub audio: mpsc::Receiver<AudioFrame>,
     /// Driver events.
     pub events: mpsc::Receiver<SessionEvent>,
 }
@@ -275,6 +340,9 @@ impl QuicSession {
         // one shape for every caller. Dropping the unused sender below is what
         // makes `rx.video.recv()` return `None` straight away.
         let (video_in_tx, video_in_rx) = mpsc::channel(config.video_capacity);
+        // Same for audio, which is off by default: the channel always exists,
+        // and it is the sender's fate that differs.
+        let (audio_in_tx, audio_in_rx) = mpsc::channel(config.audio_capacity);
         let (events_tx, events_rx) = mpsc::channel(config.control_capacity);
 
         let shared = Arc::new(Shared {
@@ -317,11 +385,20 @@ impl QuicSession {
             input_recv,
             input_in_tx,
         )));
-        if config.receive_video {
-            tasks.push(tokio::spawn(video_recv_loop(
+        // `then_some` moves each sender into the `Some` or drops it on the
+        // spot, which is precisely the gate: a `None` here means the matching
+        // receiver is already closed and the loop has nowhere to put that kind
+        // of datagram. The video half carries its reassembly policy with it so
+        // that the loop cannot build a `Reassembler` it has no channel for.
+        let video_sink = config
+            .receive_video
+            .then_some((video_in_tx, config.reassembly));
+        let audio_sink = config.receive_audio.then_some(audio_in_tx);
+        if config.receive_video || config.receive_audio {
+            tasks.push(tokio::spawn(datagram_recv_loop(
                 shared.clone(),
-                video_in_tx,
-                config.reassembly,
+                video_sink,
+                audio_sink,
             )));
         }
         if config.heartbeat_ms > 0 {
@@ -346,6 +423,7 @@ impl QuicSession {
             control: control_in_rx,
             input: input_in_rx,
             video: video_in_rx,
+            audio: audio_in_rx,
             events: events_rx,
         };
         Ok((session, receivers))
@@ -596,12 +674,21 @@ async fn input_read_loop(shared: Arc<Shared>, mut stream: RecvStream, tx: mpsc::
     }
 }
 
-async fn video_recv_loop(
+/// The one `read_datagram` caller in the workspace: receive every media
+/// datagram, decide which medium it is, and hand it to that medium's channel.
+///
+/// `video` is `Some` only when [`SessionConfig::receive_video`] is set, and
+/// carries the reassembly policy so the [`Reassembler`] — much the most
+/// expensive state in this loop — is built only when there is somewhere for
+/// its frames to go. `audio` is `Some` only when
+/// [`SessionConfig::receive_audio`] is set. Both `None` is not a state
+/// [`QuicSession::start`] produces: it does not spawn this loop at all then.
+async fn datagram_recv_loop(
     shared: Arc<Shared>,
-    tx: mpsc::Sender<EncodedFrame>,
-    config: ReassemblyConfig,
+    video: Option<(mpsc::Sender<EncodedFrame>, ReassemblyConfig)>,
+    audio_tx: Option<mpsc::Sender<AudioFrame>>,
 ) {
-    let mut reassembler = Reassembler::new(config);
+    let mut video = video.map(|(tx, config)| (tx, Reassembler::new(config)));
     loop {
         let datagram = match shared.conn.read_datagram().await {
             Ok(d) => d,
@@ -609,6 +696,67 @@ async fn video_recv_loop(
                 shared.mark_closed(&format!("datagram stream closed: {e}"));
                 return;
             }
+        };
+
+        // --- Media demux, ahead of every parser and every allocation ---
+        //
+        // `is_audio_datagram` reads byte 8 through `.get()`, never `[8]`. That
+        // is not defensive habit, it is required: a QUIC DATAGRAM frame may
+        // legitimately carry a zero-length payload, and anyone on the path can
+        // inject one, so `datagram` here can be any length at all — including
+        // empty. An index panic on that byte would be a *silent* kill.
+        //
+        // Silent because of how this task is owned. It is a bare
+        // `tokio::spawn` whose `JoinHandle` is only ever `abort()`ed in
+        // `Drop`; nothing joins it and nothing observes a panic, so
+        // `mark_closed` would never run. `is_closed()` would stay false, the
+        // heartbeat and stats loops would go on ticking, the client UI would
+        // go on reading Connected, and the reconnect path would never fire.
+        // Video frozen for the life of the process, with every indicator
+        // green — which is strictly worse than a crash, because a crash gets
+        // reported.
+        //
+        // The classification is deliberately UNCONDITIONAL: it does not
+        // consult `receive_audio`. Only *delivery* is gated, by `audio_tx`
+        // being `None`. If the demux were gated too, a host that emitted audio
+        // outside the negotiation would push it into `Reassembler::push`,
+        // where `FragHeader::decode` refuses it and `fragments_rejected`
+        // climbs — a counter that reads as "the video wire is corrupt" for
+        // traffic that is perfectly well formed and merely unwanted. Route
+        // audio away always; `receive_audio` decides only who receives it.
+        if audio::is_audio_datagram(&datagram) {
+            if let Some(tx) = audio_tx.as_ref() {
+                match audio::decode_packet(&datagram) {
+                    Ok(packet) => {
+                        if tx.try_send(AudioFrame::from_packet(&packet)).is_err() {
+                            // Same policy as video: audio delivered late is a
+                            // widening sync offset, not a recovered sound.
+                            shared.emit(SessionEvent::Warning {
+                                detail: "audio receive queue full; packet dropped".into(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        // Malformed audio is dropped, never fatal — anyone on
+                        // the path can inject a datagram with this bit set.
+                        shared.emit(SessionEvent::Warning {
+                            detail: format!("bad audio datagram: {e}"),
+                        });
+                    }
+                }
+            }
+            // Audio was not negotiated: the datagram has still been kept away
+            // from the reassembler, which is the point, and is now discarded
+            // without a warning. One warning per unwanted packet, fifty times
+            // a second, is a log flood rather than a diagnostic.
+            continue;
+        }
+
+        let Some((tx, reassembler)) = video.as_mut() else {
+            // Audio-only session. A video datagram is not ours to reassemble
+            // and there is nowhere to put the result; silently ignored, for
+            // the same anti-flood reason as above.
+            continue;
         };
         let now_ms = shared.now_ms();
 
@@ -856,6 +1004,10 @@ pub fn delta_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: the driver demuxes and forwards audio without ever naming a
+    // concrete format or building a packet, so importing these at module scope
+    // would be genuinely unused in production code.
+    use crate::audio::{AudioFormat, AudioPacket};
     use crate::crypto::tls::ServerPinning;
     use crate::crypto::HostIdentity;
     use crate::transport::quic::QuicParams;
@@ -872,6 +1024,37 @@ mod tests {
         }
     }
 
+    /// The sender half of the audio path, which the driver does not own either.
+    /// There is no `fragment_*` step to mirror: one AAC-LC access unit is one
+    /// datagram, always, so an audio packet is either delivered whole or lost.
+    fn send_audio(conn: &Connection, seq: u32, payload: &[u8]) {
+        let bytes = crate::audio::encode_packet(&AudioPacket {
+            seq,
+            capture_ms: 1_000 + seq,
+            discontinuity: false,
+            format: AudioFormat::Stereo48k,
+            payload,
+        })
+        .expect("encode audio");
+        conn.send_datagram(bytes::Bytes::from(bytes))
+            .expect("datagram");
+    }
+
+    /// Field-by-field frame equality. [`EncodedFrame`] does not derive
+    /// `PartialEq`, and a reassembly test that compared only `frame_id` would
+    /// pass on a frame whose bytes had been shuffled — which is most of what
+    /// these tests are actually watching for.
+    fn assert_same_frame(got: &EncodedFrame, want: &EncodedFrame) {
+        assert_eq!(got.frame_id, want.frame_id, "frame_id");
+        assert_eq!(got.keyframe, want.keyframe, "keyframe flag");
+        assert_eq!(got.timestamp_ms, want.timestamp_ms, "timestamp_ms");
+        assert_eq!(
+            got.data, want.data,
+            "frame {} did not reassemble byte for byte",
+            want.frame_id
+        );
+    }
+
     #[test]
     fn config_validation() {
         assert!(SessionConfig::default().validate().is_ok());
@@ -880,6 +1063,15 @@ mod tests {
             ..SessionConfig::default()
         };
         assert!(bad.validate().is_err());
+        // `audio_capacity` too: `mpsc::channel(0)` panics rather than erroring,
+        // and a panic inside `start` is not something a caller can report.
+        let bad_audio = SessionConfig {
+            audio_capacity: 0,
+            ..SessionConfig::default()
+        };
+        assert!(bad_audio.validate().is_err());
+        // Off by default, so no session pays for audio it did not negotiate.
+        assert!(!SessionConfig::default().receive_audio);
     }
 
     #[test]
@@ -1263,6 +1455,484 @@ mod tests {
             .unwrap()
             .unwrap();
         client_ep.wait_idle().await;
+    }
+
+    /// With [`SessionConfig::receive_audio`] off — the default — the audio
+    /// sender is never handed to the receive loop, so `rx.audio` is closed from
+    /// the start rather than merely idle. Exactly what
+    /// `receive_video_false_spawns_no_reassembler` pins for the video half.
+    ///
+    /// The second half of this test is the more interesting one. The host sends
+    /// real audio datagrams at a client that did not ask for them, and the
+    /// client's video still arrives byte-for-byte. That is the *unconditional*
+    /// demux observed from outside: the flag suppresses delivery, not
+    /// classification, so those datagrams are routed away from
+    /// [`Reassembler::push`] even on a session with audio switched off. Gate
+    /// the demux on the flag instead and they would land in
+    /// `FragHeader::decode`'s rejection path —
+    /// `an_audio_datagram_never_disturbs_a_reassembler` spells out what that
+    /// costs, and how much worse than a bad counter it is one flag mask away
+    /// from being.
+    #[tokio::test]
+    async fn receive_audio_false_closes_the_audio_receiver() {
+        let id = HostIdentity::generate("no-audio-host").unwrap();
+        let params = QuicParams::default();
+        let server =
+            quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let host_task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let streams = quic::accept_streams(&conn).await.expect("accept streams");
+            let (session, mut rx) = QuicSession::start(
+                conn,
+                streams,
+                TransportRoute::DirectUdp,
+                SessionConfig {
+                    heartbeat_ms: 0,
+                    stats_interval_ms: 0,
+                    // A pure sender: it neither receives video nor audio.
+                    receive_video: false,
+                    receive_audio: false,
+                    ..Default::default()
+                },
+            )
+            .expect("host session");
+
+            // Rendezvous, so the datagrams below cannot race the client's
+            // session coming up.
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.control.recv())
+                .await
+                .expect("control timeout")
+                .expect("control closed");
+            assert!(matches!(msg, ControlMsg::StartStream { .. }));
+
+            // Audio before, during and after the video frame, at a client that
+            // never negotiated any of it.
+            for seq in 0..4u32 {
+                send_audio(session.connection(), seq, &[0xA5; 48]);
+            }
+            send_frame(
+                session.connection(),
+                &EncodedFrame {
+                    frame_id: 11,
+                    keyframe: true,
+                    timestamp_ms: 77,
+                    data: (0..8000u32).map(|i| (i % 251) as u8).collect(),
+                },
+            );
+            for seq in 4..8u32 {
+                send_audio(session.connection(), seq, &[0xA5; 48]);
+            }
+
+            // Stay up while the client drains: closing straight away would only
+            // prove the audio receiver was closed because the session was.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(!session.is_closed());
+        });
+
+        let client_ep = quic::client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
+        let conn = quic::connect(&client_ep, server_addr)
+            .await
+            .expect("connect");
+        let streams = quic::open_streams(&conn).await.expect("open streams");
+        // Plain `default()`: `receive_audio` is false without anyone saying so,
+        // which is the state every existing caller is already in.
+        let (session, mut rx) = QuicSession::start(
+            conn,
+            streams,
+            TransportRoute::DirectUdp,
+            SessionConfig::default(),
+        )
+        .expect("client session");
+
+        session
+            .send_control(ControlMsg::StartStream {
+                max_width: 1920,
+                max_height: 1080,
+                preferred_fps: 60,
+                quality_mode: crate::protocol::QualityMode::Balanced,
+            })
+            .expect("send control");
+
+        // Closed, not idle: the sender was dropped at `start`, so this returns
+        // without waiting for anything.
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.audio.recv())
+            .await
+            .expect("audio receiver should close, not hang");
+        assert!(got.is_none(), "no audio should ever be delivered");
+
+        // And the video path is untouched by the audio that just went past it.
+        let frame = tokio::time::timeout(Duration::from_secs(10), rx.video.recv())
+            .await
+            .expect("video timeout")
+            .expect("video closed");
+        assert_eq!(frame.frame_id, 11);
+        assert!(frame.keyframe);
+        assert_eq!(frame.timestamp_ms, 77);
+        assert_eq!(frame.data.len(), 8000);
+        assert!(
+            frame
+                .data
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == (i as u32 % 251) as u8),
+            "the frame reassembled with audio interleaved through it"
+        );
+        assert!(!session.is_closed());
+
+        tokio::time::timeout(Duration::from_secs(15), host_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        session.close("test done");
+        client_ep.wait_idle().await;
+    }
+
+    /// Audio and video interleaved on the one datagram path, over loopback
+    /// QUIC: each comes out on its own channel, undamaged.
+    ///
+    /// The interleaving is the substance. Audio packets are sent *between* the
+    /// fragments of a frame, not merely between frames, because a stray
+    /// datagram arriving mid-frame is the one that would land on a live
+    /// reassembly slot. A second frame follows all of it, so the reassembler
+    /// has to still be in a fit state to start a new frame afterwards.
+    #[tokio::test]
+    async fn loopback_session_demuxes_interleaved_audio_and_video() {
+        // Audio packets sent, and the number the client must see, in order.
+        const AUDIO_PACKETS: u32 = 12;
+        // Payload bytes per audio packet. Every byte is the sequence number, so
+        // a swapped pair shows up as a content mismatch and not merely an
+        // ordering one.
+        const AUDIO_PAYLOAD_LEN: usize = 48;
+
+        fn video_frame(id: u32) -> EncodedFrame {
+            EncodedFrame {
+                frame_id: id,
+                keyframe: id == 7,
+                timestamp_ms: 900 + id,
+                data: (0..8000u32)
+                    .map(|i| (i.wrapping_add(id) % 251) as u8)
+                    .collect(),
+            }
+        }
+
+        let id = HostIdentity::generate("audio-demux-host").unwrap();
+        let params = QuicParams::default();
+        let server =
+            quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let host_task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let streams = quic::accept_streams(&conn).await.expect("accept streams");
+            let (session, mut rx) = QuicSession::start(
+                conn,
+                streams,
+                TransportRoute::DirectUdp,
+                SessionConfig {
+                    heartbeat_ms: 0,
+                    stats_interval_ms: 0,
+                    receive_video: false,
+                    receive_audio: false,
+                    ..Default::default()
+                },
+            )
+            .expect("host session");
+
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.control.recv())
+                .await
+                .expect("control timeout")
+                .expect("control closed");
+            assert!(matches!(msg, ControlMsg::StartStream { .. }));
+
+            let conn = session.connection();
+            let mtu = quic::max_datagram(conn).expect("datagrams");
+            let frame_a = video_frame(7);
+            let frags = crate::video::fragment_frame_fec(&frame_a, mtu, 0).expect("fragment");
+            assert!(frags.len() > 1, "the fixture must need reassembly");
+
+            // One audio packet before each video fragment, so the demux runs
+            // in the middle of a frame rather than only at its boundaries.
+            for seq in 0..AUDIO_PACKETS {
+                send_audio(conn, seq, &[seq as u8; AUDIO_PAYLOAD_LEN]);
+                if let Some(f) = frags.get(seq as usize) {
+                    conn.send_datagram(bytes::Bytes::from(f.clone()))
+                        .expect("datagram");
+                }
+            }
+            for f in frags.iter().skip(AUDIO_PACKETS as usize) {
+                conn.send_datagram(bytes::Bytes::from(f.clone()))
+                    .expect("datagram");
+            }
+
+            // A whole frame after all the audio has gone by.
+            send_frame(conn, &video_frame(8));
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(!session.is_closed());
+        });
+
+        let client_ep = quic::client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
+        let conn = quic::connect(&client_ep, server_addr)
+            .await
+            .expect("connect");
+        let streams = quic::open_streams(&conn).await.expect("open streams");
+        let (session, mut rx) = QuicSession::start(
+            conn,
+            streams,
+            TransportRoute::DirectUdp,
+            SessionConfig {
+                heartbeat_ms: 0,
+                stats_interval_ms: 0,
+                receive_audio: true,
+                ..Default::default()
+            },
+        )
+        .expect("client session");
+
+        session
+            .send_control(ControlMsg::StartStream {
+                max_width: 1920,
+                max_height: 1080,
+                preferred_fps: 60,
+                quality_mode: crate::protocol::QualityMode::Balanced,
+            })
+            .expect("send control");
+
+        // Video first: both frames, byte for byte, despite the audio threaded
+        // through the first one's fragments.
+        for id in [7u32, 8] {
+            let frame = tokio::time::timeout(Duration::from_secs(10), rx.video.recv())
+                .await
+                .expect("video timeout")
+                .expect("video closed");
+            assert_same_frame(&frame, &video_frame(id));
+        }
+
+        // Audio: every packet, in sequence order, with its header fields and
+        // payload intact. `audio_capacity` is 32 by default, comfortably more
+        // than AUDIO_PACKETS, so nothing here is testing the drop policy.
+        for seq in 0..AUDIO_PACKETS {
+            let packet = tokio::time::timeout(Duration::from_secs(10), rx.audio.recv())
+                .await
+                .expect("audio timeout")
+                .expect("audio closed");
+            assert_eq!(packet.seq, seq, "audio arrived out of order");
+            assert_eq!(packet.capture_ms, 1_000 + seq);
+            assert!(!packet.discontinuity);
+            assert_eq!(packet.format, AudioFormat::Stereo48k);
+            assert_eq!(packet.data, vec![seq as u8; AUDIO_PAYLOAD_LEN]);
+        }
+
+        assert!(!session.is_closed());
+        tokio::time::timeout(Duration::from_secs(15), host_task)
+            .await
+            .unwrap()
+            .unwrap();
+        session.close("test done");
+        client_ep.wait_idle().await;
+    }
+
+    /// The proof that `Reassembler::adopt_numbering` is unreachable from audio.
+    ///
+    /// This is the failure the demux exists to prevent, stated at the level of
+    /// the thing that would break. An audio packet's bytes 0..4 are a
+    /// *sequence number* — a number line with no relationship whatever to a
+    /// video `frame_id` — so a run of audio datagrams read as video fragments
+    /// looks to `accept_frame_id` like a run of consecutive, mutually agreeing
+    /// out-of-window frame ids. That is precisely its signature for a
+    /// legitimate encoder renumbering, so past `resync_after` (8) of them it
+    /// calls `adopt_numbering`: every live slot dropped, every ready frame
+    /// dropped, the window relocated to a number line the sender is not on, and
+    /// a keyframe demanded. Video stalls, and nothing logs an error.
+    ///
+    /// So: two real video frames with a hundred real audio datagrams pushed
+    /// straight into a `Reassembler` between them, with no demux in front of it
+    /// at all. Both frames must still reassemble byte for byte, the audio must
+    /// move exactly one counter, and [`video_loss`] — the figure the adaptor
+    /// steers on — must stay a clean zero. The control group at the end clears
+    /// the one bit that carried the whole rejection and shows the same
+    /// datagrams wrecking a reassembler, so this is a test of a mechanism and
+    /// not of an accident.
+    ///
+    /// It lives beside the demux rather than in `reassembly.rs` because the
+    /// property is the demux's, and because `video_loss` — where a stall like
+    /// this would have to become visible — is defined in this module.
+    #[test]
+    fn an_audio_datagram_never_disturbs_a_reassembler() {
+        // Enough to clear `resync_after` (8) more than ten times over.
+        const AUDIO_COUNT: u32 = 100;
+
+        fn video_frame(id: u32, keyframe: bool) -> EncodedFrame {
+            EncodedFrame {
+                frame_id: id,
+                keyframe,
+                timestamp_ms: 1_000 + id,
+                data: (0..4000u32)
+                    .map(|i| (i.wrapping_add(id) % 251) as u8)
+                    .collect(),
+            }
+        }
+
+        fn frags_of(frame: &EncodedFrame) -> Vec<Vec<u8>> {
+            crate::video::fragment_frame_fec(frame, 1200, 0).expect("fragment")
+        }
+
+        // Audio datagrams whose sequence numbers are far outside the video
+        // window *and* within `max_forward_jump` of each other. Both halves
+        // matter: scattered ids would never accumulate a run, so the test would
+        // pass without ever approaching the mechanism it is about.
+        fn audio_datagrams() -> Vec<Vec<u8>> {
+            (0..AUDIO_COUNT)
+                .map(|i| {
+                    let payload = [0x5A; 64];
+                    crate::audio::encode_packet(&AudioPacket {
+                        seq: 0x4000_0000u32.wrapping_add(i),
+                        // Read as a video header this lands frag_index = 0 and
+                        // frag_count = 1, so the disguised control group below
+                        // is refused by the flag check alone rather than by
+                        // some unrelated geometry rule. Same fixture reasoning
+                        // as `audio::tests::a_real_audio_packet_is_rejected_by_
+                        // the_video_decoder`.
+                        capture_ms: 0x0001_0000,
+                        discontinuity: false,
+                        format: AudioFormat::Stereo48k,
+                        payload: &payload,
+                    })
+                    .expect("encode audio")
+                })
+                .collect()
+        }
+
+        let frame_a = video_frame(100, true);
+        let frame_b = video_frame(101, false);
+        let frags_a = frags_of(&frame_a);
+        let frags_b = frags_of(&frame_b);
+        assert!(frags_a.len() > 1, "the fixture must need reassembly");
+        assert!(
+            (frags_b.len() as u32) < ReassemblyConfig::default().resync_after,
+            "frame B must be too short to trip a resync run on its own, or the \
+             control group below would be measuring its own fixture"
+        );
+
+        let mut r = Reassembler::new(ReassemblyConfig::default());
+        for f in &frags_a {
+            r.push(f, 0).expect("video fragment");
+        }
+        assert_same_frame(&r.pop_frame().expect("frame A"), &frame_a);
+        let before = r.stats();
+
+        for datagram in &audio_datagrams() {
+            assert!(
+                audio::is_audio_datagram(datagram),
+                "the real demux would have routed this away before it got here"
+            );
+            assert!(
+                r.push(datagram, 0).is_err(),
+                "an audio datagram must never be accepted as a video fragment"
+            );
+        }
+
+        // The whole claim, in one comparison: a hundred audio datagrams may
+        // move the rejection count and may move nothing else. Not the window,
+        // not the slots, not the ready queue, not a single frame counter.
+        assert_eq!(
+            r.stats(),
+            ReassemblyStats {
+                fragments_rejected: before.fragments_rejected + u64::from(AUDIO_COUNT),
+                ..before
+            },
+            "audio disturbed reassembler state beyond the rejection count"
+        );
+
+        for f in &frags_b {
+            r.push(f, 0).expect("video fragment");
+        }
+        assert_same_frame(&r.pop_frame().expect("frame B"), &frame_b);
+
+        let after = r.stats();
+        assert_eq!(after.frames_completed, before.frames_completed + 1);
+        assert_eq!(after.frames_dropped_incomplete, 0);
+        assert_eq!(after.frames_dropped_stale, 0);
+        assert_eq!(
+            video_loss(&before, &after),
+            0.0,
+            "a hundred audio datagrams between two frames read as video loss"
+        );
+        // `adopt_numbering` raises `need_keyframe`. Frame A was a keyframe and
+        // frame B followed it with no gap, so a demand here could only have
+        // come from the audio.
+        assert!(
+            !r.take_keyframe_request(0),
+            "the audio raised a keyframe demand, which means it reached adopt_numbering"
+        );
+
+        // --- Control group: prove the premise instead of asserting it ---
+        //
+        // The same datagrams with `FLAG_AUDIO` cleared — the only thing wrong
+        // with them as far as `FragHeader::decode` is concerned — do exactly
+        // the damage described above. Without this, the assertions so far would
+        // be equally satisfied by a fixture that could never have hurt anything.
+        let mut r2 = Reassembler::new(ReassemblyConfig::default());
+        for f in &frags_a {
+            r2.push(f, 0).expect("video fragment");
+        }
+        assert_same_frame(&r2.pop_frame().expect("frame A"), &frame_a);
+        assert!(
+            !r2.take_keyframe_request(0),
+            "clean before the disguised run"
+        );
+
+        for datagram in &audio_datagrams() {
+            let mut disguised = datagram.clone();
+            disguised[crate::audio::AUDIO_FLAGS_OFFSET] &= !crate::audio::FLAG_AUDIO;
+            let _ = r2.push(&disguised, 0);
+        }
+        assert!(
+            r2.take_keyframe_request(0),
+            "the fixture must be able to trip the resync once the audio bit is gone, \
+             or this test proves nothing about that bit"
+        );
+
+        let wrecked = r2.stats();
+        for f in &frags_b {
+            let _ = r2.push(f, 0);
+        }
+        assert_eq!(
+            r2.stats().fragments_rejected,
+            wrecked.fragments_rejected + frags_b.len() as u64,
+            "with the window moved onto the audio's number line, every fragment of \
+             frame B is refused — a video stall for the life of the session, with \
+             no error logged anywhere"
+        );
+        while let Some(frame) = r2.pop_frame() {
+            assert_ne!(
+                frame.data, frame_b.data,
+                "frame B must not have survived the forged renumbering"
+            );
+        }
     }
 
     /// A `Bye` from the peer must close the session and surface the reason.
