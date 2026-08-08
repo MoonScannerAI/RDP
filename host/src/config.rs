@@ -312,7 +312,12 @@ impl Default for HostConfig {
             remote_access_enabled: true,
             udp_port: DEFAULT_UDP_PORT,
             display_name: default_display_name(),
-            quality_mode: QualityMode::Balanced,
+            // A remote *desktop* is text-first: TextDesktop's high adaptive
+            // ceiling (28 Mbps) only spends bits during scrolls and redraws,
+            // and the AIMD controller backs off when the link can't hold it —
+            // verified sustained on the real Philippines↔Ohio link at
+            // 2560x1600@60 (2026-08-08).
+            quality_mode: QualityMode::TextDesktop,
             target_fps: 60,
             bitrate_kbps: 12_000,
             bitrate_cap_kbps: None,

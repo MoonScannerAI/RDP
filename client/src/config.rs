@@ -62,7 +62,7 @@ impl Default for ClientConfig {
             display_name: String::new(),
             // This is a remote *desktop*, so text is the primary workload. TextDesktop now carries
             // the highest bitrate ceiling because sharp glyph edges are high-frequency detail and
-            // a low ceiling destroys them. Balanced caps at 15000 kbps, TextDesktop at 20000.
+            // a low ceiling destroys them. Balanced caps at 15000 kbps, TextDesktop at 28000.
             quality_mode: QualityMode::TextDesktop,
             show_diagnostics: false,
             start_fullscreen: false,
