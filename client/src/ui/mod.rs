@@ -1485,7 +1485,16 @@ impl eframe::App for ClientApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &ctx));
+        // In fullscreen the toolbar would steal rows from the video and force
+        // a fractional downscale (host desktop == monitor size leaves zero
+        // slack), so hide it unless the pointer is at the top edge or we are
+        // not actively streaming.
+        let show_toolbar = !self.fullscreen
+            || !matches!(self.state, ConnectionState::Connected)
+            || ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y < 40.0));
+        if show_toolbar {
+            egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &ctx));
+        }
 
         egui::CentralPanel::no_frame()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
