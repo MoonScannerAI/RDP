@@ -300,6 +300,27 @@ pub struct HostConfig {
     pub system_audio_redundancy: bool,
     /// Which source the audio thread pumps. See [`AudioSource`].
     pub system_audio_source: AudioSource,
+    /// Opt-in: let a client see and stream a **second** monitor beside the
+    /// primary one, and pick which monitor each stream carries.
+    ///
+    /// Default `false` for exactly the reason [`lossless_tiles_enabled`] and
+    /// [`system_audio_enabled`] are: the host is remote, so the staged rollout
+    /// ships the code first and turns it on separately. It gates
+    /// [`features::MULTI_MONITOR`], and *every* new message this feature
+    /// introduces (`MonitorList`, `SelectMonitors`, `StreamConfig`,
+    /// `StreamStopped`, and stream-tagged video datagrams) is sent only when
+    /// that bit is mutual — so with this off the host is byte-identical on the
+    /// wire to one that never heard of multiple monitors.
+    ///
+    /// The mutual-bit guarantee matters as much here as it does for audio: the
+    /// second monitor's frames share the media *datagram* path with the first,
+    /// distinguished only by `FLAG_STREAM1`, and a client that predates the
+    /// feature would hand those fragments to its one and only reassembler.
+    ///
+    /// [`lossless_tiles_enabled`]: HostConfig::lossless_tiles_enabled
+    /// [`system_audio_enabled`]: HostConfig::system_audio_enabled
+    /// [`features::MULTI_MONITOR`]: directdesk_shared::protocol::features::MULTI_MONITOR
+    pub multi_monitor_enabled: bool,
 }
 
 /// Lower/upper bounds for [`HostConfig::uac_arm_ttl_secs`].
@@ -341,6 +362,8 @@ impl Default for HostConfig {
             system_audio_kbps: 96,
             system_audio_redundancy: false,
             system_audio_source: AudioSource::Loopback,
+            // Off by default: step 1 of the rollout ships this code inert too.
+            multi_monitor_enabled: false,
         }
     }
 }
@@ -685,6 +708,29 @@ mod tests {
         assert_eq!(c.system_audio_kbps, 96);
         assert!(!c.system_audio_redundancy);
         assert_eq!(c.system_audio_source, AudioSource::Loopback);
+    }
+
+    #[test]
+    fn multi_monitor_is_off_by_default_and_roundtrips() {
+        // Rollout step 1 ships this code inert as well. `offered_features` is
+        // derived from this flag, so an off default is what makes the host
+        // advertise no MULTI_MONITOR bit — and with the bit never mutual, not
+        // one of the feature's new messages can reach a client.
+        let c = HostConfig::default().sanitized();
+        assert!(!c.multi_monitor_enabled);
+
+        let on = HostConfig {
+            multi_monitor_enabled: true,
+            ..Default::default()
+        };
+        let back: HostConfig = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.multi_monitor_enabled);
+        assert_eq!(on, back);
+
+        // An older config file predating the feature must default to OFF: the
+        // staged rollout depends on a deployed host.json not turning it on.
+        let old: HostConfig = serde_json::from_str(r#"{"udp_port":47990}"#).unwrap();
+        assert!(!old.multi_monitor_enabled);
     }
 
     #[test]

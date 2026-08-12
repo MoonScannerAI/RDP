@@ -20,7 +20,7 @@
 //! resets them, and every decision about *how much* to send is made in
 //! [`super::adaptation`]. This module spends the budget; it never sets it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ use crossbeam_channel::Receiver as CbReceiver;
 use quinn::Connection;
 
 use directdesk_shared::transport::quic;
-use directdesk_shared::video::{fragment_frame_fec, EncodedFrame};
+use directdesk_shared::video::{fragment_frame_fec_on, EncodedFrame};
 
 use crate::session::HostSession;
 
@@ -93,6 +93,25 @@ pub fn max_frame_wire_size(mtu: usize) -> usize {
     let data = frags * (chunk + FRAG_HEADER_LEN);
     let parity = frags.div_ceil(FEC_BLOCK_SIZE as usize);
     data + parity * (FRAG_HEADER_LEN + chunk)
+}
+
+/// Bytes one video pump must leave untouched for the **other** video streams.
+///
+/// The single-stream case reserves nothing and is the arithmetic that shipped:
+/// with one producer of frames the precheck in [`video_pump`] only has to fit
+/// the frame it is about to pay out, because nothing else can spend the buffer
+/// while it paces (audio holds back a whole frame of its own, see
+/// [`super::audio`]). `active_streams` of 0 or 1 therefore returns 0, byte for
+/// byte the behaviour of the code before multiple monitors existed.
+///
+/// With a second monitor selected there are two `dd-video-tx` threads on one
+/// connection and neither can see the other's frame, so each holds back one
+/// worst-case frame ([`max_frame_wire_size`]) per *other* active stream — the
+/// same "an under-estimate is the failure being prevented" reasoning the audio
+/// reserve is built on, applied symmetrically.
+pub fn video_reserve(active_streams: u8, mtu: usize) -> usize {
+    let others = active_streams.saturating_sub(1) as usize;
+    max_frame_wire_size(mtu).saturating_mul(others)
 }
 
 /// Shortest sleep Windows can actually honour, even with the 1 ms timer
@@ -176,6 +195,22 @@ impl Drop for TimerResolution {
 }
 
 /// Fragment encoded frames into datagrams, newest-first.
+///
+/// `stream` is the video stream this pump feeds: `0` is the primary and is what
+/// every peer has always received, `1` is the second monitor and rides the same
+/// datagram path tagged with `FLAG_STREAM1`. A pump is only ever spawned with
+/// `stream == 1` when `features::MULTI_MONITOR` came back mutual, so a client
+/// that predates the feature is never handed a tagged fragment.
+///
+/// `active_streams` is how many video pumps are alive on this connection right
+/// now. It is read per frame (one relaxed load) rather than captured, because
+/// the second stream can be selected and deselected mid-session and the reserve
+/// each pump holds has to follow — see [`video_reserve`].
+///
+/// `stop` is this pump's **own** flag, not the session-wide one: a slot can be
+/// retargeted at a different monitor while the rest of the session (audio,
+/// tiles, the elevation loop) carries on.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn video_pump(
     conn: Connection,
     frames: CbReceiver<EncodedFrame>,
@@ -183,6 +218,8 @@ pub(super) fn video_pump(
     streaming: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     counters: Arc<VideoCounters>,
+    stream: u8,
+    active_streams: Arc<AtomicU8>,
 ) {
     crate::session::lower_video_thread_priority("video-tx");
     let _timer = TimerResolution::acquire();
@@ -240,7 +277,16 @@ pub(super) fn video_pump(
         // is as useless as a frame that never arrived, so the result is two
         // wasted frames instead of one. Skipping cleanly here costs one frame
         // and keeps every frame that is sent decodable.
-        if conn.datagram_send_buffer_space() < wire_size(&frame, mtu, FEC_BLOCK_SIZE) {
+        //
+        // The reserve on top is what a *second* video stream costs: with two
+        // monitors selected there are two of these threads on one connection,
+        // and the sibling's frame is as invisible to this one as an audio
+        // packet is. Recomputed per frame from the live stream count and the
+        // live MTU — both move mid-session. It is zero for a single stream, so
+        // this is the exact comparison that shipped when there was only ever
+        // one monitor.
+        let reserve = video_reserve(active_streams.load(Ordering::Relaxed), mtu);
+        if conn.datagram_send_buffer_space() < wire_size(&frame, mtu, FEC_BLOCK_SIZE) + reserve {
             counters.backpressured.fetch_add(1, Ordering::Relaxed);
             if idr.allow(start.elapsed().as_millis() as u64) {
                 pipeline.request_keyframe();
@@ -260,13 +306,27 @@ pub(super) fn video_pump(
         // has already counted, and quinn's eviction then shreds the frame in
         // flight rather than refusing the newcomer.
         //
-        // The invariant is now one-sided and enforced on the *other* side:
-        // `net::audio` prechecks with `max_frame_wire_size` held back on top of
-        // its own packet, so audio can never take the room this frame reserved.
-        // Video reserves nothing in return and does not need to — one worst-case
-        // frame of slack covers whatever audio could have queued meanwhile.
-        // Any future third producer on the datagram path owes the same reserve.
-        let frags = match fragment_frame_fec(&frame, mtu, FEC_BLOCK_SIZE) {
+        // There are now up to three kinds of producer here, and the contract is
+        // no longer one-sided:
+        //
+        // - **Audio** (`net::audio`) prechecks with `max_frame_wire_size` held
+        //   back on top of its own packet, so it can never take the room a
+        //   video frame reserved. It yields to video and video reserves nothing
+        //   for it in return, because one worst-case frame of slack already
+        //   covers whatever audio could have queued meanwhile. That half is
+        //   unchanged — except that the reserve is now scaled by the number of
+        //   live video streams, since with two of them there are two frames
+        //   being paced out that audio must not displace.
+        //
+        // - **The other video stream**, when the client has selected a second
+        //   monitor. Neither pump can yield to the other (both carry the
+        //   picture, and a stream that always loses is a stream that never
+        //   arrives), so instead each holds back one worst-case frame per
+        //   sibling in the precheck above. Symmetric, and it degrades to
+        //   exactly the old arithmetic when there is only one stream.
+        //
+        // Any future producer on the datagram path owes the same reserve.
+        let frags = match fragment_frame_fec_on(&frame, mtu, FEC_BLOCK_SIZE, stream) {
             Ok(f) => f,
             Err(e) => {
                 counters
@@ -354,7 +414,7 @@ pub(super) fn video_pump(
         counters.frames_sent.fetch_add(1, Ordering::Relaxed);
         counters.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
-    tracing::debug!("video sender finished");
+    tracing::debug!(stream, "video sender finished");
 }
 
 /// How long the pump sleeps when the tile queue is empty. Tiles are a
@@ -449,8 +509,11 @@ pub(super) async fn tile_pump(
 mod tests {
     use super::*;
     // Data-only fragmenter: `wire_size` models exactly its output, so the tests
-    // that pin that relationship exercise it directly.
-    use directdesk_shared::video::fragment_frame;
+    // that pin that relationship exercise it directly. `fragment_frame_fec` is
+    // the stream-0 spelling of what the pump now calls as `..._on(.., 0)`; the
+    // two are the same function and pinning `wire_size` against either is the
+    // same assertion.
+    use directdesk_shared::video::{fragment_frame, fragment_frame_fec};
 
     // -- drop policy -------------------------------------------------------
 
@@ -589,6 +652,108 @@ mod tests {
             reserve < directdesk_shared::transport::quic::DEFAULT_DATAGRAM_SEND_BUFFER / 2,
             "a {reserve}-byte reserve would starve audio outright"
         );
+    }
+
+    // -- the two-stream reserve -------------------------------------------
+
+    #[test]
+    fn one_video_stream_reserves_exactly_nothing() {
+        // The regression guard for the whole feature's "off means byte-identical
+        // on the wire" promise on this path: with a single stream the precheck
+        // must be the comparison that shipped, not a wider one that would start
+        // dropping frames a deployed host keeps.
+        for mtu in [576usize, 1_200, 1_400, 1_500, 9_000] {
+            assert_eq!(video_reserve(0, mtu), 0, "no stream reserves nothing");
+            assert_eq!(video_reserve(1, mtu), 0, "one stream has no sibling");
+        }
+    }
+
+    #[test]
+    fn a_second_video_stream_reserves_one_whole_frame_for_its_sibling() {
+        for mtu in [576usize, 1_200, 1_400, 1_500, 9_000] {
+            assert_eq!(video_reserve(2, mtu), max_frame_wire_size(mtu));
+            // The rule is per *other* stream, so it stays honest if
+            // MAX_VIDEO_STREAMS is ever raised.
+            assert_eq!(video_reserve(3, mtu), 2 * max_frame_wire_size(mtu));
+        }
+        // And it cannot wrap into permission at an absurd stream count.
+        assert!(video_reserve(u8::MAX, 1_200) > max_frame_wire_size(1_200));
+    }
+
+    #[test]
+    fn two_streams_paying_out_plus_the_audio_reserve_need_the_widened_buffer() {
+        // The sizing argument for `MULTI_MONITOR_DATAGRAM_SEND_BUFFER`, pinned.
+        //
+        // Walk the worst ordinary moment of a two-monitor session: both streams
+        // hit a scene change at once, so both are part-way through paying a big
+        // keyframe out, and audio arrives while they are. Audio's precheck then
+        // has to find its own packet *plus* two worst-case frames free — and if
+        // it never can, the feature is not "audio yields under load", it is
+        // "enabling a second monitor silently turns the sound off".
+        //
+        // Both claims are checked against the buffer the host actually asks for
+        // when multi-monitor is enabled, and against the 2 MiB default, which
+        // this does not fit. That failing assertion is the whole reason the
+        // host widens it, so it is asserted rather than described.
+        for mtu in [1_200usize, 1_500] {
+            let widened = super::super::MULTI_MONITOR_DATAGRAM_SEND_BUFFER;
+            let default = directdesk_shared::transport::quic::DEFAULT_DATAGRAM_SEND_BUFFER;
+
+            // A real scene-change keyframe, not a synthetic worst case: the
+            // worst case is what gets *reserved*, and what gets paid out is an
+            // ordinary big frame.
+            let frame = EncodedFrame {
+                frame_id: 1,
+                keyframe: true,
+                timestamp_ms: 0,
+                data: vec![0u8; 400_000],
+            };
+            let in_flight = 2 * wire_size(&frame, mtu, FEC_BLOCK_SIZE);
+            let audio_reserve = 2 * max_frame_wire_size(mtu);
+            let want = in_flight + audio_reserve + 350; // 350 = one AAC packet
+
+            assert!(
+                want <= widened,
+                "mtu {mtu}: two keyframes in flight plus audio's two-stream \
+                 reserve is {want} bytes and the widened buffer is only {widened}"
+            );
+            assert!(
+                want > default,
+                "mtu {mtu}: this fits the {default}-byte default, so the host \
+                 has no reason to widen the buffer at all — delete the override"
+            );
+
+            // And the video side's own precheck still leaves room to work in:
+            // one stream paying out while reserving for its sibling must fit,
+            // or the second monitor would never get a frame onto the wire.
+            assert!(
+                wire_size(&frame, mtu, FEC_BLOCK_SIZE) + video_reserve(2, mtu) < widened,
+                "mtu {mtu}: a stream cannot pay out while reserving for its sibling"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_zero_fragments_are_byte_identical_to_the_untagged_fragmenter() {
+        // The pump now calls `fragment_frame_fec_on` unconditionally and passes
+        // the slot's stream id, so stream 0 has to be exactly what
+        // `fragment_frame_fec` produced before the parameter existed — right
+        // down to the flags byte, which is what a deployed client parses.
+        for len in [1usize, 100, 1_187, 5_000, 145_000] {
+            for keyframe in [false, true] {
+                let f = EncodedFrame {
+                    frame_id: 7,
+                    keyframe,
+                    timestamp_ms: 42,
+                    data: vec![0x5A; len],
+                };
+                assert_eq!(
+                    fragment_frame_fec_on(&f, 1_200, FEC_BLOCK_SIZE, 0).unwrap(),
+                    fragment_frame_fec(&f, 1_200, FEC_BLOCK_SIZE).unwrap(),
+                    "len {len} keyframe {keyframe}"
+                );
+            }
+        }
     }
 
     // -- pacing ------------------------------------------------------------
