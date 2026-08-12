@@ -141,6 +141,10 @@ fn main() -> anyhow::Result<()> {
 
     let (session, transport) = ClientSession::new();
     let slot = Arc::new(FrameSlot::new());
+    // The second monitor's frame slot. Created unconditionally — whether a
+    // session ever carries a second stream is decided per connection, in the
+    // handshake — and stays empty until one does.
+    let slot2 = Arc::new(FrameSlot::new());
 
     let mode = if args.loopback_demo {
         SourceMode::LoopbackDemo
@@ -210,6 +214,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let video_rx = session.video_rx.clone();
+    let video2_rx = session.video2_rx.clone();
     let demo_fps = args.demo_fps;
     let capture_on_start = args.capture_on_start;
     let hold_capture = args.hold_capture;
@@ -219,8 +224,11 @@ fn main() -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
-            let repaint = move || ctx.request_repaint();
-            let pipeline = match mode {
+            let repaint = {
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            };
+            let mut pipeline = match mode {
                 SourceMode::LoopbackDemo => {
                     pipeline::spawn_demo_source(slot.clone(), demo_fps, repaint)
                 }
@@ -231,6 +239,37 @@ fn main() -> anyhow::Result<()> {
                     pipeline::spawn_decode_thread(video_rx, slot.clone(), control_tx, repaint)
                 }
             };
+
+            // The second decode path, attached once here exactly like the tile
+            // and audio threads: whether a connection carries a second monitor
+            // is decided per handshake, long after this point, and the thread
+            // costs one parked poll until a stream-1 frame actually arrives (it
+            // builds no decoder before then). Wiring it here rather than on
+            // connect also means a mid-session `SelectMonitors` needs no thread
+            // plumbing at all.
+            let stream1_status = match mode {
+                SourceMode::Live => {
+                    // Repaints the *child* viewport, not the root: the second
+                    // window paints on its own cadence, which is the whole
+                    // reason it is a deferred viewport.
+                    let repaint2 = move || {
+                        ctx.request_repaint_of(
+                            directdesk_client::ui::second_window::stream1_viewport_id(),
+                        )
+                    };
+                    pipeline.attach_decode_thread(
+                        video2_rx,
+                        slot2.clone(),
+                        session.control_tx.clone(),
+                        repaint2,
+                    )
+                }
+                // `--loopback-demo` has no transport, so nothing could ever
+                // reach a second decode thread. The gauges still exist so the
+                // UI has something honest to read: it reports nothing measured.
+                SourceMode::LoopbackDemo => Arc::new(pipeline::SourceStatus::default()),
+            };
+
             Ok(Box::new(ClientApp::new(
                 cc,
                 AppInit {
@@ -238,6 +277,8 @@ fn main() -> anyhow::Result<()> {
                     session,
                     transport: transport_for_app,
                     slot,
+                    slot2,
+                    stream1_status,
                     pipeline,
                     mode,
                     supervisor,

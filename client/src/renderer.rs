@@ -266,8 +266,27 @@ pub struct VideoView {
     pub remote_h: u32,
 }
 
+/// egui texture name for the main window's video surface.
+///
+/// **Load-bearing string.** `Context::load_texture` keys the managed texture by
+/// this name, so it is effectively the main window's video surface identity for
+/// the whole process. It is spelled out as a constant rather than inlined
+/// because a second window now exists with its own name, and the two must never
+/// collide — two `Presenter`s sharing one name would fight over a single
+/// texture and each would upload over the other's picture every frame.
+pub const MAIN_VIDEO_TEXTURE: &str = "directdesk_video";
+
+/// egui texture name for the second monitor's window. See
+/// [`MAIN_VIDEO_TEXTURE`] for why these are distinct.
+pub const SECOND_VIDEO_TEXTURE: &str = "directdesk_video_1";
+
 /// Owns the egui texture and the presentation counters.
 pub struct Presenter {
+    /// Which managed texture this presenter uploads into — see
+    /// [`MAIN_VIDEO_TEXTURE`]. `&'static str` rather than `String` because
+    /// there are exactly two, both compile-time constants, and the upload path
+    /// runs once per frame.
+    texture_name: &'static str,
     texture: Option<egui::TextureHandle>,
     tex_size: [usize; 2],
     last_generation: u64,
@@ -282,9 +301,12 @@ pub struct Presenter {
 }
 
 impl Presenter {
-    pub fn new() -> Self {
+    /// `texture_name` must be [`MAIN_VIDEO_TEXTURE`] or [`SECOND_VIDEO_TEXTURE`]
+    /// — one per window, never shared (see [`MAIN_VIDEO_TEXTURE`]).
+    pub fn new(texture_name: &'static str) -> Self {
         let now = Instant::now();
         Self {
+            texture_name,
             texture: None,
             tex_size: [0, 0],
             last_generation: 0,
@@ -308,7 +330,7 @@ impl Presenter {
                             tex.set(image, opts);
                         }
                         slot_tex => {
-                            *slot_tex = Some(ctx.load_texture("directdesk_video", image, opts));
+                            *slot_tex = Some(ctx.load_texture(self.texture_name, image, opts));
                         }
                     }
                     self.last_generation = generation;
@@ -456,18 +478,17 @@ impl Presenter {
         self.last_scale.get()
     }
 
+    /// The managed-texture name this presenter uploads into.
+    pub fn texture_name(&self) -> &'static str {
+        self.texture_name
+    }
+
     /// Drop the presented image (stream stopped / reconnecting).
     pub fn reset(&mut self) {
         self.texture = None;
         self.tex_size = [0, 0];
         self.last_generation = 0;
         self.last_arrived = None;
-    }
-}
-
-impl Default for Presenter {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -494,6 +515,22 @@ mod tests {
         assert_eq!(video_texture_options(1.0).minification, Linear);
         // A nonsense scale must not panic or pick nearest.
         assert_eq!(video_texture_options(f32::NAN).magnification, Linear);
+    }
+
+    #[test]
+    fn the_two_windows_never_share_a_managed_texture() {
+        // Two `Presenter`s under one name would each upload over the other's
+        // picture every frame, so this pair must stay distinct — and the main
+        // window's name must stay EXACTLY what it has always been, since that
+        // is the identity egui's texture manager has been keyed on since M1.
+        assert_eq!(MAIN_VIDEO_TEXTURE, "directdesk_video");
+        assert_eq!(SECOND_VIDEO_TEXTURE, "directdesk_video_1");
+        assert_ne!(MAIN_VIDEO_TEXTURE, SECOND_VIDEO_TEXTURE);
+        assert_eq!(
+            Presenter::new(SECOND_VIDEO_TEXTURE).texture_name(),
+            SECOND_VIDEO_TEXTURE,
+            "the ctor argument is what reaches load_texture"
+        );
     }
 
     fn frame(w: u32, h: u32, tag: u8) -> RawFrame {

@@ -269,6 +269,64 @@ impl Pipeline {
         self.threads.push(handle);
     }
 
+    /// Spawn a **second** decode thread for the second monitor's video stream.
+    ///
+    /// The stream-1 twin of [`spawn_decode_thread`]'s thread, attached to the
+    /// pipeline that already owns stream 0 so one stop flag and one join list
+    /// still cover every thread this module spawns. Returns that stream's own
+    /// [`SourceStatus`] — the caller keeps it for per-stream diagnostics, since
+    /// [`Pipeline::status`] belongs to stream 0 and merging the two would make
+    /// every gauge a lie about both.
+    ///
+    /// Three properties make this safe to attach unconditionally at startup,
+    /// which is what lets `main` wire it once instead of racing the handshake:
+    ///
+    /// * **Its own [`DecodeLoop`]**, hence its own [`KeyframeGate`] and its own
+    ///   `frame_id` space. The two streams are two independent encoders; a gap
+    ///   on one must never gate the other.
+    /// * **A fresh, empty [`TileStore`]** rather than `self.tiles`. The store is
+    ///   never armed (only stream 0's `Reset` arms one, and that one is a
+    ///   different object), so `composite_onto` returns early on every frame —
+    ///   the "lossless refinement tiles are stream-0 only" rule costs zero new
+    ///   code and cannot be violated by a host that sends tiles anyway.
+    /// * **A lazily built decoder** (see [`DecodeLoop::ensure_decoder`]): a
+    ///   single-monitor session never receives a stream-1 frame, so it never
+    ///   builds a second Media Foundation MFT or enters a second COM apartment.
+    ///   The thread costs one parked 100 ms poll, exactly like the audio thread
+    ///   on a session that never negotiated audio.
+    pub fn attach_decode_thread(
+        &mut self,
+        video_rx: Receiver<EncodedFrame>,
+        slot: Arc<FrameSlot>,
+        control_tx: mpsc::Sender<ControlMsg>,
+        repaint: impl Fn() + Send + 'static,
+    ) -> Arc<SourceStatus> {
+        let status = Arc::new(SourceStatus::default());
+        let thread_status = status.clone();
+        let stop = self.stop.clone();
+        // Deliberately NOT `self.tiles`: see the doc comment above.
+        let tiles = Arc::new(TileStore::new());
+        let tile_highlight = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::Builder::new()
+            .name("directdesk-decode-1".into())
+            .spawn(move || {
+                let mut decode_loop = DecodeLoop::new(
+                    crate::decoder::new_decoder,
+                    thread_status,
+                    tiles,
+                    tile_highlight,
+                    slot,
+                    control_tx,
+                    repaint,
+                );
+                recv_until_stopped(&video_rx, &stop, |frame| decode_loop.handle_frame(frame));
+                tracing::info!("second decode thread exiting");
+            })
+            .expect("spawn second decode thread");
+        self.threads.push(handle);
+        status
+    }
+
     pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         for handle in self.threads.drain(..) {
@@ -303,8 +361,15 @@ pub fn spawn_decode_thread(
     let handle = std::thread::Builder::new()
         .name("directdesk-decode".into())
         .spawn(move || {
-            let mut decode_loop =
-                DecodeLoop::new(status, tiles, tile_highlight, slot, control_tx, repaint);
+            let mut decode_loop = DecodeLoop::new(
+                crate::decoder::new_decoder,
+                status,
+                tiles,
+                tile_highlight,
+                slot,
+                control_tx,
+                repaint,
+            );
             recv_until_stopped(&video_rx, &stop, |frame| decode_loop.handle_frame(frame));
             tracing::info!("decode thread exiting");
         })
@@ -324,11 +389,35 @@ pub fn spawn_decode_thread(
 /// refinement tiles, publish. It is callable directly from tests with a
 /// `NullDecoder` or a small scripted double, with no Media Foundation and no
 /// channel involved.
+/// How a [`DecodeLoop`] obtains its decoder, called at most once, on the first
+/// frame that reaches it.
+///
+/// A plain `fn` pointer for the same reason [`OpenSink`] is one: the production
+/// build sets it once, from a path that never captures, so it should not cost an
+/// allocation — and it gives the tests a seam to count constructions with,
+/// which is the only way "no decoder is built until the first frame" is
+/// observable at all.
+type NewDecoder = fn() -> Result<Box<dyn Decoder>>;
+
+/// A [`DecodeLoop`]'s decoder, which does not exist until the first frame.
+enum DecoderState {
+    /// Nothing has arrived yet, so nothing has been built. The whole point of
+    /// the second decode path: a single-monitor session parks here forever.
+    NotBuilt,
+    Ready(Box<dyn Decoder>),
+    /// Construction was attempted and failed (e.g. a platform without Media
+    /// Foundation). Every frame is then a no-op, same as before the build
+    /// became lazy — and, importantly, it is never retried: a decoder that
+    /// cannot be created will not start working on frame 200, and retrying
+    /// would turn one logged error into one per frame.
+    Unavailable,
+}
+
 struct DecodeLoop<R> {
-    /// `None` when the decoder failed to construct (e.g. a platform without
-    /// Media Foundation); every frame is then a no-op, same as before this
-    /// type existed.
-    decoder: Option<Box<dyn Decoder>>,
+    decoder: DecoderState,
+    /// Deferred construction, see [`NewDecoder`] and
+    /// [`DecodeLoop::ensure_decoder`].
+    new_decoder: NewDecoder,
     gate: KeyframeGate,
     /// Hoisted so the per-frame cost of a snapshot is a memcpy of `Arc`
     /// pointers into an already-grown buffer, never an allocation.
@@ -341,8 +430,16 @@ struct DecodeLoop<R> {
     repaint: R,
 }
 
+/// What [`SourceStatus::description`] reads before the first frame has arrived.
+///
+/// The decoder is built lazily, so there is genuinely nothing measured to
+/// report yet — and the diagnostics panel's HONESTY RULE means saying so beats
+/// naming a Media Foundation MFT that has not been created.
+const DECODER_PENDING: &str = "H.264 — decoder is created on the first frame";
+
 impl<R: Fn() + Send + 'static> DecodeLoop<R> {
     fn new(
+        new_decoder: NewDecoder,
         status: Arc<SourceStatus>,
         tiles: Arc<TileStore>,
         tile_highlight: Arc<AtomicBool>,
@@ -350,25 +447,10 @@ impl<R: Fn() + Send + 'static> DecodeLoop<R> {
         control_tx: mpsc::Sender<ControlMsg>,
         repaint: R,
     ) -> Self {
-        let decoder: Option<Box<dyn Decoder>> = match crate::decoder::new_decoder() {
-            Ok(d) => {
-                #[cfg(windows)]
-                status.set_description(
-                    "MF H.264 (CLSID_MSH264DecoderMFT), NV12→RGBA8 BT.709 limited".to_string(),
-                );
-                #[cfg(not(windows))]
-                status.set_description("H.264 decoder".to_string());
-                Some(d)
-            }
-            Err(e) => {
-                tracing::error!("decoder unavailable: {e}");
-                status.set_description("unavailable".to_string());
-                status.set_error(Some(e.to_string()));
-                None
-            }
-        };
+        status.set_description(DECODER_PENDING.to_string());
         Self {
-            decoder,
+            decoder: DecoderState::NotBuilt,
+            new_decoder,
             gate: KeyframeGate::default(),
             scratch: Vec::new(),
             status,
@@ -380,6 +462,41 @@ impl<R: Fn() + Send + 'static> DecodeLoop<R> {
         }
     }
 
+    /// Build the decoder if this is the first frame, and report whether one is
+    /// available at all.
+    ///
+    /// Deferring construction out of [`DecodeLoop::new`] is what makes a second
+    /// decode thread free to attach unconditionally: a session that streams one
+    /// monitor never receives a stream-1 frame, so it never pays for a second MF
+    /// H.264 MFT or a second COM apartment. Construction happens **on the decode
+    /// thread**, which is also where it has to happen — the MFT's apartment is
+    /// thread-affine (see `decoder.rs`), so building it from the spawning thread
+    /// would be wrong regardless of cost.
+    ///
+    /// Idempotent and non-retrying: exactly one attempt is ever made.
+    fn ensure_decoder(&mut self) -> bool {
+        if matches!(self.decoder, DecoderState::NotBuilt) {
+            self.decoder = match (self.new_decoder)() {
+                Ok(d) => {
+                    #[cfg(windows)]
+                    self.status.set_description(
+                        "MF H.264 (CLSID_MSH264DecoderMFT), NV12→RGBA8 BT.709 limited".to_string(),
+                    );
+                    #[cfg(not(windows))]
+                    self.status.set_description("H.264 decoder".to_string());
+                    DecoderState::Ready(d)
+                }
+                Err(e) => {
+                    tracing::error!("decoder unavailable: {e}");
+                    self.status.set_description("unavailable".to_string());
+                    self.status.set_error(Some(e.to_string()));
+                    DecoderState::Unavailable
+                }
+            };
+        }
+        matches!(self.decoder, DecoderState::Ready(_))
+    }
+
     /// Handle one received encoded frame end to end.
     ///
     /// Keyframe-gates it, decodes it, composites the live refinement tiles
@@ -388,11 +505,17 @@ impl<R: Fn() + Send + 'static> DecodeLoop<R> {
     /// and ask the host for a fresh keyframe (see
     /// [`flush_and_request_keyframe`]).
     fn handle_frame(&mut self, frame: EncodedFrame) {
-        let Some(decoder) = self.decoder.as_mut() else {
+        if !self.ensure_decoder() {
             return;
-        };
+        }
 
         let (admitted, request_keyframe_now) = self.gate.admit(frame.frame_id, frame.keyframe);
+        // `ensure_decoder` just returned true, so this always matches. Matching
+        // rather than unwrapping is what splits the borrow of `self.decoder`
+        // from `self.gate` above and `self.status` / `self.slot` below.
+        let DecoderState::Ready(decoder) = &mut self.decoder else {
+            return;
+        };
         if !admitted {
             self.status.record_frame_gated();
             tracing::debug!(
@@ -1443,7 +1566,12 @@ mod tests {
         repaint: R,
     ) -> DecodeLoop<R> {
         DecodeLoop {
-            decoder: Some(decoder),
+            decoder: DecoderState::Ready(decoder),
+            // Already `Ready`, so `ensure_decoder` must never reach for this.
+            // Panicking rather than returning something usable is what makes
+            // "the injected double is the decoder that ran" an assertion
+            // instead of an assumption.
+            new_decoder: || panic!("a DecodeLoop handed a decoder must not build another"),
             gate: KeyframeGate::default(),
             scratch: Vec::new(),
             status,
@@ -1453,6 +1581,53 @@ mod tests {
             slot,
             repaint,
         }
+    }
+
+    thread_local! {
+        /// How many times [`counting_new_decoder`] has been called on this
+        /// thread. Same thread-local seam (and same rationale) as
+        /// `OPEN_FAILURES` below: [`NewDecoder`] is a plain `fn` pointer, which
+        /// cannot capture, and libtest gives each `#[test]` its own thread.
+        static DECODERS_BUILT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Whether [`counting_new_decoder`] should fail instead of succeeding.
+        static DECODER_BUILD_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn counting_new_decoder() -> directdesk_shared::error::Result<Box<dyn Decoder>> {
+        DECODERS_BUILT.with(|c| c.set(c.get() + 1));
+        if DECODER_BUILD_FAILS.with(|c| c.get()) {
+            return Err(Error::Decoder("no H.264 decoder (test)".into()));
+        }
+        Ok(Box::new(NullDecoder))
+    }
+
+    fn decoders_built() -> u32 {
+        DECODERS_BUILT.with(|c| c.get())
+    }
+
+    fn reset_decoder_seam(fails: bool) {
+        DECODERS_BUILT.with(|c| c.set(0));
+        DECODER_BUILD_FAILS.with(|c| c.set(fails));
+    }
+
+    /// A [`DecodeLoop`] that has **not** built its decoder yet, so the laziness
+    /// itself is under test rather than assumed. The counterpart to
+    /// [`decode_loop_for_test`], which injects a ready-made one.
+    fn lazy_decode_loop_for_test<R: Fn() + Send + 'static>(
+        status: Arc<SourceStatus>,
+        control_tx: mpsc::Sender<ControlMsg>,
+        slot: Arc<FrameSlot>,
+        repaint: R,
+    ) -> DecodeLoop<R> {
+        DecodeLoop::new(
+            counting_new_decoder,
+            status,
+            Arc::new(TileStore::new()),
+            Arc::new(AtomicBool::new(false)),
+            slot,
+            control_tx,
+            repaint,
+        )
     }
 
     #[test]
@@ -1526,6 +1701,193 @@ mod tests {
         );
         assert_eq!(slot.decoded_count(), 0, "nothing was produced to publish");
         assert!(status.error().is_some());
+    }
+
+    #[test]
+    fn no_decoder_is_built_until_the_first_frame_arrives() {
+        // The property that makes a second decode thread free to attach at
+        // startup: a single-monitor session never gets a stream-1 frame, so it
+        // must never pay for a second Media Foundation MFT or COM apartment.
+        reset_decoder_seam(false);
+        let slot = Arc::new(FrameSlot::new());
+        let status = Arc::new(SourceStatus::default());
+        let (control_tx, _control_rx) = mpsc::channel(4);
+        let mut decode_loop =
+            lazy_decode_loop_for_test(status.clone(), control_tx, slot.clone(), || {});
+
+        assert_eq!(decoders_built(), 0, "construction must not happen in new()");
+        assert_eq!(
+            status.description(),
+            DECODER_PENDING,
+            "the panel must say what is actually true before the first frame"
+        );
+        assert!(status.error().is_none());
+
+        decode_loop.handle_frame(EncodedFrame {
+            frame_id: 1,
+            keyframe: true,
+            timestamp_ms: 0,
+            data: vec![1, 2, 3, 4],
+        });
+        assert_eq!(decoders_built(), 1, "the first frame builds the decoder");
+        assert_eq!(slot.decoded_count(), 1);
+        assert_ne!(
+            status.description(),
+            DECODER_PENDING,
+            "the description must be replaced once something real exists"
+        );
+
+        // Every later frame reuses it — a per-frame construction would be a
+        // catastrophic regression that still passed a "decodes a frame" test.
+        decode_loop.handle_frame(EncodedFrame {
+            frame_id: 2,
+            keyframe: false,
+            timestamp_ms: 1,
+            data: vec![5, 6, 7, 8],
+        });
+        assert_eq!(decoders_built(), 1, "the decoder is built at most once");
+        assert_eq!(slot.decoded_count(), 2);
+    }
+
+    #[test]
+    fn a_decoder_that_cannot_be_built_is_tried_once_and_reported() {
+        // Laziness must not turn "no decoder on this platform" into a silent
+        // failure, nor into one construction attempt (and one log line) per
+        // frame for the rest of the session.
+        reset_decoder_seam(true);
+        let slot = Arc::new(FrameSlot::new());
+        let status = Arc::new(SourceStatus::default());
+        let (control_tx, mut control_rx) = mpsc::channel(4);
+        let mut decode_loop =
+            lazy_decode_loop_for_test(status.clone(), control_tx, slot.clone(), || {});
+
+        for frame_id in 1..=3 {
+            decode_loop.handle_frame(EncodedFrame {
+                frame_id,
+                keyframe: true,
+                timestamp_ms: 0,
+                data: vec![9; 4],
+            });
+        }
+
+        assert_eq!(decoders_built(), 1, "a failed build is never retried");
+        assert_eq!(status.description(), "unavailable");
+        assert!(status.error().is_some(), "the failure must be visible");
+        assert_eq!(slot.decoded_count(), 0, "every frame is a no-op");
+        assert!(
+            control_rx.try_recv().is_err(),
+            "a missing decoder is not something a keyframe can fix"
+        );
+        reset_decoder_seam(false);
+    }
+
+    #[test]
+    fn two_decode_loops_gate_their_streams_independently() {
+        // The two video streams are two independent encoders with two
+        // independent `frame_id` spaces. If they shared a `KeyframeGate`,
+        // stream 1's ids would read as a permanent gap in stream 0 and each
+        // stream would gate the other into a frozen picture.
+        let slot0 = Arc::new(FrameSlot::new());
+        let slot1 = Arc::new(FrameSlot::new());
+        let status0 = Arc::new(SourceStatus::default());
+        let status1 = Arc::new(SourceStatus::default());
+        let (tx0, mut rx0) = mpsc::channel(4);
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let mut loop0 = decode_loop_for_test(
+            Box::new(NullDecoder),
+            status0.clone(),
+            tx0,
+            slot0.clone(),
+            || {},
+        );
+        let mut loop1 = decode_loop_for_test(
+            Box::new(NullDecoder),
+            status1.clone(),
+            tx1,
+            slot1.clone(),
+            || {},
+        );
+
+        // Stream 0 opens with an IDR and continues contiguously.
+        loop0.handle_frame(EncodedFrame {
+            frame_id: 100,
+            keyframe: true,
+            timestamp_ms: 0,
+            data: vec![1; 4],
+        });
+        loop0.handle_frame(EncodedFrame {
+            frame_id: 101,
+            keyframe: false,
+            timestamp_ms: 1,
+            data: vec![2; 4],
+        });
+
+        // Stream 1 has not seen its own IDR yet, so its deltas are refused —
+        // interleaved with, and using ids adjacent to, stream 0's.
+        loop1.handle_frame(EncodedFrame {
+            frame_id: 101,
+            keyframe: false,
+            timestamp_ms: 0,
+            data: vec![3; 4],
+        });
+        loop1.handle_frame(EncodedFrame {
+            frame_id: 102,
+            keyframe: false,
+            timestamp_ms: 1,
+            data: vec![4; 4],
+        });
+
+        assert_eq!(slot0.decoded_count(), 2, "stream 0 is unaffected");
+        assert_eq!(status0.frames_gated(), 0);
+        assert!(
+            rx0.try_recv().is_err(),
+            "stream 0 must not be dragged into stream 1's recovery"
+        );
+
+        assert_eq!(slot1.decoded_count(), 0, "stream 1 has no reference chain");
+        assert_eq!(status1.frames_gated(), 2);
+        assert!(
+            matches!(rx1.try_recv(), Ok(ControlMsg::RequestKeyframe)),
+            "stream 1 asks for its own IDR"
+        );
+
+        // And stream 1 recovers on its own IDR without touching stream 0.
+        loop1.handle_frame(EncodedFrame {
+            frame_id: 7,
+            keyframe: true,
+            timestamp_ms: 2,
+            data: vec![5; 4],
+        });
+        assert_eq!(slot1.decoded_count(), 1);
+        assert_eq!(slot0.decoded_count(), 2);
+    }
+
+    #[test]
+    fn the_second_decode_thread_is_inert_and_has_its_own_status() {
+        // Attaching the second decode path unconditionally at startup is only
+        // safe if a session that never streams a second monitor pays nothing
+        // for it: no decoder, no frames, no shared diagnostics.
+        let (video_tx, video_rx) = crossbeam_channel::unbounded::<EncodedFrame>();
+        let (control_tx, _control_rx) = mpsc::channel(4);
+        let slot2 = Arc::new(FrameSlot::new());
+        let mut pipeline = Pipeline::new(
+            Arc::new(SourceStatus::default()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let status1 = pipeline.attach_decode_thread(video_rx, slot2.clone(), control_tx, || {});
+
+        assert!(
+            !Arc::ptr_eq(&pipeline.status, &status1),
+            "stream 1 must not publish into stream 0's gauges"
+        );
+        // No frame was ever sent, so the thread parked on its poll without
+        // building anything. `shutdown` joins it, which is also what makes
+        // this assertion race-free.
+        pipeline.shutdown();
+        assert_eq!(slot2.decoded_count(), 0);
+        assert_eq!(status1.description(), DECODER_PENDING);
+        assert!(status1.error().is_none());
+        drop(video_tx);
     }
 
     #[test]
@@ -1785,7 +2147,7 @@ mod tests {
         /// so the tests' side channel is a thread-local. Each `#[test]` runs on
         /// its own thread, so no two share one.
         static OPENED_SINKS: std::cell::RefCell<Vec<SharedSink>> =
-            std::cell::RefCell::new(Vec::new());
+            const { std::cell::RefCell::new(Vec::new()) };
         /// Opens [`test_open_sink`] should fail before it starts succeeding —
         /// a client with no default render endpoint yet.
         static OPEN_FAILURES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
