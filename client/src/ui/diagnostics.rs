@@ -35,6 +35,36 @@ pub struct DiagnosticsInput<'a> {
     /// The audio path degraded to silence, and why.
     pub audio_error: Option<&'a str>,
     pub demo_mode: bool,
+    /// Stream 1's gauges, or `None` when no second stream is live this
+    /// session. The whole "Stream 1" section is omitted (not shown as
+    /// dashes) when this is `None`: unlike audio, which every live session
+    /// either negotiated or didn't, most sessions never have a second
+    /// monitor at all (`MonitorChoice::Primary` is the default), so a
+    /// permanent dashed section would read as "something is supposed to be
+    /// here" when nothing ever was.
+    pub stream1: Option<Stream1Diag<'a>>,
+}
+
+/// Stream 1 (second monitor) gauges. Built only while that stream is
+/// actually live this session — see [`DiagnosticsInput::stream1`].
+///
+/// `fps_present` / present-age are deliberately not here: the second
+/// window's `Presenter` is private to `ui::second_window` and today only
+/// exposes `fps_decode` (`SecondaryShared::fps_decode`). Widening that is a
+/// smaller, separate change than inventing a number this panel never
+/// actually measured.
+pub struct Stream1Diag<'a> {
+    pub fps_decode: f32,
+    pub source_description: &'a str,
+    pub source_error: Option<&'a str>,
+    pub frames_decoded: u64,
+    pub frames_presented: u64,
+    pub frames_dropped_at_present: u64,
+    pub remote_dims: Option<(u32, u32)>,
+    /// Delta frames [`crate::pipeline::SourceStatus::frames_gated`] refused
+    /// pending a keyframe — stream 1's own independent gate and frame_id
+    /// space, per `Pipeline::attach_decode_thread`.
+    pub frames_gated: u64,
 }
 
 /// Host stats older than this are called out as stale.
@@ -246,6 +276,46 @@ fn body(ui: &mut egui::Ui, input: DiagnosticsInput<'_>) {
             row(ui, "Mouse moves sent", input.moves_sent.to_string());
             row(ui, "Moves coalesced", input.moves_coalesced.to_string());
         });
+
+    // Omitted entirely (not a dashed section) when `None` — see the field
+    // doc on `DiagnosticsInput::stream1`.
+    if let Some(s1) = input.stream1 {
+        ui.add_space(8.0);
+        ui.heading("Stream 1 (second monitor)");
+        egui::Grid::new("diag_stream1")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                row(ui, "Source", s1.source_description.to_string());
+                row(ui, "fps decode (local)", format!("{:.1}", s1.fps_decode));
+                row(
+                    ui,
+                    "Decoded size",
+                    match s1.remote_dims {
+                        Some((w, h)) => format!("{w} x {h}"),
+                        None => DASH.to_string(),
+                    },
+                );
+                row(ui, "Frames decoded", s1.frames_decoded.to_string());
+                row(ui, "Frames presented", s1.frames_presented.to_string());
+                row(
+                    ui,
+                    "Dropped at present",
+                    s1.frames_dropped_at_present.to_string(),
+                );
+                row(
+                    ui,
+                    "Frames gated (awaiting keyframe)",
+                    s1.frames_gated.to_string(),
+                );
+            });
+        if let Some(err) = s1.source_error {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 90, 90),
+                format!("Stream 1 decoder error: {err}"),
+            );
+        }
+    }
 }
 
 fn row(ui: &mut egui::Ui, label: &str, value: String) {

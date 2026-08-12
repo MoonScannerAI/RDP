@@ -8,13 +8,19 @@
 //!   straight into the slot, bypassing H.264 entirely, so the whole UI / input
 //!   / render loop is exercisable with no network and no host.
 //!
-//! Two further optional threads hang off the same [`Pipeline`]:
+//! Further optional threads hang off the same [`Pipeline`]:
 //!
 //! * [`Pipeline::attach_tile_thread`] — feeds the lossless refinement store the
 //!   decode thread composites from.
 //! * [`Pipeline::attach_audio_thread`] — the system-audio playback path: jitter
 //!   buffer, AAC-LC decoder, WASAPI endpoint, and the two controllers that keep
 //!   the latency honest.
+//! * [`Pipeline::attach_decode_thread`] — a second, independent decode path
+//!   for the second monitor's video stream (own gate, own frame_id space,
+//!   lazy decoder construction).
+//! * [`Pipeline::attach_demo_thread`] — the demo twin of the above:
+//!   `--demo-second-window` feeds the second monitor's slot a synthetic
+//!   picture instead, so the second-window path is exercisable with no host.
 //!
 //! All of them share one stop flag and one join list, so [`Pipeline::shutdown`]
 //! (and therefore `Drop`) covers every thread this module ever spawns.
@@ -323,6 +329,36 @@ impl Pipeline {
                 tracing::info!("second decode thread exiting");
             })
             .expect("spawn second decode thread");
+        self.threads.push(handle);
+        status
+    }
+
+    /// Spawn a **second** synthetic source for `--demo-second-window`: the
+    /// demo twin of [`Pipeline::attach_decode_thread`], riding this
+    /// pipeline's existing stop flag and join list (so
+    /// [`Pipeline::shutdown`], and therefore `Drop`, already covers it) with
+    /// its own [`SourceStatus`] so the second window's diagnostics are never
+    /// a lie about the first window's.
+    ///
+    /// Exists to prove the second-window / second-slot path — open, focus,
+    /// close, per-stream diagnostics, the periodic log line — with no
+    /// transport and no host at all. `--loopback-demo` already does this for
+    /// the primary window; this extends the same idea to the second one.
+    pub fn attach_demo_thread(
+        &mut self,
+        slot: Arc<FrameSlot>,
+        fps: u32,
+        repaint: impl Fn() + Send + 'static,
+    ) -> Arc<SourceStatus> {
+        let status = Arc::new(SourceStatus::default());
+        let handle = spawn_demo_thread(
+            slot,
+            fps,
+            DemoPattern::Secondary,
+            status.clone(),
+            self.stop.clone(),
+            repaint,
+        );
         self.threads.push(handle);
         status
     }
@@ -1285,6 +1321,41 @@ impl AudioLoop {
     }
 }
 
+/// Which synthetic picture a demo thread paints.
+///
+/// Exists solely so `--demo-second-window` can feed the second monitor's
+/// frame slot a picture nobody could mistake for the primary window's — a
+/// mirrored gradient with the animated channel swapped, and the sweep bar
+/// reversed in both direction and colour — without needing a real second
+/// monitor, a second decoder, or a second host stream. The underlying motion
+/// (tick-driven gradient + sweep + binary counter) is otherwise identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoPattern {
+    /// `--loopback-demo`'s primary window.
+    Primary,
+    /// `--demo-second-window`'s second window.
+    Secondary,
+}
+
+impl DemoPattern {
+    fn thread_name(self) -> &'static str {
+        match self {
+            DemoPattern::Primary => "directdesk-demo",
+            DemoPattern::Secondary => "directdesk-demo-1",
+        }
+    }
+
+    /// Prefix for [`SourceStatus::description`], so the diagnostics panel
+    /// and the log both say which window's synthetic source this is —
+    /// mirrors [`DECODER_PENDING`]'s job on the real decode path.
+    fn description_prefix(self) -> &'static str {
+        match self {
+            DemoPattern::Primary => "loopback demo",
+            DemoPattern::Secondary => "loopback demo (2nd window)",
+        }
+    }
+}
+
 /// `--loopback-demo`: synthetic RGBA frames at `fps`, no H.264 involved.
 ///
 /// This exists to exercise the render + input + stats loop end to end with no
@@ -1295,25 +1366,49 @@ pub fn spawn_demo_source(
     fps: u32,
     repaint: impl Fn() + Send + 'static,
 ) -> Pipeline {
+    let status = Arc::new(SourceStatus::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut pipeline = Pipeline::new(status.clone(), stop.clone());
+    let handle = spawn_demo_thread(slot, fps, DemoPattern::Primary, status, stop, repaint);
+    pipeline.threads.push(handle);
+    pipeline
+}
+
+/// The synthetic-source thread body, shared by [`spawn_demo_source`] (which
+/// mints the primary window's own [`Pipeline`]) and
+/// [`Pipeline::attach_demo_thread`] (a second source riding the primary
+/// pipeline's existing stop flag and join list — the demo twin of
+/// [`Pipeline::attach_decode_thread`]).
+fn spawn_demo_thread(
+    slot: Arc<FrameSlot>,
+    fps: u32,
+    pattern: DemoPattern,
+    status: Arc<SourceStatus>,
+    stop: Arc<AtomicBool>,
+    repaint: impl Fn() + Send + 'static,
+) -> JoinHandle<()> {
     const WIDTH: u32 = 1280;
     const HEIGHT: u32 = 720;
-
-    let status = Arc::new(SourceStatus::default());
     status.set_description(format!(
-        "loopback demo: synthetic RGBA {WIDTH}x{HEIGHT} @ {fps} fps (decoder BYPASSED)"
+        "{}: synthetic RGBA {WIDTH}x{HEIGHT} @ {fps} fps (decoder BYPASSED)",
+        pattern.description_prefix()
     ));
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut pipeline = Pipeline::new(status, stop.clone());
 
     let interval = Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
-    let handle = std::thread::Builder::new()
-        .name("directdesk-demo".into())
+    std::thread::Builder::new()
+        .name(pattern.thread_name().into())
         .spawn(move || {
             let start = Instant::now();
             let mut tick: u32 = 0;
             let mut next = Instant::now();
             while !stop.load(Ordering::Relaxed) {
-                let frame = synth_frame(WIDTH, HEIGHT, tick, start.elapsed().as_millis() as u32);
+                let frame = synth_frame(
+                    WIDTH,
+                    HEIGHT,
+                    tick,
+                    start.elapsed().as_millis() as u32,
+                    pattern,
+                );
                 slot.publish(frame);
                 repaint();
                 tick = tick.wrapping_add(1);
@@ -1326,31 +1421,62 @@ pub fn spawn_demo_source(
                     next = now; // fell behind; do not spiral
                 }
             }
-            tracing::info!(frames = tick, "demo source exiting");
+            tracing::info!(
+                frames = tick,
+                pattern = format_args!("{pattern:?}"),
+                "demo source exiting"
+            );
         })
-        .expect("spawn demo thread");
-
-    pipeline.threads.push(handle);
-    pipeline
+        .expect("spawn demo thread")
 }
 
 /// Animated gradient with a sweeping bar and a binary tick counter, so motion
 /// and frame rate are verifiable by eye as well as by counter.
-fn synth_frame(width: u32, height: u32, tick: u32, timestamp_ms: u32) -> RawFrame {
+///
+/// `pattern` mirrors the x-axis gradient, swaps which channel phase-shifts,
+/// and reverses the sweep bar's direction and colour for
+/// [`DemoPattern::Secondary`] — see the type's doc for why.
+fn synth_frame(
+    width: u32,
+    height: u32,
+    tick: u32,
+    timestamp_ms: u32,
+    pattern: DemoPattern,
+) -> RawFrame {
     let (w, h) = (width as usize, height as usize);
     let mut data = vec![0u8; w * h * 4];
+    let mirrored = pattern == DemoPattern::Secondary;
 
     // Per-column values depend only on x — hoisted out of the pixel loop.
     let phase = tick % 256;
     let mut col_rb = vec![(0u8, 0u8); w];
     for (x, slot) in col_rb.iter_mut().enumerate() {
-        let r = (x * 255 / w.max(1)) as u8;
-        let b = (((x * 255 / w.max(1)) as u32 + phase) % 256) as u8;
-        *slot = (r, b);
+        let gx = if mirrored { w.saturating_sub(1) - x } else { x };
+        let base = (gx * 255 / w.max(1)) as u8;
+        let animated = (((gx * 255 / w.max(1)) as u32 + phase) % 256) as u8;
+        // Primary animates blue; Secondary mirrors x AND animates red
+        // instead — a colour swap on top of the mirror, so the two pictures
+        // are never a simple rotation of one another.
+        *slot = if mirrored {
+            (animated, base)
+        } else {
+            (base, animated)
+        };
     }
 
-    let bar = (tick as usize * 7) % w;
+    let sweep = (tick as usize * 7) % w;
+    let bar = if mirrored {
+        w.saturating_sub(1).saturating_sub(sweep)
+    } else {
+        sweep
+    };
     let bar_end = (bar + 12).min(w);
+    // White sweeping right for Primary; cyan sweeping left for Secondary.
+    let bar_color: [u8; 3] = if mirrored {
+        [0, 220, 255]
+    } else {
+        [255, 255, 255]
+    };
 
     for y in 0..h {
         let g = (y * 255 / h.max(1)) as u8;
@@ -1362,11 +1488,12 @@ fn synth_frame(width: u32, height: u32, tick: u32, timestamp_ms: u32) -> RawFram
             px[2] = b;
             px[3] = 255;
         }
-        // Sweeping white bar: unmistakable motion.
+        // Sweeping bar: unmistakable motion, and its colour/direction is the
+        // other half of what tells the two windows apart at a glance.
         for px in row[bar * 4..bar_end * 4].chunks_exact_mut(4) {
-            px[0] = 255;
-            px[1] = 255;
-            px[2] = 255;
+            px[0] = bar_color[0];
+            px[1] = bar_color[1];
+            px[2] = bar_color[2];
         }
     }
 
@@ -2719,23 +2846,55 @@ mod tests {
 
     #[test]
     fn synth_frame_is_well_formed_rgba() {
-        let f = synth_frame(64, 32, 0, 0);
-        assert_eq!(f.format, PixelFormat::Rgba8);
-        assert_eq!(f.width, 64);
-        assert_eq!(f.height, 32);
-        assert_eq!(f.data.len(), 64 * 32 * 4);
-        assert!(
-            f.data.chunks_exact(4).all(|p| p[3] == 255),
-            "must be opaque"
-        );
+        for pattern in [DemoPattern::Primary, DemoPattern::Secondary] {
+            let f = synth_frame(64, 32, 0, 0, pattern);
+            assert_eq!(f.format, PixelFormat::Rgba8);
+            assert_eq!(f.width, 64);
+            assert_eq!(f.height, 32);
+            assert_eq!(f.data.len(), 64 * 32 * 4);
+            assert!(
+                f.data.chunks_exact(4).all(|p| p[3] == 255),
+                "must be opaque ({pattern:?})"
+            );
+        }
     }
 
     #[test]
     fn synth_frame_actually_animates() {
         // If consecutive frames were identical the demo would prove nothing.
-        let a = synth_frame(64, 32, 10, 0);
-        let b = synth_frame(64, 32, 11, 33);
+        let a = synth_frame(64, 32, 10, 0, DemoPattern::Primary);
+        let b = synth_frame(64, 32, 11, 33, DemoPattern::Primary);
         assert_ne!(a.data, b.data);
+
+        let a = synth_frame(64, 32, 10, 0, DemoPattern::Secondary);
+        let b = synth_frame(64, 32, 11, 33, DemoPattern::Secondary);
+        assert_ne!(a.data, b.data);
+    }
+
+    /// `--demo-second-window`'s whole reason to exist: the two windows must
+    /// never be confusable at a glance. Same tick, same timestamp — the only
+    /// thing that can account for a difference is `pattern`.
+    #[test]
+    fn the_two_demo_patterns_are_never_the_same_picture() {
+        let primary = synth_frame(64, 32, 3, 100, DemoPattern::Primary);
+        let secondary = synth_frame(64, 32, 3, 100, DemoPattern::Secondary);
+        assert_ne!(primary.data, secondary.data);
+    }
+
+    /// `DemoPattern`'s two labels must never collide — a thread-name clash
+    /// would be silently confusing in `tracing`/process-list output, and an
+    /// identical description would defeat the whole point of tagging one
+    /// "(2nd window)" in the diagnostics panel.
+    #[test]
+    fn demo_pattern_labels_are_distinct() {
+        assert_ne!(
+            DemoPattern::Primary.thread_name(),
+            DemoPattern::Secondary.thread_name()
+        );
+        assert_ne!(
+            DemoPattern::Primary.description_prefix(),
+            DemoPattern::Secondary.description_prefix()
+        );
     }
 
     #[test]
@@ -2815,5 +2974,45 @@ mod tests {
             slot.decoded_count()
         );
         assert_eq!(slot.remote_dims(), Some((1280, 720)));
+    }
+
+    /// `--demo-second-window`: a second synthetic source, attached to the
+    /// *same* pipeline as the primary demo source, feeding a *different*
+    /// slot with its own `SourceStatus` — proving the two are independent
+    /// (own counters, own description) and that `Pipeline::shutdown` stops
+    /// both threads, not just the one it was originally built with.
+    #[test]
+    fn attach_demo_thread_feeds_its_own_slot_independently_of_the_primary() {
+        let slot1 = Arc::new(FrameSlot::new());
+        let slot2 = Arc::new(FrameSlot::new());
+        let mut pipeline = spawn_demo_source(slot1.clone(), 200, || {});
+        let stream1_status = pipeline.attach_demo_thread(slot2.clone(), 200, || {});
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (slot1.decoded_count() < 5 || slot2.decoded_count() < 5) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pipeline.shutdown();
+
+        assert!(
+            slot1.decoded_count() >= 5,
+            "primary: {}",
+            slot1.decoded_count()
+        );
+        assert!(
+            slot2.decoded_count() >= 5,
+            "secondary: {}",
+            slot2.decoded_count()
+        );
+        assert_eq!(slot2.remote_dims(), Some((1280, 720)));
+        // Its own status, distinguishable in the diagnostics panel and the
+        // log from the primary window's `pipeline.status`.
+        assert!(stream1_status.description().contains("2nd window"));
+        assert_eq!(
+            stream1_status.frames_gated(),
+            0,
+            "demo bypasses the gate entirely"
+        );
     }
 }

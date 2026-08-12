@@ -97,6 +97,14 @@ pub struct AppInit {
     /// release chord, tears it down). Lets the capture path be exercised on a
     /// machine where another app keeps stealing foreground focus.
     pub hold_capture: bool,
+    /// Test aid (`--demo-second-window`): the caller has already attached a
+    /// second synthetic source to `slot2` (mirroring `--loopback-demo`'s
+    /// primary source), so open the second window immediately rather than
+    /// waiting for a `MonitorList` that a loopback session will never
+    /// receive. `main`'s arg parsing rejects this flag without
+    /// `--loopback-demo`, so it is meaningless (and never set) under
+    /// `SourceMode::Live`.
+    pub demo_second_window: bool,
 }
 
 pub struct ClientApp {
@@ -315,7 +323,9 @@ impl ClientApp {
             ))),
             stream1_slot: init.slot2,
             stream1_status: init.stream1_status,
-            stream1_window_open: false,
+            // Normally waits for a `MonitorList`/toolbar click; `--demo-second-window`
+            // has no host to send either, so it starts the window open directly.
+            stream1_window_open: init.demo_second_window,
             stream1_intent: SecondWindowIntent::default(),
             stream1_video: None,
             stream1_monitor: None,
@@ -682,7 +692,7 @@ impl ClientApp {
     /// and there is a live session behind it. Both halves are required — see
     /// the call site in `ui` for the channel-ordering reason.
     fn second_window_visible(&self) -> bool {
-        self.stream1_window_open && self.state.is_live()
+        stream1_should_be_visible(self.stream1_window_open, self.state.is_live())
     }
 
     /// Does the second monitor's window have focus right now?
@@ -1685,6 +1695,29 @@ impl ClientApp {
         let error = self.pipeline.status.error();
         let audio = self.pipeline.audio_snapshot();
         let audio_error = self.pipeline.audio_error();
+
+        // Computed unconditionally (all cheap: an atomic load or a brief
+        // mutex lock, the same cost `log_metrics` already pays every 2 s and
+        // this pays every frame the panel is open) but only ever shown
+        // through `stream1`, which is `None` unless the window is actually
+        // live right now — see `stream1_should_be_visible`. Nothing here is
+        // fabricated for a session that never had a second stream; it is
+        // simply never read in that case.
+        let stream1_description = self.stream1_status.description();
+        let stream1_error = self.stream1_status.error();
+        let stream1 = self
+            .second_window_visible()
+            .then(|| diagnostics::Stream1Diag {
+                fps_decode: self.stream1.lock().fps_decode(),
+                source_description: &stream1_description,
+                source_error: stream1_error.as_deref(),
+                frames_decoded: self.stream1_slot.decoded_count(),
+                frames_presented: self.stream1_slot.presented_count(),
+                frames_dropped_at_present: self.stream1_slot.dropped_at_present(),
+                remote_dims: self.stream1_slot.remote_dims(),
+                frames_gated: self.stream1_status.frames_gated(),
+            });
+
         diagnostics::show(
             ctx,
             &mut open,
@@ -1705,6 +1738,7 @@ impl ClientApp {
                 audio,
                 audio_error: audio_error.as_deref(),
                 demo_mode: self.mode == SourceMode::LoopbackDemo,
+                stream1,
             },
         );
         self.show_diagnostics = open;
@@ -2097,6 +2131,22 @@ pub fn plan_monitor_list(
 /// change either, since there is nothing yet to contradict.
 pub fn stream1_format_changed(prev: Option<(u32, u32, u32, u32)>, width: u32, height: u32) -> bool {
     prev.is_some_and(|(w, h, _, _)| (w, h) != (width, height))
+}
+
+/// Pure core of [`ClientApp::second_window_visible`]: does the second window
+/// — and by extension its per-frame diagnostics section and its line in
+/// [`ClientApp::log_metrics`] — exist right now?
+///
+/// Split out so "no second stream this session" (either input `false`) is a
+/// plain unit test rather than something only checkable by eye against a live
+/// window. A closed window's counters are stale the instant it closes (its
+/// slot is cleared in the same call, see `close_second_window`), so the same
+/// gate that decides whether the OS window exists also decides whether the
+/// diagnostics panel's "Stream 1" section — and the log's "stream 1 metrics"
+/// line — exist: showing either from a window that is not currently up would
+/// be either empty or lying, and the panel's HONESTY RULE forbids both.
+fn stream1_should_be_visible(window_open: bool, live: bool) -> bool {
+    window_open && live
 }
 
 /// The notice for a host that never sent a `MonitorList` at all.
@@ -2666,6 +2716,29 @@ mod tests {
         assert!(stream1_format_changed(base, 2560, 1080));
         // The first config of a stream is not a change: nothing to contradict.
         assert!(!stream1_format_changed(None, 2560, 1440));
+    }
+
+    /// Feeds `ClientApp::diagnostics_window`'s `stream1: Option<Stream1Diag>`
+    /// and `log_metrics`'s "stream 1 metrics" line, so this is the
+    /// end-to-end proof of the panel's own claim: "no second stream this
+    /// session" (never opened, or the session is not live) must mean
+    /// `None`, never a section of zeros.
+    #[test]
+    fn stream1_diagnostics_are_none_with_no_second_stream_this_session() {
+        assert!(
+            !stream1_should_be_visible(false, true),
+            "never opened this session"
+        );
+        assert!(
+            !stream1_should_be_visible(true, false),
+            "window flag set but the session is not live (e.g. disconnected)"
+        );
+        assert!(!stream1_should_be_visible(false, false));
+    }
+
+    #[test]
+    fn stream1_diagnostics_appear_once_the_window_is_actually_live() {
+        assert!(stream1_should_be_visible(true, true));
     }
 
     #[test]
