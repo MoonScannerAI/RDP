@@ -2032,10 +2032,7 @@ mod tests {
         }
 
         fn hw(name: &'static str, works: bool) -> (Candidate, EncoderPath) {
-            (
-                Candidate { name, works },
-                EncoderPath::HardwareSameAdapter,
-            )
+            (Candidate { name, works }, EncoderPath::HardwareSameAdapter)
         }
 
         fn sw(name: &'static str, works: bool) -> (Candidate, EncoderPath) {
