@@ -22,6 +22,7 @@ use crate::connect::ConnectSupervisor;
 use crate::input_capture::{
     is_release_chord, wheel_delta, CaptureLoss, InputCapture, RELEASE_CHORD,
 };
+use crate::monitors::{self, MonitorChoice};
 use crate::pipeline::Pipeline;
 use crate::renderer::{describe_scale, is_exact_scale, FrameSlot, Presenter, VideoView};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
@@ -197,6 +198,7 @@ impl ClientApp {
         let mut supervisor = init.supervisor;
         if let Some(sup) = supervisor.as_mut() {
             sup.set_preferred_fps(init.config.preferred_fps);
+            sup.set_monitor_choice(init.config.monitor_choice);
         }
 
         // Lossless refinement tiles. The store belongs to the pipeline (the
@@ -925,11 +927,51 @@ impl ClientApp {
                         self.session.send_control(ControlMsg::QualityChange(chosen));
                     }
                     ui.end_row();
+
+                    ui.label("Monitors");
+                    let current_choice = self.config.monitor_choice;
+                    let mut chosen_choice = current_choice;
+                    // Only trust the cache when it was written for exactly the
+                    // host currently typed into the form — never a stale cache
+                    // from a previous host reused by accident.
+                    let cache_matches_host = !self.config.cached_monitor_host.is_empty()
+                        && self.config.cached_monitor_host == self.address_input.trim();
+                    let selected_label = monitors::picker_label(
+                        current_choice,
+                        &self.config.cached_monitors,
+                        cache_matches_host,
+                    );
+                    egui::ComboBox::from_id_salt("monitor_choice")
+                        .selected_text(selected_label)
+                        .show_ui(ui, |ui| {
+                            for choice in
+                                [MonitorChoice::Primary, MonitorChoice::Second, MonitorChoice::Both]
+                            {
+                                let option_label = monitors::picker_label(
+                                    choice,
+                                    &self.config.cached_monitors,
+                                    cache_matches_host,
+                                );
+                                if ui
+                                    .selectable_label(current_choice == choice, option_label)
+                                    .clicked()
+                                {
+                                    chosen_choice = choice;
+                                }
+                            }
+                        });
+                    if chosen_choice != current_choice {
+                        self.config.monitor_choice = chosen_choice;
+                    }
+                    ui.end_row();
                 });
 
             ui.add_space(6.0);
             ui.weak("Enter the code shown on the host's 'Pair new device' window.");
             ui.weak("Leave the code blank to reconnect to a host you have paired before.");
+            ui.weak(
+                "Monitors: applied if the host reports more than one — otherwise primary only.",
+            );
 
             ui.add_space(12.0);
             // The button names the action it will take, so pairing vs. reconnect
@@ -1039,6 +1081,11 @@ impl ClientApp {
             pairing = request.pairing_code.is_some(),
             "connect requested"
         );
+        // Seeded once at startup (`ClientApp::new`), but the picker can change
+        // the choice afterwards without a reconnect happening in between — push
+        // the current config value so this connect carries whatever is showing
+        // in the combo right now, not a stale one from launch.
+        supervisor.set_monitor_choice(self.config.monitor_choice);
         supervisor.connect(request);
 
         // The route stays unknown until the transport reports one; the driver

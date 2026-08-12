@@ -39,6 +39,7 @@ use directdesk_shared::video::EncodedFrame;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::monitors::MonitorChoice;
 use crate::net::{self, ConnectParams};
 use crate::session::{ConnectionState, TransportEndpoints, CONTROL_QUEUE_DEPTH, INPUT_QUEUE_DEPTH};
 use directdesk_shared::protocol::InputMsg;
@@ -70,6 +71,12 @@ pub struct StreamCaps {
     /// user of an audio-enabled host had to find a second switch to get the
     /// feature the operator already turned on.
     pub system_audio: bool,
+    /// Which outputs to ask the host for. Default `Primary` — a single
+    /// stream, exactly today's behaviour; `Second`/`Both` only take effect
+    /// once the host echoes `features::MULTI_MONITOR` (wired in milestone
+    /// C2). Seeded from [`crate::config::ClientConfig::monitor_choice`] and
+    /// updated live by [`ConnectSupervisor::set_monitor_choice`].
+    pub monitor_choice: MonitorChoice,
 }
 
 impl Default for StreamCaps {
@@ -85,6 +92,7 @@ impl Default for StreamCaps {
             preferred_fps: 0,
             lossless_tiles: true,
             system_audio: true,
+            monitor_choice: MonitorChoice::default(),
         }
     }
 }
@@ -114,6 +122,7 @@ impl ConnectRequest {
             preferred_fps: caps.preferred_fps,
             lossless_tiles: caps.lossless_tiles,
             system_audio: caps.system_audio,
+            monitor_choice: caps.monitor_choice,
         }
     }
 }
@@ -205,6 +214,16 @@ impl ConnectSupervisor {
     /// directly on the session's control channel.
     pub fn set_preferred_fps(&mut self, fps: u32) {
         self.caps.preferred_fps = fps;
+    }
+
+    /// Update the monitor choice the *next* `connect()` carries, for the same
+    /// reason and with the same scope as [`set_preferred_fps`](Self::set_preferred_fps):
+    /// it does not touch a currently-live connection. A mid-session change is
+    /// the UI's job (re-sending `ControlMsg::SelectMonitors` directly, wired
+    /// in milestone C2) so that a driver mid-reconnect still picks up the
+    /// operator's latest choice rather than the one in effect when it started.
+    pub fn set_monitor_choice(&mut self, choice: MonitorChoice) {
+        self.caps.monitor_choice = choice;
     }
 
     /// Spawn `run_client` for `request`, cancelling any prior attempt first so a

@@ -91,6 +91,7 @@ use directdesk_shared::transport::session::{QuicSession, Session, SessionConfig,
 use quinn::{Connection, Endpoint};
 use tokio::sync::watch;
 
+use crate::monitors::MonitorChoice;
 use crate::session::{ConnectionState, TransportEndpoints};
 
 /// `Hello.features` bit the client sets to *hint* it intends to pair rather
@@ -137,6 +138,11 @@ pub struct ConnectParams {
     /// See [`crate::connect::StreamCaps::system_audio`] for why the client's
     /// default is `true` while the host's is `false`.
     pub system_audio: bool,
+    /// Which outputs to ask the host for once `features::MULTI_MONITOR`
+    /// comes back mutual. Carried through the handshake starting in
+    /// milestone C2; this build sets it from [`crate::connect::StreamCaps`]
+    /// but nothing yet reads it on the wire side.
+    pub monitor_choice: MonitorChoice,
 }
 
 impl ConnectParams {
@@ -276,6 +282,9 @@ pub async fn run_client(
             },
             // The client is the receiving end of a one-directional video path.
             receive_video: true,
+            // The second monitor's stream. Off until the client actually
+            // selects a second monitor; nothing here does yet.
+            receive_video_1: false,
             // And of the audio path, which is one-directional the same way.
             // Left unconditionally on rather than gated on `system_audio`: a
             // host that did not echo the bit sends no audio datagrams at all,
@@ -1147,6 +1156,7 @@ mod tests {
             preferred_fps: 60,
             lossless_tiles: true,
             system_audio: true,
+            monitor_choice: MonitorChoice::default(),
         };
         match p.start_stream() {
             ControlMsg::StartStream {

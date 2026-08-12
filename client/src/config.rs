@@ -6,8 +6,18 @@
 
 use std::path::PathBuf;
 
-use directdesk_shared::protocol::{QualityMode, DEFAULT_UDP_PORT, MAX_TARGET_FPS, MIN_TARGET_FPS};
+use directdesk_shared::protocol::{
+    MonitorInfo, QualityMode, DEFAULT_UDP_PORT, MAX_MONITORS, MAX_TARGET_FPS, MIN_TARGET_FPS,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::monitors::MonitorChoice;
+
+/// Cap on a cached [`MonitorInfo::name`] in `sanitized()`. Matches the cap the
+/// host itself applies when it enumerates (see the field's own docs on
+/// `MonitorInfo`) — this is a defensive re-clamp for a hand-edited config
+/// file, not a new limit.
+const MAX_CACHED_MONITOR_NAME_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,6 +62,25 @@ pub struct ClientConfig {
     /// build — `auto_snap_scale` is the source of truth going forward.
     #[serde(default)]
     auto_snap_1to1: bool,
+    /// Which outputs the operator asked for. Default `Primary` — a config
+    /// written before multi-monitor existed must keep behaving exactly like
+    /// today's single-stream client.
+    #[serde(default)]
+    pub monitor_choice: MonitorChoice,
+    /// Host address the fields below were cached from. Only a label aid for
+    /// the connect-screen picker — never compared for anything but an exact
+    /// match against the host currently typed into the form. Empty means "no
+    /// cache", and `sanitized()` enforces that `cached_monitors` is empty
+    /// whenever this is.
+    #[serde(default)]
+    pub cached_monitor_host: String,
+    /// The last `MonitorList` seen from `cached_monitor_host`, so the picker
+    /// can show real dimensions/names before the next connect even starts.
+    /// Display only — never parsed, never used to address a monitor; see
+    /// `MonitorInfo::name`'s own docs for why the wire type already treats it
+    /// that way.
+    #[serde(default)]
+    pub cached_monitors: Vec<MonitorInfo>,
 }
 
 impl Default for ClientConfig {
@@ -70,6 +99,9 @@ impl Default for ClientConfig {
             preferred_fps: 0,
             auto_snap_scale: 0,
             auto_snap_1to1: false,
+            monitor_choice: MonitorChoice::default(),
+            cached_monitor_host: String::new(),
+            cached_monitors: Vec::new(),
         }
     }
 }
@@ -149,8 +181,38 @@ impl ClientConfig {
         if self.auto_snap_scale > 3 {
             self.auto_snap_scale = 0;
         }
+        // The cache is only meaningful tied to a host; an empty host with a
+        // non-empty list is not a state this build ever writes, but a
+        // hand-edited file could claim it — treat it as no cache at all.
+        if self.cached_monitor_host.is_empty() {
+            self.cached_monitors.clear();
+        }
+        // A peer-declared count is never trusted verbatim even after landing
+        // in a config file: cap it at the same MAX_MONITORS the wire itself
+        // enforces (see `MonitorInfo`'s docs) rather than a fresh number.
+        if self.cached_monitors.len() > MAX_MONITORS {
+            self.cached_monitors.truncate(MAX_MONITORS);
+        }
+        for m in &mut self.cached_monitors {
+            truncate_str_bytes(&mut m.name, MAX_CACHED_MONITOR_NAME_BYTES);
+        }
         self
     }
+}
+
+/// Truncate `s` to at most `max_bytes` bytes, backing off to the nearest
+/// earlier char boundary so this never panics or splits a multi-byte
+/// character (unlike `String::truncate`, which requires the caller to
+/// already know the string is ASCII at that offset).
+fn truncate_str_bytes(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
 }
 
 #[cfg(test)]
@@ -191,6 +253,11 @@ mod tests {
         // A config written before integer-scale snapping existed must not
         // silently turn it on.
         assert_eq!(back.auto_snap_scale, 0);
+        // A config written before multi-monitor existed must keep behaving
+        // like today's single-stream client: Primary, no cache.
+        assert_eq!(back.monitor_choice, MonitorChoice::Primary);
+        assert_eq!(back.cached_monitor_host, "");
+        assert!(back.cached_monitors.is_empty());
     }
 
     #[test]
@@ -225,6 +292,75 @@ mod tests {
         }
         .sanitized();
         assert_eq!(c.auto_snap_scale, 0);
+    }
+
+    #[test]
+    fn orphan_monitor_cache_is_cleared_when_the_host_is_empty() {
+        // A hand-edited (or otherwise inconsistent) file could carry a
+        // non-empty cache with no host to anchor it to; sanitized() must
+        // drop the cache rather than let the picker attribute it to
+        // whatever host the operator later types in.
+        let c = ClientConfig {
+            cached_monitor_host: String::new(),
+            cached_monitors: vec![MonitorInfo {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                origin_x: 0,
+                origin_y: 0,
+                is_primary: true,
+                name: "A".into(),
+            }],
+            ..Default::default()
+        }
+        .sanitized();
+        assert!(c.cached_monitors.is_empty());
+    }
+
+    #[test]
+    fn oversized_monitor_cache_is_truncated_to_max_monitors() {
+        let cached_monitors = (0..(MAX_MONITORS as u8 + 5))
+            .map(|id| MonitorInfo {
+                id,
+                width: 1920,
+                height: 1080,
+                origin_x: 0,
+                origin_y: 0,
+                is_primary: id == 0,
+                name: "A".into(),
+            })
+            .collect();
+        let c = ClientConfig {
+            cached_monitor_host: "pc.lan".into(),
+            cached_monitors,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(c.cached_monitors.len(), MAX_MONITORS);
+    }
+
+    #[test]
+    fn oversized_cached_monitor_name_is_truncated_at_a_char_boundary() {
+        // A multi-byte character sitting right at the cut point must not
+        // panic `String::truncate`; the helper backs off to the nearest
+        // earlier boundary instead of splitting it.
+        let long_name: String = "é".repeat(40); // 80 bytes, 40 chars
+        let c = ClientConfig {
+            cached_monitor_host: "pc.lan".into(),
+            cached_monitors: vec![MonitorInfo {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                origin_x: 0,
+                origin_y: 0,
+                is_primary: true,
+                name: long_name,
+            }],
+            ..Default::default()
+        }
+        .sanitized();
+        assert!(c.cached_monitors[0].name.len() <= MAX_CACHED_MONITOR_NAME_BYTES);
+        assert!(c.cached_monitors[0].name.is_char_boundary(c.cached_monitors[0].name.len()));
     }
 
     #[test]
@@ -298,5 +434,8 @@ mod tests {
         assert!(c.capture_in_background);
         assert_eq!(c.preferred_fps, 30);
         assert_eq!(c.auto_snap_scale, 2);
+        // Nothing in this file has ever heard of multi-monitor either.
+        assert_eq!(c.monitor_choice, MonitorChoice::Primary);
+        assert!(c.cached_monitors.is_empty());
     }
 }

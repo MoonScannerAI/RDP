@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use directdesk_client::monitors::MonitorChoice;
 use directdesk_client::net::{run_client, ConnectParams, FEATURE_PAIRING_REQUEST};
 use directdesk_client::session::{ClientSession, ConnectionState};
 use directdesk_shared::crypto::auth::{
@@ -463,6 +464,7 @@ fn pair_params(addr: SocketAddr, code: &str) -> ConnectParams {
         preferred_fps: 60,
         lossless_tiles: true,
         system_audio: true,
+        monitor_choice: MonitorChoice::default(),
     }
 }
 
@@ -747,6 +749,7 @@ async fn mismatched_spki_pin_is_rejected() {
         preferred_fps: 60,
         lossless_tiles: true,
         system_audio: true,
+        monitor_choice: MonitorChoice::default(),
     };
     let (client, shutdown, client_task) = spawn_client(params, store);
 
