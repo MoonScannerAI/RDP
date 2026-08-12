@@ -668,6 +668,11 @@ fn both_new_single_monitor() {
 ///
 /// * `SelectMonitors { ids: [0, 1] }` produces `StreamConfig { id: 1, monitor:
 ///   1, .. }` — and stream 0 is still described by the legacy `VideoConfig`.
+/// * `StartStream`'s reply carries them **in that order**: the legacy
+///   `VideoConfig` first, the `StreamConfig { id: 1, .. }` after it, exactly as
+///   the client's handshake documentation specifies. Asserted strictly, because
+///   a client that is told a second stream exists before it has been told the
+///   primary's format is holding a window it cannot yet place.
 /// * The two lanes really are independent: tagged and untagged datagrams go to
 ///   two [`Reassembler`]s with **separate frame-id spaces**, and both complete
 ///   frames. One shared reassembler would reject half the traffic outright,
@@ -776,6 +781,59 @@ fn both_new_dual_monitor() {
         assert!(
             poll_until(REPLY_TIMEOUT, || tally.video_configs() > 0).await,
             "stream 0 got no legacy VideoConfig while a second stream was live"
+        );
+
+        // --- and in the order the contract specifies -----------------------
+        //
+        // Strict, not order-agnostic. `StartStream`'s reply is the legacy
+        // `VideoConfig` for stream 0 FIRST and the `StreamConfig { id: 1, .. }`
+        // after it. The client sizes its main window from the former, so one
+        // handed the second stream's geometry first is holding a window it
+        // cannot place until the primary's format turns up.
+        //
+        // Both messages appear more than once in this scenario, so the
+        // assertion is on the LAST of each: `SelectMonitors { [0, 1] }`
+        // announced stream 1 when it built it, and `StartStream` re-announces
+        // it because `set_mode` has just moved the whole budget. The host's
+        // control loop handles the two client messages in the order they were
+        // sent, so the expected sequence is exactly Stream(1), Video,
+        // Stream(1) — and waiting for the *second* Stream(1) is what makes
+        // this a fact rather than a race against the tail of the same reply.
+        assert!(
+            poll_until(REPLY_TIMEOUT, || {
+                let o = tally.config_order();
+                o.iter().filter(|c| **c == SeenConfig::Stream(1)).count() >= 2
+                    && o.contains(&SeenConfig::Video)
+            })
+            .await,
+            "StartStream did not produce both a legacy VideoConfig and a \
+             re-announced StreamConfig {{ id: 1 }} within {REPLY_TIMEOUT:?}; the \
+             format messages observed were {:?}",
+            tally.config_order()
+        );
+        let order = tally.config_order();
+        println!("reply order  : {order:?}");
+        let last_video = order
+            .iter()
+            .rposition(|c| *c == SeenConfig::Video)
+            .expect("a VideoConfig was recorded");
+        let last_stream1 = order
+            .iter()
+            .rposition(|c| *c == SeenConfig::Stream(1))
+            .expect("a StreamConfig { id: 1 } was recorded");
+        assert!(
+            last_video < last_stream1,
+            "the StartStream reply sent StreamConfig {{ id: 1 }} BEFORE the \
+             legacy VideoConfig. The client's handshake documentation specifies \
+             the legacy VideoConfig for stream 0 first and the StreamConfig \
+             after it, and VideoConfig is the message the main window is sized \
+             from. Observed: {order:?}"
+        );
+        assert!(
+            !order.contains(&SeenConfig::Stream(0)),
+            "a StreamConfig {{ id: 0 }} arrived; stream 0 is described by the \
+             legacy VideoConfig and StreamConfig is for id != 0 only. \
+             Observed: {order:?}"
         );
 
         // --- the two lanes ------------------------------------------------
@@ -1339,6 +1397,30 @@ struct SeenStreamConfig {
     height: u32,
 }
 
+/// One of the two format messages, recorded so a scenario can assert on the
+/// ORDER they arrived in and not merely on their counts.
+///
+/// The host's contract with the client's handshake documentation is "the legacy
+/// `VideoConfig` for stream 0, and a `StreamConfig { id: 1, .. }` after it when a
+/// second stream is live" — a *relative* ordering, which no counter can see.
+/// `VideoConfig` is the message the client sizes its main window from, so being
+/// handed the second stream's geometry first leaves it with a window it cannot
+/// place.
+///
+/// The ordering is a property of the `StartStream` **reply**, not of the session:
+/// a client sends `SelectMonitors` first, and the host announces slot 1 when it
+/// builds it, so the first format message on a two-monitor session is a
+/// `StreamConfig`. That is why this is a log rather than a pair of flags — the
+/// assertion has to name *which* pair it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeenConfig {
+    /// The legacy `VideoConfig`: stream 0, and the only format message a client
+    /// that never heard of a second monitor understands.
+    Video,
+    /// `StreamConfig`, by stream id.
+    Stream(u8),
+}
+
 /// What the client observed, accumulated by background tasks so a test can ask
 /// at any moment.
 #[derive(Default)]
@@ -1359,6 +1441,11 @@ struct Tally {
     stream_configs: AtomicU64,
     stream_stoppeds: AtomicU64,
     last_stream_config: Mutex<Option<SeenStreamConfig>>,
+    /// Every `VideoConfig` and `StreamConfig` in arrival order. One mutex, so a
+    /// scenario that polls it and then asserts from it is reading a single
+    /// consistent snapshot — the relative order of two messages cannot be read
+    /// out of two independent counters without a race.
+    config_order: Mutex<Vec<SeenConfig>>,
     stopped_ids: Mutex<Vec<u8>>,
     /// The first new-vocabulary message seen, verbatim, so a compatibility
     /// failure names the message rather than only counting it.
@@ -1411,6 +1498,9 @@ impl Tally {
     }
     fn last_stream_config(&self) -> Option<SeenStreamConfig> {
         *self.last_stream_config.lock()
+    }
+    fn config_order(&self) -> Vec<SeenConfig> {
+        self.config_order.lock().clone()
     }
     fn stopped_ids(&self) -> Vec<u8> {
         self.stopped_ids.lock().clone()
@@ -1543,6 +1633,7 @@ fn spawn_pump(rx: SessionReceivers) -> Arc<Tally> {
                         tally.host_stats.fetch_add(1, Ordering::Relaxed);
                     }
                     Some(ControlMsg::VideoConfig { width, height, .. }) => {
+                        tally.config_order.lock().push(SeenConfig::Video);
                         tally.video_configs.fetch_add(1, Ordering::Relaxed);
                         *tally.last_video_config.lock() = Some((width, height));
                     }
@@ -1557,6 +1648,7 @@ fn spawn_pump(rx: SessionReceivers) -> Arc<Tally> {
                     Some(ControlMsg::StreamConfig {
                         id, monitor, width, height, ..
                     }) => {
+                        tally.config_order.lock().push(SeenConfig::Stream(id));
                         tally.stream_configs.fetch_add(1, Ordering::Relaxed);
                         *tally.last_stream_config.lock() = Some(SeenStreamConfig {
                             id, monitor, width, height,

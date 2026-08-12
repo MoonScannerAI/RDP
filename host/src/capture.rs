@@ -930,7 +930,9 @@ fn select_output(candidates: &[CandidateInfo], selector: &MonitorSelector) -> Op
 /// Enumerate outputs, apply `selector`, and build the [`AdapterInfo`] the
 /// caller needs to finish constructing the capture. The glue between the pure
 /// [`select_output`] and the COM handles [`enumerate_outputs`] collected.
-fn resolve_output(selector: &MonitorSelector) -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
+fn resolve_output(
+    selector: &MonitorSelector,
+) -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
     let outputs = enumerate_outputs()?;
     if outputs.is_empty() {
         return Err(Error::Capture(
@@ -1127,10 +1129,7 @@ mod tests {
             device_name: r"\\.\DISPLAY2".into(),
             origin: (0, 0), // deliberately stale too.
         };
-        assert_eq!(
-            select_output(&cands, &MonitorSelector::Key(key)),
-            Some(1)
-        );
+        assert_eq!(select_output(&cands, &MonitorSelector::Key(key)), Some(1));
     }
 
     #[test]
@@ -1147,10 +1146,7 @@ mod tests {
             device_name: r"\\.\DISPLAY2".into(),
             origin: (1920, 0),
         };
-        assert_eq!(
-            select_output(&cands, &MonitorSelector::Key(key)),
-            Some(1)
-        );
+        assert_eq!(select_output(&cands, &MonitorSelector::Key(key)), Some(1));
     }
 
     #[test]

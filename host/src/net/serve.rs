@@ -176,6 +176,30 @@ enum SlotChange {
     Start { slot: u8, monitor: u8 },
 }
 
+/// What one [`StreamSlots::reconcile`] pass left behind, for the caller that has
+/// to tell the client about it.
+///
+/// Two variants rather than a `bool` and a vector, because the invariant between
+/// them is the one that was got wrong: a fresh `VideoConfig` may only be built
+/// from the split that this very pass applied. Carrying the split *inside* the
+/// variant that permits the message makes reaching for the adaptor's total
+/// instead a thing that does not compile.
+enum Reconciled {
+    /// The plan was empty — the client re-sent a selection it already has.
+    /// Nothing was built, nothing was re-split, and nothing is said back.
+    Unchanged,
+    /// Streams changed.
+    Changed {
+        /// Slot 0's monitor changed, which the caller answers with a fresh
+        /// legacy `VideoConfig`: a client that only understands one stream still
+        /// has to be told the picture's dimensions moved.
+        slot0_changed: bool,
+        /// The re-split done after the last stream came up. Every rate the
+        /// caller quotes comes out of this. See [`AppliedBitrate`].
+        bitrate: AppliedBitrate,
+    },
+}
+
 /// The key identifying the output a pipeline is **actually** duplicating.
 ///
 /// Derived from the pipeline's own description rather than from the selector it
@@ -191,6 +215,21 @@ fn pipeline_key(session: &HostSession) -> MonitorKey {
     }
 }
 
+/// The id, in one session's monitor table, of the output `key` names.
+///
+/// The single place the key -> id mapping lives, because two callers have to
+/// agree on it exactly: [`StreamSlots::persistent_monitor_id`] asks it what the
+/// persistent pipeline is really showing, and the topology watchdog asks it the
+/// same question for every slot once an enumeration has renumbered the list.
+/// Two answers to that question is the bug this function exists to make
+/// impossible.
+///
+/// `None` means the output is not in the table — unplugged, or riding out the
+/// mode change that made the topology interesting in the first place.
+fn monitor_id_for_key(monitors: &[(MonitorInfo, MonitorKey)], key: &MonitorKey) -> Option<u8> {
+    monitors.iter().find(|(_, k)| k == key).map(|(i, _)| i.id)
+}
+
 /// Turn a client's raw `SelectMonitors` list into the slot assignment the host
 /// will actually run.
 ///
@@ -202,12 +241,33 @@ fn pipeline_key(session: &HostSession) -> MonitorKey {
 ///   the wrong desktop;
 /// * **duplicates are dropped**, first occurrence winning, because two slots
 ///   duplicating one output means two DXGI duplications of the same monitor;
-/// * **the list is truncated** to [`MAX_VIDEO_STREAMS`]; and
+/// * **the list is truncated** to [`MAX_VIDEO_STREAMS`] — *after* the two
+///   filters above, and preferring the resident monitor (next paragraph);
 /// * **the persistent pipeline's own monitor, when selected, is moved to
 ///   slot 0** — `resident` is that monitor's id, from
 ///   [`StreamSlots::persistent_monitor_id`].
 ///
-/// That last rule is the one deviation here from a literal reading of the
+/// # Truncation keeps the resident monitor
+///
+/// Not "keep the first `MAX_VIDEO_STREAMS`". `SelectMonitors { [1, 2, 0] }` on a
+/// two-stream host whose persistent pipeline is on monitor 0 would, under that
+/// rule, run monitors 1 and 2: two brand-new Desktop Duplications, while the
+/// persistent pipeline goes on duplicating monitor 0 for nobody at all. Three
+/// duplications, one of them pure waste, and the client has lost the one monitor
+/// that was free — slot 0 re-attaches that pipeline rather than building
+/// anything (see [`StreamSlots::build`]).
+///
+/// So the rule is: **when the list is too long and the requester named the
+/// resident monitor anywhere in it, the resident is kept and the last of the ids
+/// that fitted gives way to it.** The requester's order is priority order and is
+/// preserved among the survivors — the ids are still ordered slots per the wire
+/// contract, and the resident, named later than everything it displaced, takes
+/// the last kept slot before the slot-0 rule below moves it to the front. A
+/// request that does *not* name the resident is truncated plainly: the client
+/// has said it wants neither the free monitor nor slot 0's cheap attach, and
+/// second-guessing that would hand it a monitor it did not ask for.
+///
+/// The slot-0 rule is the one deviation here from a literal reading of the
 /// client's request. The persistent pipeline is never stopped — it outlives
 /// every client so the next one does not wait for D3D11 and Media Foundation —
 /// so its output is the one monitor that is always already being duplicated,
@@ -217,18 +277,28 @@ fn pipeline_key(session: &HostSession) -> MonitorKey {
 ///
 /// Note `resident` is usually but *not always* 0: see
 /// [`StreamSlots::persistent_monitor_id`]. `None` (its output is unplugged)
-/// simply means no id gets moved.
+/// means no id is preferred and none gets moved.
 ///
 /// An empty result means "nothing the client asked for exists here"; the caller
 /// keeps the current selection rather than tearing every stream down.
 fn filter_selection(ids: &[u8], known: &[u8], resident: Option<u8>) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(ids.len().min(MAX_VIDEO_STREAMS as usize));
+    let n = MAX_VIDEO_STREAMS as usize;
+    // Dedup and drop the unknowns over the WHOLE request first. Truncating
+    // before this step would let ids the host was never going to run — a stale
+    // list's ghosts, a repeat — decide which real monitors survive.
+    let mut out: Vec<u8> = Vec::with_capacity(ids.len());
     for id in ids {
-        if out.len() >= MAX_VIDEO_STREAMS as usize {
-            break;
-        }
         if known.contains(id) && !out.contains(id) {
             out.push(*id);
+        }
+    }
+    if out.len() > n {
+        // `out` has no duplicates, so "named but did not fit" is exactly
+        // "present in the tail that is about to be cut".
+        let rescue = resident.filter(|r| out[n..].contains(r));
+        out.truncate(n);
+        if let Some(r) = rescue {
+            out[n - 1] = r;
         }
     }
     // The already-resident monitor belongs to slot 0. See the doc comment.
@@ -404,11 +474,7 @@ impl StreamSlots {
     /// the list at all (it was unplugged), in which case every id is free to be
     /// built session-scoped.
     fn persistent_monitor_id(&self, primary: &Arc<HostSession>) -> Option<u8> {
-        let key = pipeline_key(primary);
-        self.monitors
-            .iter()
-            .find(|(_, k)| *k == key)
-            .map(|(i, _)| i.id)
+        monitor_id_for_key(&self.monitors, &pipeline_key(primary))
     }
 
     /// Republish the hot-path view and the live pump count.
@@ -613,9 +679,7 @@ impl StreamSlots {
 
     /// Reconcile the running streams with `desired` (already filtered).
     ///
-    /// Returns `true` when slot 0's monitor changed, which the caller answers
-    /// with a fresh legacy `VideoConfig` — a client that only understands one
-    /// stream still has to be told the picture's dimensions moved.
+    /// See [`Reconciled`] for what the caller owes the client afterwards.
     async fn reconcile(
         &mut self,
         desired: &[u8],
@@ -623,11 +687,11 @@ impl StreamSlots {
         primary: &Arc<HostSession>,
         fps: u32,
         total_kbps: u32,
-    ) -> bool {
+    ) -> Reconciled {
         let plan = plan_slot_changes(&self.current(), desired);
         if plan.is_empty() {
             tracing::debug!(?desired, "monitor selection unchanged; nothing to do");
-            return false;
+            return Reconciled::Unchanged;
         }
         tracing::info!(?desired, ?plan, "reconciling video streams");
 
@@ -698,15 +762,10 @@ impl StreamSlots {
         // a moment ago — and a `StreamConfig` naming the old share, or the
         // total, would have the client sizing its expectations against a
         // bandwidth this stream will never use.
-        let shares = apply_bitrate(inner, &self.view, total_kbps);
+        let bitrate = apply_bitrate(inner, &self.view, total_kbps);
         for slot in started {
             if slot != 0 {
-                let share = shares
-                    .get(slot as usize)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(total_kbps);
-                self.announce(slot, fps, share);
+                self.announce(slot, fps, bitrate.share(slot));
             }
             // A stream nobody has sent an IDR to is a stream the client cannot
             // start decoding. Asked for after the announcement, so the format
@@ -715,7 +774,10 @@ impl StreamSlots {
                 s.session.request_keyframe();
             }
         }
-        slot0_changed
+        Reconciled::Changed {
+            slot0_changed,
+            bitrate,
+        }
     }
 
     /// Tell the client the format of a secondary stream.
@@ -826,19 +888,43 @@ impl StreamSlots {
             // a slot already carries the requested monitor and skip a rebuild
             // the client did ask for. The key is the identity that survives
             // renumbering; re-derive the id from it.
-            for s in self.slots.iter_mut().flatten() {
-                let Some(key) = &s.key else {
-                    // The persistent pipeline selects `Primary`, so whichever
-                    // output that now resolves to *is* monitor 0 by definition.
-                    s.monitor_id = 0;
-                    continue;
-                };
-                if let Some((info, _)) = self.monitors.iter().find(|(_, k)| k == key) {
-                    s.monitor_id = info.id;
+            //
+            // The persistent pipeline carries no key of its own, and its id is
+            // emphatically **not** 0. It resolved `MonitorSelector::Primary`
+            // once, at construction, and keeps that output for life, while
+            // `list_monitors` re-decides which output is primary on every call
+            // — so "the operator moved the Windows primary" is at once the
+            // event that brings us here and the event that makes the two
+            // disagree. Writing 0 would leave slot 0 claiming a monitor it is
+            // not showing, and since `plan_slot_changes` compares by id the
+            // reconciler would then answer `SelectMonitors { [0] }` by doing
+            // nothing at all — the client keeps receiving the other panel — and
+            // read a request for the pipeline's *real* monitor as a retarget,
+            // building a second duplication of an output this process holds.
+            // So it is asked, through the same [`monitor_id_for_key`] seam
+            // `persistent_monitor_id` uses.
+            //
+            // Resolved into a vector before the mutation because both answers
+            // are read back out of `self`.
+            let resolved: Vec<Option<u8>> = self
+                .slots
+                .iter()
+                .map(|slot| {
+                    let s = slot.as_ref()?;
+                    match &s.key {
+                        Some(key) => monitor_id_for_key(&self.monitors, key),
+                        None => self.persistent_monitor_id(&s.session),
+                    }
+                })
+                .collect();
+            for (slot, id) in self.slots.iter_mut().zip(resolved) {
+                // A slot whose key resolves to nothing is either riding out a
+                // transient or about to be reaped below. Either way the old id
+                // is the best guess there is, and overwriting it with a wrong
+                // one would be worse.
+                if let (Some(s), Some(id)) = (slot.as_mut(), id) {
+                    s.monitor_id = id;
                 }
-                // Not found: it is either riding out a transient or about to be
-                // reaped below. Either way the old id is the best guess there
-                // is, and overwriting it with a wrong one would be worse.
             }
         }
 
@@ -1440,33 +1526,36 @@ async fn control_loop(
                 // rate. The second monitor's `StreamConfig` is re-sent below so
                 // its decoder is not left believing the old one.
                 for_each_slot(&view, |h| h.session.set_fps(fps));
-                let shares = {
+                let bitrate = {
                     let mut a = adaptor.lock();
                     a.set_mode(quality_mode, now);
                     apply_bitrate(&inner, &view, a.current())
                 };
                 for_each_slot(&view, |h| h.session.request_keyframe());
                 streaming.store(true, Ordering::SeqCst);
-                // Re-announced unconditionally, beside the `VideoConfig` below,
-                // which is what the client's handshake documentation says it
-                // expects ("the legacy VideoConfig for stream 0, and a
-                // StreamConfig { id: 1, .. } after it when a second stream is
-                // live"). Not merely cosmetic agreement: `SelectMonitors`
-                // arrives BEFORE this message and the stream was announced
-                // then, at whatever the adaptor happened to hold — but
-                // `set_mode` two lines up has just moved the whole budget
-                // (Balanced and TextDesktop are several megabits apart), so the
-                // share quoted in that first announcement is now stale. This is
-                // one small control message per session, and the client treats
-                // it as UI state rather than a decoder reconfiguration.
-                {
-                    let s = slots.lock().await;
-                    if s.enabled && s.slots.get(1).is_some_and(Option::is_some) {
-                        let share = shares.get(1).copied().flatten().unwrap_or_default();
-                        s.announce(1, fps, share);
-                    }
-                }
 
+                // Order is contractual, not cosmetic: the legacy `VideoConfig`
+                // for stream 0 FIRST, and a `StreamConfig { id: 1, .. }` after
+                // it when a second stream is live. That is what the client's
+                // handshake documentation specifies for *this reply*, and the
+                // reason is the client's: `VideoConfig` is the message it sizes
+                // its main window from, and being told a second stream exists
+                // before it has been told the primary's format leaves it
+                // holding the second window's geometry with nowhere to put it.
+                //
+                // The claim is about the `StartStream` reply and no more than
+                // that, because it is not a property of the session as a whole
+                // and must not be read as one. A client sends `SelectMonitors`
+                // *before* `StartStream`, so on a two-monitor session the first
+                // format message it ever sees is the `StreamConfig` that
+                // `reconcile` announces when it builds slot 1 — and a single
+                // `SelectMonitors` that both retargets slot 0 and starts slot 1
+                // announces the second stream (inside `reconcile`, so that a
+                // stream's format is on the wire ahead of its first keyframe)
+                // before the caller sends slot 0's fresh `VideoConfig`. The
+                // client is explicitly order-agnostic about those two arriving
+                // in any order, which is what makes that acceptable; what it is
+                // not agnostic about is a *reply* that leads with the secondary.
                 let cfg = ControlMsg::VideoConfig {
                     width: w,
                     height: h,
@@ -1476,11 +1565,29 @@ async fn control_loop(
                     // the old value. `active_fps()` is for the status path,
                     // where observed truth is what is wanted.
                     fps,
-                    bitrate_kbps: adaptor.lock().current(),
+                    // Stream 0's applied share, not the adaptor's total: this
+                    // message describes stream 0 alone. See
+                    // [`AppliedBitrate::share`].
+                    bitrate_kbps: bitrate.share(0),
                     codec: Codec::H264,
                 };
                 if let Err(e) = session.send_control(cfg) {
                     tracing::warn!("could not send VideoConfig: {e}");
+                }
+                // Re-announced unconditionally, after the `VideoConfig` above.
+                // Not merely cosmetic agreement: `SelectMonitors` arrives BEFORE
+                // this message and the stream was announced then, at whatever
+                // the adaptor happened to hold — but `set_mode` above has just
+                // moved the whole budget (Balanced and TextDesktop are several
+                // megabits apart), so the share quoted in that first
+                // announcement is now stale. This is one small control message
+                // per session, and the client treats it as UI state rather than
+                // a decoder reconfiguration.
+                {
+                    let s = slots.lock().await;
+                    if s.enabled && s.slots.get(1).is_some_and(Option::is_some) {
+                        s.announce(1, fps, bitrate.share(1));
+                    }
                 }
             }
             ControlMsg::StopStream => {
@@ -1540,7 +1647,7 @@ async fn control_loop(
                 // stream has come up: splitting per change would hand the
                 // encoders a share computed against a set of streams that no
                 // longer exists by the time the plan finishes.
-                let slot0_changed = s.reconcile(&desired, &inner, &pipeline, fps, total).await;
+                let outcome = s.reconcile(&desired, &inner, &pipeline, fps, total).await;
                 let primary_is_the_persistent_pipeline =
                     s.slots[0].as_ref().is_some_and(|s| s.key.is_none());
                 drop(s);
@@ -1552,7 +1659,11 @@ async fn control_loop(
                 // is painted over the wrong picture. `reset_tiles` retracts all
                 // of them; `status_loop` then zeroes the budget for as long as
                 // stream 0 is elsewhere, and lets it refill when it comes back.
-                if slot0_changed {
+                if let Reconciled::Changed {
+                    slot0_changed: true,
+                    bitrate,
+                } = outcome
+                {
                     pipeline.reset_tiles();
                     let (w, h) = slot_dimensions(&view, 0).unwrap_or_else(|| pipeline.dimensions());
                     tracing::info!(
@@ -1566,7 +1677,12 @@ async fn control_loop(
                         width: w,
                         height: h,
                         fps: *inner.fps.lock(),
-                        bitrate_kbps: adaptor.lock().current(),
+                        // Slot 0's share out of the split `reconcile` just
+                        // applied — the set of running streams changed a moment
+                        // ago, so the adaptor's total is now the wrong number by
+                        // a factor the client cannot guess. See
+                        // [`AppliedBitrate::share`].
+                        bitrate_kbps: bitrate.share(0),
                         codec: Codec::H264,
                     };
                     if let Err(e) = session.send_control(cfg) {
@@ -1634,6 +1750,48 @@ fn slot_dimensions(view: &SlotView, slot: u8) -> Option<(u32, u32)> {
         .map(|h| h.session.dimensions())
 }
 
+/// What [`apply_bitrate`] actually handed the encoders.
+///
+/// Every message that quotes a bitrate to the client quotes it from here, and
+/// from nowhere else. The adaptor's own `current()` is two steps removed from
+/// what any one stream is asked to produce — the client's `BitrateLimit` caps it
+/// and the pixel-area split divides it — so a message built from `current()`
+/// tells the client to expect bandwidth that is never going to arrive.
+struct AppliedBitrate {
+    /// The connection's budget after the cap: the number the live slots divided
+    /// up, and the honest answer about a slot that is not running.
+    capped_total: u32,
+    /// Each slot's applied share, indexed by stream id. `None` = that stream is
+    /// not running, so nothing was applied to it.
+    per_slot: Vec<Option<u32>>,
+}
+
+impl AppliedBitrate {
+    /// The bitrate a config message about `slot` must quote.
+    ///
+    /// This is the number `set_bitrate` was last handed for that stream:
+    /// post-cap, post-split. It is what `StreamConfig` has always meant, and it
+    /// is what the legacy `VideoConfig` means too — that message describes
+    /// **stream 0 and nothing else**, so `share(0)` is its `bitrate_kbps`.
+    /// Quoting the adaptor's total there would overstate stream 0 twice over
+    /// (by the limit the client itself asked for, and by whatever share a second
+    /// monitor is taking) and would have the host's two format messages
+    /// contradict each other about one connection.
+    ///
+    /// A slot that is not running has no applied share, and the capped total is
+    /// then the truthful fallback rather than zero: a lone stream's split is a
+    /// pass-through, so it is exactly what that slot gets the moment it comes
+    /// back. Never the *un*-capped total — no quote may exceed the ceiling the
+    /// client asked for.
+    fn share(&self, slot: u8) -> u32 {
+        self.per_slot
+            .get(slot as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(self.capped_total)
+    }
+}
+
 /// Hand the adaptor's decision to the encoders.
 ///
 /// The cap is applied to the **total** and the split happens underneath it, so
@@ -1641,10 +1799,11 @@ fn slot_dimensions(view: &SlotView, slot: u8) -> Option<(u32, u32)> {
 /// this connection is ever asked to produce, however many monitors are on it.
 /// Splitting first and capping each share would let two streams together
 /// produce twice the limit the client asked for.
-/// Returns each slot's share, indexed by stream id, so a caller about to quote
-/// one in a `StreamConfig` quotes the number that was actually applied rather
-/// than the connection's total or a stale encoder reading.
-fn apply_bitrate(inner: &Arc<Inner>, view: &SlotView, kbps: u32) -> Vec<Option<u32>> {
+///
+/// Returns what was applied, so a caller about to quote a rate quotes the number
+/// that really reached an encoder rather than the connection's total or a stale
+/// reading off a pipeline that started a moment ago. See [`AppliedBitrate`].
+fn apply_bitrate(inner: &Arc<Inner>, view: &SlotView, kbps: u32) -> AppliedBitrate {
     // A `BitrateLimit`/host cap is a hard ceiling on what the encoder is ever
     // asked for, applied on top of whatever the adaptor picked within its mode
     // range. The encoder never sees a value above the cap.
@@ -1689,7 +1848,10 @@ fn apply_bitrate(inner: &Arc<Inner>, view: &SlotView, kbps: u32) -> Vec<Option<u
     // "the bitrate the adaptive controller currently asks the encoder for", and
     // it is the connection's number.
     inner.status_mut(|s| s.target_kbps = capped);
-    applied
+    AppliedBitrate {
+        capped_total: capped,
+        per_slot: applied,
+    }
 }
 
 /// The encoder-vs-link overrun for one status window.
@@ -2134,6 +2296,89 @@ mod tests {
     }
 
     #[test]
+    fn truncation_never_detaches_the_resident_pipeline() {
+        let known = [0u8, 1, 2];
+        let n = MAX_VIDEO_STREAMS as usize;
+
+        // The case this rule exists for. Truncating to the first two would run
+        // monitors 1 and 2 — two new Desktop Duplications — while the
+        // persistent pipeline goes on duplicating monitor 0 for nobody: three
+        // duplications, one of them waste, and the client has lost the monitor
+        // that was free. Monitor 2 gives way instead, and 0 lands in slot 0
+        // where re-attaching it builds nothing at all.
+        let got = filter_selection(&[1, 2, 0], &known, Some(0));
+        assert_eq!(
+            got,
+            vec![0, 1],
+            "the resident monitor was named and must survive the truncation; \
+             {got:?} detaches the persistent pipeline"
+        );
+
+        // The requester's order is priority order and survives among the
+        // survivors: its first choice keeps its place, its last choice is the
+        // one dropped. (Slot assignment is then the ordinary slot-0 rule.)
+        assert_eq!(filter_selection(&[2, 1, 0], &known, Some(0)), vec![0, 2]);
+
+        // `resident` is not id 0 in general — an operator can move the Windows
+        // primary. The rule follows the pipeline, not the number.
+        assert_eq!(filter_selection(&[0, 1, 2], &known, Some(2)), vec![2, 0]);
+
+        // A request that does not name the resident is truncated plainly. The
+        // client has said it wants neither the free monitor nor slot 0's cheap
+        // attach, and substituting one in would hand it a monitor it did not
+        // ask for.
+        assert_eq!(filter_selection(&[1, 2], &known, Some(0)), vec![1, 2]);
+        let known4 = [0u8, 1, 2, 3];
+        assert_eq!(filter_selection(&[1, 2, 3], &known4, Some(0)), vec![1, 2]);
+
+        // Nothing resident (the pipeline's output is unplugged): plain
+        // truncation, exactly as before.
+        assert_eq!(filter_selection(&[1, 2, 0], &known, None), vec![1, 2]);
+
+        // Lists that fit are untouched by any of this.
+        assert_eq!(filter_selection(&[0, 1], &known, Some(0)), vec![0, 1]);
+        assert_eq!(filter_selection(&[1, 0], &known, Some(0)), vec![0, 1]);
+        assert_eq!(filter_selection(&[1, 2], &known, Some(2)), vec![2, 1]);
+
+        // Truncation happens AFTER the unknown/duplicate filters, so ids the
+        // host was never going to run cannot decide which real monitors
+        // survive. Under the old order `[1, 1, 0]` filled the two slots with
+        // one monitor's repeats and dropped the resident.
+        assert_eq!(filter_selection(&[1, 1, 0], &known, Some(0)), vec![0, 1]);
+        assert_eq!(filter_selection(&[1, 7, 2, 0], &known, Some(0)), vec![0, 1]);
+
+        // Whatever the request, the result is a set of known ids, without
+        // duplicates, within the slot budget — the properties every caller
+        // downstream relies on.
+        for a in 0..4u8 {
+            for b in 0..4u8 {
+                for c in 0..4u8 {
+                    for resident in [None, Some(0), Some(1), Some(2)] {
+                        let got = filter_selection(&[a, b, c], &known, resident);
+                        assert!(got.len() <= n, "{a},{b},{c} -> {got:?} overruns the slots");
+                        assert!(got.iter().all(|id| known.contains(id)));
+                        let mut sorted = got.clone();
+                        sorted.sort_unstable();
+                        sorted.dedup();
+                        assert_eq!(sorted.len(), got.len(), "{got:?} duplicates a monitor");
+                        // And the rule itself, as a property: a resident that
+                        // was asked for is always in the result.
+                        if let Some(r) = resident {
+                            if [a, b, c].contains(&r) && known.contains(&r) {
+                                assert!(
+                                    got.contains(&r),
+                                    "resident {r} was requested in {:?} but dropped: {got:?}",
+                                    [a, b, c]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_primary_is_always_served_by_slot_zero() {
         // Not cosmetic. Monitor 0 is duplicated by the persistent pipeline,
         // which is never stopped — it outlives every client so the next one
@@ -2306,6 +2551,161 @@ mod tests {
                 }
             ],
         );
+    }
+
+    // -- the persistent slot's id, after the primary moves ------------------
+
+    fn key_of(device: &str) -> MonitorKey {
+        MonitorKey {
+            adapter_luid: 1,
+            device_name: device.into(),
+            origin: match device {
+                r"\\.\DISPLAY1" => (0, 0),
+                _ => (1920, 0),
+            },
+        }
+    }
+
+    /// One row of a session's monitor table: id `id` naming output `device`.
+    fn table_row(id: u8, device: &str) -> (MonitorInfo, MonitorKey) {
+        let key = key_of(device);
+        (
+            MonitorInfo {
+                id,
+                width: 1920,
+                height: 1080,
+                origin_x: key.origin.0,
+                origin_y: key.origin.1,
+                is_primary: id == 0,
+                name: device.into(),
+            },
+            key,
+        )
+    }
+
+    #[test]
+    fn the_persistent_slot_carries_the_id_its_output_has_now() {
+        // The operator moves the Windows primary from DISPLAY1 to DISPLAY2
+        // mid-session. `DdaCapture` resolved `Primary` once, at construction,
+        // so the persistent pipeline is still duplicating DISPLAY1 — but ids
+        // are positional and `list_monitors` has just renumbered DISPLAY1 from
+        // 0 to 1. This is what the topology watchdog must write into slot 0.
+        let persistent = key_of(r"\\.\DISPLAY1");
+        let was = vec![table_row(0, r"\\.\DISPLAY1"), table_row(1, r"\\.\DISPLAY2")];
+        let now = vec![table_row(0, r"\\.\DISPLAY2"), table_row(1, r"\\.\DISPLAY1")];
+
+        assert_eq!(monitor_id_for_key(&was, &persistent), Some(0));
+        assert_eq!(
+            monitor_id_for_key(&now, &persistent),
+            Some(1),
+            "the pipeline's output is now id 1; the watchdog derives slot 0's \
+             id from the key, and hardcoding 0 is what makes everything below \
+             wrong"
+        );
+
+        // What `current()` therefore hands the reconciler.
+        let slot0 = monitor_id_for_key(&now, &persistent).expect("the output is still listed");
+        let current = slots(Some(slot0), None);
+
+        // Selecting the monitor the pipeline is really showing is a no-op: it
+        // is already on the wire, and "rebuilding" it would mean a second DXGI
+        // duplication of an output this process still holds.
+        assert!(
+            plan_slot_changes(&current, &[1]).is_empty(),
+            "SelectMonitors {{ [1] }} names the output slot 0 already duplicates \
+             and must plan no work"
+        );
+
+        // And id 0 now names DISPLAY2, which nothing is duplicating, so that is
+        // a real retarget.
+        assert_eq!(
+            plan_slot_changes(&current, &[0]),
+            vec![
+                SlotChange::Stop { slot: 0 },
+                SlotChange::Start {
+                    slot: 0,
+                    monitor: 0
+                }
+            ],
+        );
+
+        // The bug this pins, stated as the plans a hardcoded 0 would produce:
+        // exactly inverted, and wrong in both directions.
+        let stale = slots(Some(0), None);
+        assert!(
+            !plan_slot_changes(&stale, &[1]).is_empty(),
+            "with the stale id, the pipeline's own monitor reads as a retarget — \
+             a second duplication of an output this process holds"
+        );
+        assert!(
+            plan_slot_changes(&stale, &[0]).is_empty(),
+            "with the stale id, a request for DISPLAY2 is judged already-running \
+             and the client goes on receiving DISPLAY1's picture"
+        );
+
+        // An output that has left the table keeps its slot's old id rather than
+        // taking a wrong one: the watchdog writes nothing when this is `None`.
+        assert_eq!(monitor_id_for_key(&[], &persistent), None);
+        assert_eq!(
+            monitor_id_for_key(&[table_row(0, r"\\.\DISPLAY2")], &persistent),
+            None
+        );
+    }
+
+    // -- what a config message may quote as a bitrate -----------------------
+
+    #[test]
+    fn a_video_config_quotes_stream_zeros_applied_share() {
+        // `VideoConfig` describes stream 0 and nothing else, so its
+        // `bitrate_kbps` is slot 0's share — which is two steps below the
+        // adaptor's `current()`: the cap, then the split.
+        let two = AppliedBitrate {
+            capped_total: 8_000,
+            per_slot: vec![Some(5_000), Some(3_000)],
+        };
+        assert_eq!(two.share(0), 5_000);
+        assert_eq!(two.share(1), 3_000);
+
+        // The concrete defect, through the pure pieces it is built from: the
+        // adaptor wants 10 Mbps, the client capped the connection at 8, and two
+        // identical panels halve it. `VideoConfig` used to say 10000.
+        let capped = clamp_to_cap(10_000, Some(8_000));
+        let split = split_bitrate(capped, &[1920 * 1080, 1920 * 1080]);
+        let real = AppliedBitrate {
+            capped_total: capped,
+            per_slot: split.iter().copied().map(Some).collect(),
+        };
+        assert_eq!(real.share(0), 4_000);
+        assert_eq!(real.share(0), real.per_slot[0].unwrap());
+        assert_ne!(real.share(0), 10_000, "the adaptor's total is not a share");
+        assert_ne!(
+            real.share(0),
+            capped,
+            "nor is the connection's capped total"
+        );
+        // And `StreamConfig` reads the same accessor, so the two format
+        // messages can no longer contradict each other about one connection.
+        assert_eq!(real.share(0) + real.share(1), capped);
+
+        // One monitor: the split is a pass-through, so the share IS the capped
+        // total — still not the adaptor's raw number while a cap is in force.
+        let lone = AppliedBitrate {
+            capped_total: clamp_to_cap(10_000, Some(6_000)),
+            per_slot: vec![Some(6_000), None],
+        };
+        assert_eq!(lone.share(0), 6_000);
+
+        // A slot that is not running has no applied share. The capped total is
+        // the honest fallback — never zero, which would read as a dead stream,
+        // and never the uncapped total, which would exceed what the client
+        // asked for.
+        let idle = AppliedBitrate {
+            capped_total: 4_000,
+            per_slot: vec![None, None],
+        };
+        assert_eq!(idle.share(0), 4_000);
+        assert_eq!(idle.share(1), 4_000);
+        assert_eq!(idle.share(9), 4_000, "an out-of-range slot must not panic");
     }
 
     // -- input routing -----------------------------------------------------
