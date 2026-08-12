@@ -21,14 +21,10 @@ use parking_lot::Mutex;
 
 use crate::config::ClientConfig;
 use crate::connect::ConnectSupervisor;
-use crate::input_capture::{
-    is_release_chord, wheel_delta, CaptureLoss, InputCapture, RELEASE_CHORD,
-};
+use crate::input_capture::{chord_pressed, CaptureLoss, InputCapture, RELEASE_CHORD};
 use crate::monitors::{self, MonitorChoice};
 use crate::pipeline::{Pipeline, SourceStatus};
-use crate::renderer::{
-    describe_scale, is_exact_scale, FrameSlot, Presenter, VideoView, MAIN_VIDEO_TEXTURE,
-};
+use crate::renderer::{describe_scale, is_exact_scale, FrameSlot, Presenter, MAIN_VIDEO_TEXTURE};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
 use crate::tiles::TileStore;
 use crate::ui::second_window::SecondaryShared;
@@ -235,7 +231,8 @@ impl ClientApp {
         // system theme preference then overrides. Pin the preference instead:
         // a remote screen belongs on a dark surround, always.
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-        let input = InputCapture::new(init.session.input_tx.clone());
+        let input_tx = init.session.input_tx.clone();
+        let input = InputCapture::new(input_tx.clone());
         let show_diagnostics = init.config.show_diagnostics;
         let auto_snap_scale = init.config.auto_snap_scale;
         let fullscreen = init.config.start_fullscreen;
@@ -312,7 +309,10 @@ impl ClientApp {
             auto_snap_scale,
             pending_auto_snap: false,
             tile_highlight: false,
-            stream1: Arc::new(Mutex::new(SecondaryShared::new(init.slot2.clone()))),
+            stream1: Arc::new(Mutex::new(SecondaryShared::new(
+                init.slot2.clone(),
+                input_tx,
+            ))),
             stream1_slot: init.slot2,
             stream1_status: init.stream1_status,
             stream1_window_open: false,
@@ -685,6 +685,32 @@ impl ClientApp {
         self.stream1_window_open && self.state.is_live()
     }
 
+    /// Does the second monitor's window have focus right now?
+    ///
+    /// Always `false` when that window does not exist, which is what keeps the
+    /// single-window case bit-for-bit what it always was: nothing here is even
+    /// consulted, and the hook's foreground gate stays the main window's own
+    /// `i.focused`.
+    ///
+    /// Two sources, deliberately. `input_for` reads the child viewport's live
+    /// `InputState` from out here — safe for a *flag* (never for events) — and
+    /// is authoritative even on a frame the child did not paint. The latched
+    /// flag from the child's own pass covers the reverse: a focus change egui
+    /// has delivered to the child but not yet reflected in what the parent can
+    /// read. Either one saying "focused" is enough; being wrong in that
+    /// direction only means the hook passes keys through for one extra frame,
+    /// while being wrong the other way double-sends every keystroke in it.
+    fn second_window_focused(&self, ctx: &egui::Context) -> bool {
+        if !self.second_window_visible() {
+            return false;
+        }
+        // Two statements on purpose: the guard must be dropped before egui is
+        // called, so this never holds the child's lock across an egui call —
+        // the one shape that could deadlock against the child's own pass.
+        let latched = self.stream1.lock().focused;
+        latched || ctx.input_for(second_window::stream1_viewport_id(), |i| i.focused)
+    }
+
     /// The second window's per-frame logic: push the capture gate down to the
     /// child and consume anything its last pass reported.
     ///
@@ -696,10 +722,16 @@ impl ClientApp {
             return;
         }
         // Mirrored down rather than read up: the child's paint callback is a
-        // plain `Fn` that cannot reach `ClientApp`. C4's forwarders gate on it.
+        // plain `Fn` that cannot reach `ClientApp`. Its forwarders gate on both.
         let closed = {
             let mut shared = self.stream1.lock();
-            shared.capturing = self.input.is_capturing();
+            shared.set_capturing(self.input.is_capturing());
+            // `monitors.is_some()` is the proof this session negotiated
+            // multi-monitor, and it is the gate on every tagged `EventOn` this
+            // window sends — same gate `send_select_monitors` uses, for the
+            // same reason: an old host's `decode_strict` reader errors on the
+            // variant and takes the whole input stream down with it.
+            shared.set_armed(self.monitors.is_some());
             std::mem::take(&mut shared.close_requested)
         };
         // Belt and braces alongside the flag the child latched: `input_for`
@@ -795,7 +827,22 @@ impl ClientApp {
         self.stream1_window_open = false;
         self.stream1_video = None;
         self.stream1_monitor = None;
-        self.stream1.lock().reset(true);
+        // A window that goes away mid-drag leaves the host holding a button
+        // that nothing left alive can lift — no more events will ever come from
+        // that viewport. `ReleaseAll` is the only message that drops it, and it
+        // is deliberately global (the host keeps held state on one injector),
+        // so it is sent only when this window actually held something rather
+        // than on every close, where it would also drop the main window's keys.
+        let held = {
+            let mut shared = self.stream1.lock();
+            let held = shared.has_buttons_held();
+            shared.reset(true);
+            held
+        };
+        if held {
+            tracing::info!("second window closed mid-drag — releasing held input");
+            self.input.release_all();
+        }
     }
 
     /// Drop every piece of second-window state because the session that owned
@@ -879,23 +926,14 @@ impl ClientApp {
             None => {}
         }
 
-        let mut chord = false;
-        ctx.input(|i| {
-            for event in &i.events {
-                if let egui::Event::Key {
-                    key,
-                    physical_key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    // The physical key is what the user actually pressed; a
-                    // remapped layout can report something else as `key`.
-                    chord |= is_release_chord(physical_key.unwrap_or(*key), *modifiers);
-                }
-            }
-        });
+        // Two windows, two `InputState`s: the chord typed into the second
+        // monitor's window never appears in this one's events, so the child
+        // detects it with the same pure predicate and latches a one-shot for us
+        // to consume here. Both paths land on the single toggle below, so the
+        // chord means the same thing from either window and can never toggle
+        // twice for one press.
+        let child_chord = self.stream1.lock().take_chord_fired();
+        let chord = child_chord || ctx.input(|i| chord_pressed(&i.events));
         if !chord {
             return;
         }
@@ -913,13 +951,19 @@ impl ClientApp {
     }
 
     /// Capture must never survive losing focus, minimizing, or closing.
-    fn enforce_capture_invariants(&mut self, ctx: &egui::Context) {
+    ///
+    /// `focused` is the **any-window** answer: with a second monitor on screen,
+    /// clicking into its window is not "DirectDesk lost focus", and dropping
+    /// capture there would make the keyboard stop working the moment the
+    /// operator looked at the other monitor. `minimized` and `closing` stay the
+    /// *main* window's — closing it ends the session, and its close request is
+    /// what persists the config.
+    fn enforce_capture_invariants(&mut self, ctx: &egui::Context, focused: bool) {
         if !self.input.is_capturing() {
             return;
         }
-        let (focused, minimized, closing) = ctx.input(|i| {
+        let (minimized, closing) = ctx.input(|i| {
             (
-                i.focused,
                 i.viewport().minimized.unwrap_or(false),
                 i.viewport().close_requested(),
             )
@@ -1567,77 +1611,15 @@ impl ClientApp {
 
         let (events, focused) = ui.ctx().input(|i| (i.events.clone(), i.focused));
         if focused {
-            self.forward_pointer_events(&events, viewport, &view);
-            self.forward_key_events(&events);
+            // Both paths live in `input_capture` now, shared with the second
+            // window's forwarders so the two windows cannot drift apart on the
+            // letterbox gate, the drag latch, or the chord filter. Keys are
+            // gated on capture inside; pointer events never were.
+            self.input
+                .forward_pointer_events(&events, viewport, &view, self.pointer);
+            self.input.forward_key_events(&events);
         }
         self.input.pump();
-    }
-
-    /// Forward keystrokes captured through the window (egui) while it is the
-    /// foreground window — the reliable path there, since Windows starves the
-    /// global low-level hook when our GPU-heavy window is focused. Gated on
-    /// capture being enabled so the toggle / release chord still governs it.
-    fn forward_key_events(&mut self, events: &[egui::Event]) {
-        if !self.input.is_capturing() {
-            return;
-        }
-        for event in events {
-            if let egui::Event::Key {
-                key,
-                physical_key,
-                pressed,
-                modifiers,
-                ..
-            } = event
-            {
-                // The release chord is ours, not the host's — swallow both the
-                // press and the release so no half of it lands on the remote
-                // machine (`reconcile_capture` already acted on it).
-                if is_release_chord(physical_key.unwrap_or(*key), *modifiers) {
-                    continue;
-                }
-                self.input
-                    .on_key_event(*physical_key, *key, *pressed, *modifiers);
-            }
-        }
-    }
-
-    fn forward_pointer_events(
-        &mut self,
-        events: &[egui::Event],
-        viewport: egui::Rect,
-        view: &VideoView,
-    ) {
-        for event in events {
-            match event {
-                egui::Event::PointerMoved(pos) if viewport.contains(*pos) => {
-                    self.input.on_pointer_moved(*pos, view);
-                }
-                egui::Event::PointerButton {
-                    pos,
-                    button,
-                    pressed,
-                    ..
-                } if viewport.contains(*pos) => {
-                    self.input.on_pointer_button(*pos, view, *button, *pressed);
-                }
-                egui::Event::MouseWheel { unit, delta, .. } => {
-                    let Some(pos) = self.pointer else { continue };
-                    if !viewport.contains(pos) {
-                        continue;
-                    }
-                    if delta.y != 0.0 {
-                        self.input
-                            .on_wheel(pos, view, wheel_delta(*unit, delta.y), false);
-                    }
-                    if delta.x != 0.0 {
-                        self.input
-                            .on_wheel(pos, view, wheel_delta(*unit, delta.x), true);
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     /// Draws the "host wants elevation" banner as a floating, non-modal
@@ -1843,6 +1825,15 @@ impl eframe::App for ClientApp {
         // chord, so the latch below reflects this frame's input.
         self.reconcile_capture(ctx);
 
+        // "Is DirectDesk the window the operator is typing into" — the answer
+        // every capture decision below turns on, and with a second monitor it
+        // is a question about *either* window. Computed once so the auto re-arm,
+        // the hook's foreground gate and `enforce_capture_invariants` can never
+        // disagree within a frame; on a single-window session it is exactly
+        // `i.focused`.
+        let main_focused = ctx.input(|i| i.focused);
+        let any_focused = main_focused || self.second_window_focused(ctx);
+
         // Wait for focus: the window is not focused on the first frame, and
         // `enforce_capture_invariants` would (correctly) drop capture again.
         // `--hold-capture` installs without waiting for focus (the whole point
@@ -1879,7 +1870,10 @@ impl eframe::App for ClientApp {
                 // `enforce_capture_invariants` releases it the instant focus is
                 // lost, so keystrokes typed into other local apps are never
                 // swallowed/forwarded.
-                let active = ctx.input(|i| i.focused && !i.viewport().minimized.unwrap_or(false));
+                // Any-window focus, matching the release rule in
+                // `enforce_capture_invariants`: working in the second monitor's
+                // window must acquire capture, not sit there unable to type.
+                let active = any_focused && !ctx.input(|i| i.viewport().minimized.unwrap_or(false));
                 if active && !self.input.is_capturing() {
                     self.input.start_capture();
                 }
@@ -1896,9 +1890,22 @@ impl eframe::App for ClientApp {
         }
 
         self.pointer = ctx.input(|i| i.pointer.latest_pos());
+        // This window's own focus, which is a different question from the one
+        // below: it is what releases the modifiers *this* window synthesized
+        // when it hands focus over — including to the other DirectDesk window,
+        // where the process-wide answer never changes at all.
+        self.input.set_window_focused(main_focused);
         // Route capture by focus: when we're foreground the egui key path owns
         // it and the low-level hook passes through; when not, the hook forwards.
-        self.input.set_window_foreground(ctx.input(|i| i.focused));
+        //
+        // "We" means *either* DirectDesk window. The hook is process-global and
+        // has no window context, so its gate has to be the OR: with a second
+        // monitor on screen the egui path owns keys while the operator is in
+        // the child window just as much as in this one, and letting the hook
+        // forward as well would double-send every keystroke. With no second
+        // window this is exactly `i.focused`, so the single-window semantics —
+        // and `swallow_decision` — are untouched.
+        self.input.set_any_window_foreground(any_focused);
         // Mirrored per frame rather than at the transition sites, because
         // `self.state` is assigned from several places (drain, Bye, connect,
         // disconnect) and the hook must never read a stale gate.
@@ -1911,7 +1918,7 @@ impl eframe::App for ClientApp {
                 self.elevation = None;
             }
         }
-        self.enforce_capture_invariants(ctx);
+        self.enforce_capture_invariants(ctx, any_focused);
         self.presenter.update(ctx, &self.slot);
         self.service_second_window(ctx);
         self.log_metrics(ctx);
