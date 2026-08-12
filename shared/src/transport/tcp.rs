@@ -1054,6 +1054,16 @@ impl TcpSession {
         let (input_out_tx, input_out_rx) = mpsc::channel(config.input_capacity);
         let (input_in_tx, input_in_rx) = mpsc::channel(config.input_capacity);
         let (video_in_tx, video_in_rx) = mpsc::channel(config.video_capacity);
+        // The second monitor's stream never arrives here either, and for a
+        // reason one step stronger than audio's: it is identified by a *video
+        // datagram* flag (`crate::video::FLAG_STREAM1`), and this transport has
+        // no datagram path at all. `encode_media_segments` muxes one video
+        // stream inline on the byte stream that also carries control and input,
+        // and there is no segment kind for a second one. So the sender is
+        // dropped where it is made and `rx.video1` is closed from the start,
+        // exactly as `SessionConfig::receive_video_1` being off would leave it.
+        let (video1_in_tx, video1_in_rx) = mpsc::channel(config.video_capacity);
+        drop(video1_in_tx);
         // Audio never arrives on this transport, so the sender is dropped the
         // moment it is made and `rx.audio` is closed from the start.
         //
@@ -1126,6 +1136,7 @@ impl TcpSession {
             control: control_in_rx,
             input: input_in_rx,
             video: video_in_rx,
+            video1: video1_in_rx,
             audio: audio_in_rx,
             events: events_rx,
         };
