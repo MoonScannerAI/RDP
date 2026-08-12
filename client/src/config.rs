@@ -360,7 +360,9 @@ mod tests {
         }
         .sanitized();
         assert!(c.cached_monitors[0].name.len() <= MAX_CACHED_MONITOR_NAME_BYTES);
-        assert!(c.cached_monitors[0].name.is_char_boundary(c.cached_monitors[0].name.len()));
+        assert!(c.cached_monitors[0]
+            .name
+            .is_char_boundary(c.cached_monitors[0].name.len()));
     }
 
     #[test]

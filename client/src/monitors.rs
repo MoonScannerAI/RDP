@@ -172,44 +172,81 @@ mod tests {
     fn primary_always_resolves_to_zero() {
         let monitors = [monitor(0, true, "A"), monitor(1, false, "B")];
         let got = resolve_selection(MonitorChoice::Primary, &monitors);
-        assert_eq!(got, Resolved { ids: vec![0], degraded: false });
+        assert_eq!(
+            got,
+            Resolved {
+                ids: vec![0],
+                degraded: false
+            }
+        );
     }
 
     #[test]
     fn second_resolves_to_one_when_present() {
         let monitors = [monitor(0, true, "A"), monitor(1, false, "B")];
         let got = resolve_selection(MonitorChoice::Second, &monitors);
-        assert_eq!(got, Resolved { ids: vec![1], degraded: false });
+        assert_eq!(
+            got,
+            Resolved {
+                ids: vec![1],
+                degraded: false
+            }
+        );
     }
 
     #[test]
     fn second_degrades_to_primary_when_host_has_only_one_monitor() {
         let monitors = [monitor(0, true, "A")];
         let got = resolve_selection(MonitorChoice::Second, &monitors);
-        assert_eq!(got, Resolved { ids: vec![0], degraded: true });
+        assert_eq!(
+            got,
+            Resolved {
+                ids: vec![0],
+                degraded: true
+            }
+        );
     }
 
     #[test]
     fn both_resolves_to_zero_and_one_when_present() {
         let monitors = [monitor(0, true, "A"), monitor(1, false, "B")];
         let got = resolve_selection(MonitorChoice::Both, &monitors);
-        assert_eq!(got, Resolved { ids: vec![0, 1], degraded: false });
+        assert_eq!(
+            got,
+            Resolved {
+                ids: vec![0, 1],
+                degraded: false
+            }
+        );
     }
 
     #[test]
     fn both_degrades_to_primary_when_host_has_only_one_monitor() {
         let monitors = [monitor(0, true, "A")];
         let got = resolve_selection(MonitorChoice::Both, &monitors);
-        assert_eq!(got, Resolved { ids: vec![0], degraded: true });
+        assert_eq!(
+            got,
+            Resolved {
+                ids: vec![0],
+                degraded: true
+            }
+        );
     }
 
     #[test]
     fn empty_monitor_list_degrades_every_choice() {
-        for choice in [MonitorChoice::Primary, MonitorChoice::Second, MonitorChoice::Both] {
+        for choice in [
+            MonitorChoice::Primary,
+            MonitorChoice::Second,
+            MonitorChoice::Both,
+        ] {
             let got = resolve_selection(choice, &[]);
             assert_eq!(
                 got,
-                Resolved { ids: vec![0], degraded: true },
+                Resolved {
+                    ids: vec![0],
+                    degraded: true
+                },
                 "{choice:?} must degrade on an empty MonitorList"
             );
         }
@@ -227,11 +264,17 @@ mod tests {
         ];
         assert_eq!(
             resolve_selection(MonitorChoice::Second, &monitors),
-            Resolved { ids: vec![1], degraded: false }
+            Resolved {
+                ids: vec![1],
+                degraded: false
+            }
         );
         assert_eq!(
             resolve_selection(MonitorChoice::Both, &monitors),
-            Resolved { ids: vec![0, 1], degraded: false }
+            Resolved {
+                ids: vec![0, 1],
+                degraded: false
+            }
         );
     }
 
@@ -244,7 +287,10 @@ mod tests {
         let monitors = [monitor(0, false, "A"), monitor(1, false, "B")];
         assert_eq!(
             resolve_selection(MonitorChoice::Both, &monitors),
-            Resolved { ids: vec![0, 1], degraded: false }
+            Resolved {
+                ids: vec![0, 1],
+                degraded: false
+            }
         );
     }
 
@@ -262,7 +308,10 @@ mod tests {
             "Second monitor"
         );
         // No cache at all.
-        assert_eq!(picker_label(MonitorChoice::Both, &[], true), "Both (two windows)");
+        assert_eq!(
+            picker_label(MonitorChoice::Both, &[], true),
+            "Both (two windows)"
+        );
     }
 
     #[test]

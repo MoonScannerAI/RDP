@@ -121,6 +121,26 @@ pub struct ClientSession {
     /// whether audio was negotiated — a session without it simply never sees a
     /// packet, and the audio thread sits on an empty channel.
     pub audio_rx: Receiver<AudioFrame>,
+
+    /// Encoded frames of the **second** monitor's stream (wire stream id 1).
+    ///
+    /// Named `video2` for the same reason `video_rx` is not called `video0`:
+    /// on this side of the seam it is the second picture, not the second index
+    /// — the wire's `1` shows up once, as
+    /// `transport::session::SessionReceivers::video1`, which `net::run_client`
+    /// bridges into here.
+    ///
+    /// Wired exactly like [`ClientSession::audio_rx`]: an ordinary inbound
+    /// channel whose sending half rides in [`TransportEndpoints`] for the app's
+    /// lifetime, fed only while a session negotiated `features::MULTI_MONITOR`
+    /// *and* the operator asked for two outputs. Nothing here knows either of
+    /// those things — a single-monitor session simply never sees a frame, and
+    /// the second decode thread sits on an empty channel. Its own channel
+    /// rather than a tagged frame on [`video_rx`](Self::video_rx) because the
+    /// two streams are two independent encoders with two `frame_id` spaces; a
+    /// merged lane would have to be re-split before either decoder could be
+    /// fed.
+    pub video2_rx: Receiver<EncodedFrame>,
 }
 
 /// Transport-side channel endpoints. The transport wave plugs into exactly
@@ -138,6 +158,11 @@ pub struct TransportEndpoints {
     /// [`TransportEndpoints::tiles_tx`]: a dropped access unit is a click, and
     /// a click is cheaper than back-pressuring QUIC.
     pub audio_tx: Sender<AudioFrame>,
+    /// Second monitor's video, host -> UI. Bounded at the same depth as
+    /// [`TransportEndpoints::video_tx`] and lossy in the same way, but on its
+    /// own queue: two monitors are two independent frame rates, and a stalled
+    /// second decode thread must not throttle the primary picture.
+    pub video2_tx: Sender<EncodedFrame>,
     pub input_rx: mpsc::Receiver<InputMsg>,
     pub control_rx: mpsc::Receiver<ControlMsg>,
 }
@@ -152,6 +177,9 @@ impl ClientSession {
         let (ctl_in_tx, ctl_in_rx) = bounded(CONTROL_QUEUE_DEPTH);
         let (tiles_tx, tiles_rx) = bounded(TILE_QUEUE_DEPTH);
         let (audio_tx, audio_rx) = bounded(AUDIO_QUEUE_DEPTH);
+        // Same depth as the primary video lane, deliberately: the second
+        // monitor decodes every frame it is sent, exactly like the first.
+        let (video2_tx, video2_rx) = bounded(VIDEO_QUEUE_DEPTH);
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_DEPTH);
         let (ctl_out_tx, ctl_out_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
 
@@ -166,6 +194,7 @@ impl ClientSession {
                 control_tx: ctl_out_tx,
                 tiles_rx,
                 audio_rx,
+                video2_rx,
             },
             TransportEndpoints {
                 video_tx,
@@ -175,6 +204,7 @@ impl ClientSession {
                 control_tx: ctl_in_tx,
                 tiles_tx,
                 audio_tx,
+                video2_tx,
                 input_rx,
                 control_rx: ctl_out_rx,
             },
@@ -353,6 +383,73 @@ mod tests {
             })
             .unwrap();
         assert_eq!(session.video_rx.try_recv().unwrap().frame_id, 42);
+    }
+
+    fn frame(frame_id: u32) -> EncodedFrame {
+        EncodedFrame {
+            frame_id,
+            keyframe: false,
+            timestamp_ms: 0,
+            data: vec![7],
+        }
+    }
+
+    /// The second monitor's lane exists on every session but is silent unless
+    /// the transport arms it: `net::run_client` only spawns the bridge that
+    /// feeds it when `MULTI_MONITOR` came back mutual *and* two outputs were
+    /// selected. An unused lane must therefore look exactly like this — open,
+    /// empty, and costing nothing — rather than closed, so the second decode
+    /// thread can be attached once at startup and simply wait.
+    #[test]
+    fn video2_lane_is_silent_until_something_is_sent_and_then_delivers() {
+        let (session, transport) = ClientSession::new();
+        assert!(
+            session.video2_rx.try_recv().is_err(),
+            "an unarmed second monitor must never produce a frame"
+        );
+        assert!(
+            session.video2_rx.is_empty() && !session.video2_rx.is_full(),
+            "the lane stays open and idle, not closed"
+        );
+
+        transport.video2_tx.try_send(frame(11)).unwrap();
+        assert_eq!(session.video2_rx.try_recv().unwrap().frame_id, 11);
+    }
+
+    /// Independence, the property the whole two-stream design rests on: the
+    /// second monitor's queue filling (a wedged second decode thread, or a
+    /// window the user never opened) must leave the primary picture — and the
+    /// audio lane — completely untouched, and must refuse rather than block so
+    /// the transport bridge can drop.
+    #[test]
+    fn a_full_video2_queue_leaves_the_other_lanes_untouched() {
+        let (session, transport) = ClientSession::new();
+        for id in 0..VIDEO_QUEUE_DEPTH as u32 {
+            transport.video2_tx.try_send(frame(id)).unwrap();
+        }
+        assert!(
+            transport.video2_tx.try_send(frame(9_999)).is_err(),
+            "a full second-monitor queue must refuse, so the bridge drops"
+        );
+
+        transport.video_tx.try_send(frame(42)).unwrap();
+        assert_eq!(session.video_rx.try_recv().unwrap().frame_id, 42);
+        transport.audio_tx.try_send(audio_frame(3)).unwrap();
+        assert_eq!(session.audio_rx.try_recv().unwrap().seq, 3);
+    }
+
+    /// The two video lanes are two channels, not one with a tag: a frame put
+    /// on one is never observable on the other, which is what lets the two
+    /// streams keep independent `frame_id` spaces without a re-split.
+    #[test]
+    fn the_two_video_lanes_never_cross() {
+        let (session, transport) = ClientSession::new();
+        transport.video_tx.try_send(frame(1)).unwrap();
+        transport.video2_tx.try_send(frame(2)).unwrap();
+        assert_eq!(session.video_rx.try_recv().unwrap().frame_id, 1);
+        assert_eq!(session.video2_rx.try_recv().unwrap().frame_id, 2);
+        assert!(session.video_rx.try_recv().is_err());
+        assert!(session.video2_rx.try_recv().is_err());
     }
 
     #[test]

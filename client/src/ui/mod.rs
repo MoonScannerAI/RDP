@@ -944,9 +944,11 @@ impl ClientApp {
                     egui::ComboBox::from_id_salt("monitor_choice")
                         .selected_text(selected_label)
                         .show_ui(ui, |ui| {
-                            for choice in
-                                [MonitorChoice::Primary, MonitorChoice::Second, MonitorChoice::Both]
-                            {
+                            for choice in [
+                                MonitorChoice::Primary,
+                                MonitorChoice::Second,
+                                MonitorChoice::Both,
+                            ] {
                                 let option_label = monitors::picker_label(
                                     choice,
                                     &self.config.cached_monitors,
