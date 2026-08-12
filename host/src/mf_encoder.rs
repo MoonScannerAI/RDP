@@ -352,36 +352,45 @@ impl MfH264Encoder {
     /// control (GPU asleep, driver session lost, encoder already in use), so a
     /// single failure demotes us to the next candidate rather than the whole
     /// pipeline.
+    ///
+    /// That promise is only worth as much as [`try_build`]'s error discipline:
+    /// EVERY fallible step from `ActivateObject` up to the moment we return
+    /// `Ok` must come back as an `Err` from `try_build`, never propagate past
+    /// the ladder. The one deliberate exception is [`bind_d3d`], which is
+    /// infallible by construction — see its doc for why a refused device
+    /// manager is a degradation rather than a failure.
+    ///
+    /// This matters most with two pipelines running: a consumer NVIDIA part
+    /// grants two or three concurrent NVENC sessions, so the *second* monitor's
+    /// encoder is the one that meets "already in use", and a `new()` that
+    /// failed instead of demoting would take `HostSession::start` down with it
+    /// when the software encoder would have carried the stream.
+    ///
+    /// [`try_build`]: Self::try_build
+    /// [`bind_d3d`]: Self::bind_d3d
     pub fn new(cfg: EncoderConfig, device: Option<&ID3D11Device>) -> Result<Self> {
         let candidates = candidate_mfts(&cfg)?;
-        if candidates.is_empty() {
-            return Err(Error::Encoder(
-                "no H.264 encoder MFT of any kind is registered".into(),
-            ));
-        }
-        let mut last_err = None;
-        for (activate, path) in candidates {
-            // SAFETY: `activate` came from MFTEnum2 and is a live IMFActivate.
-            let name = unsafe { read_string(&activate, &MFT_FRIENDLY_NAME_Attribute) }
-                .unwrap_or_else(|| "<unnamed MFT>".to_string());
-            match Self::try_build(&activate, path, name.clone(), cfg.clone(), device) {
-                Ok(me) => return Ok(me),
-                Err(e) => {
-                    tracing::warn!(
-                        "encoder candidate \"{name}\" ({}) unusable: {e}",
-                        path.label()
-                    );
-                    // SAFETY: releases whatever the failed activation created.
-                    unsafe {
-                        let _ = activate.ShutdownObject();
-                    }
-                    last_err = Some(e);
+        first_usable(
+            candidates,
+            |activate| {
+                // SAFETY: `activate` came from MFTEnum2 and is a live IMFActivate.
+                unsafe { read_string(activate, &MFT_FRIENDLY_NAME_Attribute) }
+                    .unwrap_or_else(|| "<unnamed MFT>".to_string())
+            },
+            |activate, path, name| Self::try_build(activate, path, name, cfg.clone(), device),
+            |activate| {
+                // SAFETY: releases whatever the failed activation created.
+                unsafe {
+                    let _ = activate.ShutdownObject();
                 }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| Error::Encoder("no usable H.264 encoder MFT".into())))
+            },
+        )
     }
 
+    /// One candidate, from activation to "committed". Every step that can fail
+    /// returns `Err` so [`new`] can demote; nothing here aborts the ladder.
+    ///
+    /// [`new`]: Self::new
     fn try_build(
         activate: &IMFActivate,
         path: EncoderPath,
@@ -526,6 +535,27 @@ impl MfH264Encoder {
         Ok(())
     }
 
+    /// Hand the MFT our D3D11 device manager so it can take GPU textures.
+    ///
+    /// Infallible ON PURPOSE — the one step inside `try_build` that does not
+    /// demote to the next candidate, and the exception is load-bearing rather
+    /// than laziness:
+    ///
+    /// * Selection tier 2 is "hardware MFT on ANY adapter (cross-adapter copy
+    ///   via CPU NV12)". Attaching adapter A's device manager to adapter B's
+    ///   encoder is *expected* to be refused; that refusal is how the tier is
+    ///   supposed to work, so demoting on it would delete tier 2 outright.
+    /// * The caller already adapts. `session::build_pipeline` computes
+    ///   `gpu_encode_input = converter.is_some() && encoder.accepts_textures()`
+    ///   and does a `readback_nv12` when it is false, so an unbound MFT is a
+    ///   working encoder that pays for a readback — not a broken one.
+    /// * Demoting here would trade a hardware encoder with a CPU-side copy for
+    ///   the *software* encoder on any host that has only one hardware MFT.
+    ///   That is strictly worse than what it is meant to protect.
+    ///
+    /// The failure that genuinely means "this device cannot encode right now"
+    /// shows up at `SetOutputType`, `SetInputType` or `NOTIFY_BEGIN_STREAMING`,
+    /// and all three do demote.
     fn bind_d3d(&mut self, device: &ID3D11Device) {
         // SAFETY: manager and device outlive the transform; failures here are
         // non-fatal and fall back to the CPU-input path.
@@ -818,11 +848,26 @@ impl MfH264Encoder {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
                 .map_err(enc_err("NOTIFY_BEGIN_STREAMING"))?;
+            // Armed HERE, between the two messages, not after both.
+            //
+            // BEGIN_STREAMING is the message on which a vendor MFT allocates
+            // its encode session — on NVIDIA, one of the two or three NVENC
+            // sessions a consumer part will ever grant. If START_OF_STREAM then
+            // fails we return `Err` and `new()` demotes to the next candidate;
+            // `Drop` is the only thing that ever sends END_STREAMING, and with
+            // this flag still `false` it skipped teardown and left the session
+            // pinned for the life of the process. On the two-monitor path that
+            // is the exact resource the second pipeline is queueing for, so the
+            // demotion would poison the fallback it was demoting to.
+            //
+            // END_OF_STREAM without a matching START_OF_STREAM is harmless:
+            // `Drop` ignores every result, and an MFT that never got a start
+            // has nothing to end.
+            self.started = true;
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
                 .map_err(enc_err("NOTIFY_START_OF_STREAM"))?;
         }
-        self.started = true;
         Ok(())
     }
 
@@ -1351,6 +1396,67 @@ fn candidate_mfts(cfg: &EncoderConfig) -> Result<Vec<(IMFActivate, EncoderPath)>
         Err(e) => tracing::warn!("software MFT enumeration failed: {e}"),
     }
     Ok(out)
+}
+
+/// Walk `candidates` best-first and return the first one `build` accepts.
+///
+/// The demotion ladder, lifted out of [`MfH264Encoder::new`] and made generic
+/// over the candidate type for one reason: activation is COM and hardware, but
+/// the *ordering rules* are not, and those rules are what stands between "this
+/// GPU is out of NVENC sessions" and a dead second monitor. With the ladder in
+/// a plain function the rules are unit-testable (see `tests::ladder`) without
+/// an MFT, a D3D device or a COM apartment anywhere near them.
+///
+/// The contract, in order:
+///
+/// * an empty list is its own diagnosis — nothing was registered, which is a
+///   different problem from everything having refused;
+/// * the first `Ok` wins immediately, and no candidate below it is activated or
+///   discarded;
+/// * every `Err` is logged with the candidate's name and tier, handed to
+///   `discard` (which releases what the failed activation created), and then
+///   demoted past — a failure at ANY position continues the walk;
+/// * if the list runs out, the last reason is reported along with how many
+///   candidates refused, because "the software encoder said no" on its own
+///   hides the hardware reason that actually mattered.
+fn first_usable<C, T>(
+    candidates: Vec<(C, EncoderPath)>,
+    name_of: impl Fn(&C) -> String,
+    build: impl Fn(&C, EncoderPath, String) -> Result<T>,
+    discard: impl Fn(&C),
+) -> Result<T> {
+    if candidates.is_empty() {
+        return Err(Error::Encoder(
+            "no H.264 encoder MFT of any kind is registered".into(),
+        ));
+    }
+    let tried = candidates.len();
+    let mut last_err = None;
+    for (candidate, path) in candidates {
+        let name = name_of(&candidate);
+        match build(&candidate, path, name.clone()) {
+            Ok(built) => return Ok(built),
+            Err(e) => {
+                tracing::warn!(
+                    "encoder candidate \"{name}\" ({}) unusable: {e}",
+                    path.label()
+                );
+                discard(&candidate);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(match last_err {
+        // Unwrap our own variant so the message does not read
+        // "encoder: ... last: encoder: ...".
+        Some(Error::Encoder(msg)) => Error::Encoder(format!(
+            "all {tried} H.264 encoder candidate(s) refused; last: {msg}"
+        )),
+        Some(other) => other,
+        // Unreachable: the list was non-empty and every iteration either
+        // returned or recorded an error. Kept total rather than panicking.
+        None => Error::Encoder("no usable H.264 encoder MFT".into()),
+    })
 }
 
 /// Does this MFT advertise the given `VEN_xxxx` hardware vendor ID?
@@ -1903,5 +2009,175 @@ mod tests {
         assert!(!EncoderPath::Software.is_hardware());
         assert!(EncoderPath::Software.label().contains("SOFTWARE"));
         assert!(EncoderPath::HardwareSameAdapter.is_hardware());
+    }
+
+    /// The demotion ladder, without COM.
+    ///
+    /// Full activation cannot be exercised headlessly — it needs a real MFT, a
+    /// D3D device and an apartment — but the ladder's *rules* are ordinary
+    /// control flow, and they are the part that kills a stream when they are
+    /// wrong. `first_usable` exists as a seam precisely so these can be pinned
+    /// down: a fake candidate is a name and a yes/no, and the tests assert what
+    /// was attempted, in what order, and what was released afterwards.
+    mod ladder {
+        use super::super::{first_usable, EncoderPath};
+        use directdesk_shared::{Error, Result};
+        use std::cell::RefCell;
+
+        /// One fake MFT. `works == false` means "refused activation", which is
+        /// what an out-of-NVENC-sessions vendor encoder looks like from here.
+        struct Candidate {
+            name: &'static str,
+            works: bool,
+        }
+
+        fn hw(name: &'static str, works: bool) -> (Candidate, EncoderPath) {
+            (
+                Candidate { name, works },
+                EncoderPath::HardwareSameAdapter,
+            )
+        }
+
+        fn sw(name: &'static str, works: bool) -> (Candidate, EncoderPath) {
+            (Candidate { name, works }, EncoderPath::Software)
+        }
+
+        type Walk = (
+            Result<(&'static str, EncoderPath)>,
+            Vec<&'static str>,
+            Vec<&'static str>,
+        );
+
+        /// Run the ladder and report what it did: the result, the candidates it
+        /// attempted in order, and the candidates it discarded in order.
+        fn walk(candidates: Vec<(Candidate, EncoderPath)>) -> Walk {
+            let attempted = RefCell::new(Vec::new());
+            let discarded = RefCell::new(Vec::new());
+            let out = first_usable(
+                candidates,
+                |c: &Candidate| c.name.to_string(),
+                |c: &Candidate, path, name| {
+                    // The name the ladder logs and the name the builder sees
+                    // must be the same string, or a demotion warning points at
+                    // the wrong encoder.
+                    assert_eq!(name, c.name, "builder got a different name");
+                    attempted.borrow_mut().push(c.name);
+                    if c.works {
+                        Ok((c.name, path))
+                    } else {
+                        Err(Error::Encoder(format!("{} is already in use", c.name)))
+                    }
+                },
+                |c: &Candidate| discarded.borrow_mut().push(c.name),
+            );
+            (out, attempted.into_inner(), discarded.into_inner())
+        }
+
+        #[test]
+        fn the_first_working_candidate_wins_and_nothing_below_it_is_touched() {
+            let (out, attempted, discarded) =
+                walk(vec![hw("nvenc", true), hw("qsv", true), sw("ms", true)]);
+            let (name, path) = out.expect("the first candidate builds");
+            assert_eq!(name, "nvenc");
+            assert_eq!(path, EncoderPath::HardwareSameAdapter);
+            assert_eq!(
+                attempted,
+                vec!["nvenc"],
+                "the ladder must stop dead at the first Ok"
+            );
+            assert!(
+                discarded.is_empty(),
+                "a candidate that worked is never shut down"
+            );
+        }
+
+        /// The T-nvenc case in miniature: the consumer GPU is out of NVENC
+        /// sessions, so both hardware entries refuse and the software SYNCMFT
+        /// has to carry the second monitor. `new()` must NOT fail here.
+        #[test]
+        fn exhausted_hardware_demotes_all_the_way_to_software() {
+            let (out, attempted, discarded) = walk(vec![
+                hw("nvenc (capture adapter)", false),
+                hw("nvenc (any adapter)", false),
+                sw("ms software", true),
+            ]);
+            let (name, path) = out.expect("software must catch the fall");
+            assert_eq!(name, "ms software");
+            assert_eq!(path, EncoderPath::Software);
+            assert_eq!(
+                attempted,
+                vec![
+                    "nvenc (capture adapter)",
+                    "nvenc (any adapter)",
+                    "ms software"
+                ]
+            );
+            assert_eq!(
+                discarded,
+                vec!["nvenc (capture adapter)", "nvenc (any adapter)"],
+                "every failed activation is released, and only those"
+            );
+        }
+
+        /// Activation can fail at ActivateObject, at media-type negotiation, at
+        /// the D3D attach or at BEGIN_STREAMING; from the ladder's side those
+        /// are indistinguishable, so what matters is that a refusal at ANY
+        /// position keeps walking instead of aborting.
+        #[test]
+        fn a_refusal_at_any_position_demotes_rather_than_aborting() {
+            const NAMES: [&str; 3] = ["first", "second", "third"];
+            for good in 0..NAMES.len() {
+                let list = NAMES
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, n)| hw(n, i == good))
+                    .collect::<Vec<_>>();
+                let (out, attempted, discarded) = walk(list);
+                assert_eq!(
+                    out.expect("one candidate works").0,
+                    NAMES[good],
+                    "working candidate at index {good} was not selected"
+                );
+                assert_eq!(attempted, NAMES[..=good].to_vec(), "good={good}");
+                assert_eq!(discarded, NAMES[..good].to_vec(), "good={good}");
+            }
+        }
+
+        #[test]
+        fn an_exhausted_ladder_reports_the_count_and_the_last_reason() {
+            let (out, attempted, discarded) = walk(vec![hw("nvenc", false), sw("ms", false)]);
+            let msg = out.err().expect("nothing usable").to_string();
+            assert!(msg.contains('2'), "must say how many were tried: {msg}");
+            assert!(
+                msg.contains("ms is already in use"),
+                "must carry the last reason: {msg}"
+            );
+            // A non-Encoder error would be passed through unwrapped; ours is an
+            // Encoder error, so the message must not be doubly prefixed.
+            assert_eq!(
+                msg.matches("encoder: ").count(),
+                1,
+                "nested Error::Encoder prefixes: {msg}"
+            );
+            assert_eq!(attempted, vec!["nvenc", "ms"]);
+            assert_eq!(discarded, vec!["nvenc", "ms"]);
+        }
+
+        #[test]
+        fn no_candidates_at_all_is_its_own_diagnosis() {
+            let err = first_usable::<Candidate, ()>(
+                Vec::new(),
+                |c| c.name.to_string(),
+                |_, _, _| Ok(()),
+                |_| unreachable!("nothing was activated, so nothing can be discarded"),
+            )
+            .err()
+            .expect("an empty list cannot produce an encoder");
+            let msg = err.to_string();
+            assert!(msg.contains("of any kind is registered"), "{msg}");
+            // Distinct from the exhausted-ladder message: "none registered" and
+            // "all refused" are different faults with different fixes.
+            assert!(!msg.contains("refused"), "{msg}");
+        }
     }
 }
