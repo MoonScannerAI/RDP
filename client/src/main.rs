@@ -294,6 +294,10 @@ fn spawn_input_sink(mut transport: TransportEndpoints) {
                     InputMsg::Event(InputEvent::MouseButton { .. }) => buttons += 1,
                     InputMsg::Event(InputEvent::MouseWheel { .. }) => wheels += 1,
                     InputMsg::ReleaseAll => releases += 1,
+                    // Appended alongside `features::MULTI_MONITOR`; the capture
+                    // path cannot produce one until that feature is wired, so
+                    // this sink has nothing to count yet.
+                    InputMsg::EventOn { .. } => {}
                 }
                 if last_log.elapsed() >= std::time::Duration::from_secs(2) {
                     last_log = std::time::Instant::now();

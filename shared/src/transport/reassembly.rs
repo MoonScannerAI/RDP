@@ -940,6 +940,7 @@ mod tests {
             frag_count,
             keyframe,
             parity: false,
+            stream: 0,
             block_size: 0,
             last_frag_len: 0,
             timestamp_ms: ts,

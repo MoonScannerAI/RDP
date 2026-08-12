@@ -8,7 +8,8 @@
 //! 6      2    frag_count   (u16, >= 1) number of DATA fragments (N)
 //! 8      1    flags        (bit0 = keyframe, bit1 = parity, bit2 = AUDIO —
 //!                          never set by this module, and rejected on decode;
-//!                          see [`FLAG_AUDIO`] and [`crate::audio`])
+//!                          see [`FLAG_AUDIO`] and [`crate::audio`] —
+//!                          bit3 = stream 1, see [`FLAG_STREAM1`])
 //! 9      1    block_size   (K, FEC block size; 0 = no FEC)
 //! 10     4    DATA: timestamp_ms (u32); PARITY: last_frag_len (u16) then 0 (u16)
 //! ```
@@ -44,11 +45,12 @@ pub const FLAG_PARITY: u8 = 0b0000_0010;
 /// It lives in the *video* flag space, at the video flags offset, because that
 /// is the only way one byte can separate the two kinds of media datagram: see
 /// [`crate::audio`] for the demux itself. Nothing in this module ever sets it —
-/// [`FragHeader::encode`] writes only [`FLAG_KEYFRAME`] and [`FLAG_PARITY`] —
-/// and, more importantly:
+/// [`FragHeader::encode`] writes only [`FLAG_KEYFRAME`], [`FLAG_PARITY`] and
+/// [`FLAG_STREAM1`] — and, more importantly:
 ///
-/// **[`FragHeader::decode`]'s allowed mask must stay
-/// `!(FLAG_KEYFRAME | FLAG_PARITY)`, i.e. it must go on REJECTING this bit.**
+/// **[`FragHeader::decode`]'s allowed mask is
+/// `!(FLAG_KEYFRAME | FLAG_PARITY | FLAG_STREAM1)`, and this bit must stay
+/// OUTSIDE it: decode must go on REJECTING `FLAG_AUDIO`.**
 /// Widening the mask to tolerate `FLAG_AUDIO` looks like harmless forward
 /// compatibility and is not. That rejection is the backstop that keeps an audio
 /// datagram from ever reaching the reassembler's `accept_frame_id`: an audio
@@ -61,10 +63,51 @@ pub const FLAG_PARITY: u8 = 0b0000_0010;
 /// demands a keyframe. The visible symptom is a video stall with no error, on a
 /// session whose only fault was that audio and video share a datagram path.
 ///
+/// The mask *has* been widened once since this was written — for
+/// [`FLAG_STREAM1`], the second monitor's tag — so "it grew before" will be
+/// available as an argument and is not one. That bit is a value this module
+/// itself writes and reads, on datagrams that are already video. This bit
+/// announces a different format with a different meaning for every byte after
+/// it, and tolerating it is how those bytes get read as video.
+///
 /// `is_audio_datagram` is the routing decision; this rejection is the safety
 /// net for the day some future caller forgets to consult it. Keep both.
 /// `video_decode_still_rejects_the_audio_flag` in the tests below pins it.
 pub const FLAG_AUDIO: u8 = 0b0000_0100;
+/// Marks a video fragment as belonging to **stream 1** — the second monitor.
+///
+/// Absence of the bit means stream 0, which is what every fragment a
+/// single-monitor session has ever sent looks like: this is the whole reason
+/// the second stream is a flag rather than a new header field. Widening
+/// [`FRAG_HEADER_LEN`] would change where the payload starts for every peer,
+/// deployed or not; spending a spare flag bit costs nothing and leaves stream
+/// 0's bytes untouched.
+///
+/// Like [`FLAG_AUDIO`], it is peeked at [`FRAG_FLAGS_OFFSET`] by the session's
+/// datagram demux *before* anything is parsed — see [`datagram_stream_id`] —
+/// because the receiver has to pick which reassembler a datagram belongs to
+/// before it has a header to consult. Sharing that one byte with the audio
+/// demux is what keeps routing a single compare against a slice of unknown
+/// provenance.
+///
+/// A new host sets it only once [`crate::protocol::features::MULTI_MONITOR`]
+/// came back mutual, which is the same one-sided safety `FLAG_AUDIO` relies on
+/// and is worth being precise about. An old peer handed a stream-1 fragment
+/// rejects it in [`FragHeader::decode`] as an unknown flag: warn and drop,
+/// non-fatal, one dropped datagram. That is *survivable* — but survivable is
+/// not the guarantee. "Never sent unless negotiated" is, because a steady
+/// stream of warn-and-drop fragments is an invisible second monitor plus a
+/// flooded log, not a clean degradation.
+///
+/// One deliberate overlap to know about: this is bit 3, the same bit
+/// [`crate::audio::FLAG_DISCONTINUITY`] uses in the same byte at the same
+/// offset. They cannot be confused because [`FLAG_AUDIO`] is what discriminates
+/// the two formats first — an audio packet always sets bit 2 and so never
+/// reaches this module's decode, and a video fragment never sets bit 2 and so
+/// never reaches the audio parser. The flag *space* is shared; the flag
+/// *meanings* are per-format, and reading bit 3 without having settled which
+/// format you hold is the mistake to avoid.
+pub const FLAG_STREAM1: u8 = 0b0000_1000;
 /// Sanity cap: no encoded frame may exceed this many fragments.
 pub const MAX_FRAGS_PER_FRAME: u16 = 512;
 /// Sanity cap on a single reassembled frame (2 MiB is generous for 1080p H.264).
@@ -79,6 +122,12 @@ pub struct FragHeader {
     /// True on parity fragments: `frag_index` is a block index and the
     /// timestamp field carries `last_frag_len` instead of a capture time.
     pub parity: bool,
+    /// Which video stream this fragment belongs to: `0` (the primary output,
+    /// and everything a single-monitor session sends) or `1` (the second
+    /// monitor). Carried as [`FLAG_STREAM1`] in the flags byte, so `0` encodes
+    /// byte-identically to a pre-multi-monitor header. Every fragment of a
+    /// frame — data *and* parity — carries the same value.
+    pub stream: u8,
     /// FEC block size K (0 = no FEC). Present on both data and parity headers.
     pub block_size: u8,
     /// Parity only: byte length of the frame's final (short) data fragment.
@@ -98,6 +147,9 @@ impl FragHeader {
         }
         if self.parity {
             flags |= FLAG_PARITY;
+        }
+        if self.stream == 1 {
+            flags |= FLAG_STREAM1;
         }
         out.push(flags);
         out.push(self.block_size);
@@ -122,7 +174,9 @@ impl FragHeader {
 
         // Deliberately narrow: `FLAG_AUDIO` is NOT in this mask and must not be
         // added to it. See `FLAG_AUDIO`'s docs for what widening it costs.
-        if flags & !(FLAG_KEYFRAME | FLAG_PARITY) != 0 {
+        // `FLAG_STREAM1` is in it because this module now *emits* it; the audio
+        // bit is the one that stays out.
+        if flags & !(FLAG_KEYFRAME | FLAG_PARITY | FLAG_STREAM1) != 0 {
             return Err(Error::Invalid(format!("unknown flags {flags:#x}")));
         }
         if frag_count == 0 || frag_count > MAX_FRAGS_PER_FRAME {
@@ -130,6 +184,7 @@ impl FragHeader {
         }
         let keyframe = flags & FLAG_KEYFRAME != 0;
         let parity = flags & FLAG_PARITY != 0;
+        let stream = u8::from(flags & FLAG_STREAM1 != 0);
 
         let (timestamp_ms, last_frag_len) = if parity {
             // Parity fragment: `frag_index` is a block index in
@@ -171,6 +226,7 @@ impl FragHeader {
                 frag_count,
                 keyframe,
                 parity,
+                stream,
                 block_size,
                 last_frag_len,
                 timestamp_ms,
@@ -203,7 +259,34 @@ pub fn fragment_frame(frame: &EncodedFrame, max_datagram: usize) -> Result<Vec<V
     fragment_frame_fec(frame, max_datagram, 0)
 }
 
-/// Split one encoded frame into datagram-sized fragments **with XOR parity**.
+/// Split one encoded frame into datagram-sized fragments **with XOR parity**,
+/// on video stream 0.
+///
+/// This is precisely [`fragment_frame_fec_on`] with `stream = 0`, which is how
+/// "the primary output" is spelled on the wire: no [`FLAG_STREAM1`] bit, hence
+/// bytes identical to every fragment this function emitted before multi-monitor
+/// existed. It delegates rather than keeping its own loop for the same
+/// anti-drift reason [`fragment_frame`] does — stream 0's fragments are
+/// *required* to stay byte-identical to the tagged path's minus one flag bit,
+/// and two copies of the chunking would let that requirement rot without a
+/// compiler error.
+pub fn fragment_frame_fec(
+    frame: &EncodedFrame,
+    max_datagram: usize,
+    block_size: u8,
+) -> Result<Vec<Vec<u8>>> {
+    fragment_frame_fec_on(frame, max_datagram, block_size, 0)
+}
+
+/// Split one encoded frame into datagram-sized fragments **with XOR parity**,
+/// tagged for video `stream` (0 = primary, 1 = second monitor).
+///
+/// `stream` is written as [`FLAG_STREAM1`] into every fragment of the frame —
+/// data *and* parity alike, without exception. A parity fragment that lost its
+/// stream tag would be XORed into the wrong stream's recovery buffer by a
+/// receiver that demuxes on the bit, silently corrupting a frame that was never
+/// even damaged; that is why the tag is a property of the frame here rather
+/// than an argument the parity loop could forget to pass on.
 ///
 /// The data fragments are identical to [`fragment_frame`]'s (same chunking,
 /// same caps) except each carries `block_size` in its header so the receiver
@@ -225,10 +308,11 @@ pub fn fragment_frame(frame: &EncodedFrame, max_datagram: usize) -> Result<Vec<V
 ///
 /// With `block_size == 0` or a single data fragment there is nothing a parity
 /// block could recover, so only the data fragments are returned.
-pub fn fragment_frame_fec(
+pub fn fragment_frame_fec_on(
     frame: &EncodedFrame,
     max_datagram: usize,
     block_size: u8,
+    stream: u8,
 ) -> Result<Vec<Vec<u8>>> {
     if frame.data.is_empty() {
         return Err(Error::Invalid("empty frame".into()));
@@ -265,6 +349,7 @@ pub fn fragment_frame_fec(
             frag_count: count as u16,
             keyframe: frame.keyframe,
             parity: false,
+            stream,
             block_size,
             last_frag_len: 0,
             timestamp_ms: frame.timestamp_ms,
@@ -316,6 +401,9 @@ pub fn fragment_frame_fec(
             frag_count: count as u16,
             keyframe: frame.keyframe,
             parity: true,
+            // Same tag as this block's data fragments, by construction: the
+            // parity payload is only meaningful against them.
+            stream,
             block_size,
             last_frag_len,
             timestamp_ms: 0,
@@ -325,6 +413,33 @@ pub fn fragment_frame_fec(
         out.push(dgram);
     }
     Ok(out)
+}
+
+/// Which video stream a datagram belongs to, from one byte and no parsing.
+///
+/// Returns `1` iff [`FLAG_STREAM1`] is set at [`FRAG_FLAGS_OFFSET`], else `0`.
+/// The counterpart to [`crate::audio::is_audio_datagram`], and used the same
+/// way and in the same place: the session demux needs to hand a datagram to the
+/// right reassembler *before* it has a header, because deciding that is what
+/// tells it which reassembler to parse the header with.
+///
+/// **Call it only on something already established to be video** — audio
+/// datagrams spend bit 3 on [`crate::audio::FLAG_DISCONTINUITY`], so route with
+/// `is_audio_datagram` first and ask this second. Doing it in the other order
+/// reads a discontinuity marker as a stream tag.
+///
+/// Total by construction: a short or empty slice answers `0` rather than
+/// panicking. That is not defensive habit — QUIC permits a zero-length
+/// datagram, and this function's whole point is to run on a slice of unknown
+/// provenance before anything has validated its length. Hence `.get`, never
+/// indexing. A malformed datagram answering "stream 0" is harmless: the
+/// stream-0 reassembler rejects it in [`FragHeader::decode`] a moment later,
+/// which is where malformed input is supposed to die.
+pub fn datagram_stream_id(d: &[u8]) -> u8 {
+    match d.get(FRAG_FLAGS_OFFSET) {
+        Some(flags) if flags & FLAG_STREAM1 != 0 => 1,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +464,7 @@ mod tests {
             frag_count: 5,
             keyframe: true,
             parity: false,
+            stream: 0,
             block_size: 0,
             last_frag_len: 0,
             timestamp_ms: 99,
@@ -371,6 +487,7 @@ mod tests {
             frag_count: 5,
             keyframe: false,
             parity: true,
+            stream: 0,
             block_size: 4,
             last_frag_len: 321,
             timestamp_ms: 0,
@@ -405,6 +522,15 @@ mod tests {
                     fragment_frame_fec(&frame, mtu, 0).unwrap(),
                     "len {len}, mtu {mtu}"
                 );
+                // Second link in the same chain: `fragment_frame_fec` is now
+                // itself a wrapper over `fragment_frame_fec_on(.., 0)`. Pinning
+                // it here keeps the stream-0 path provably one implementation
+                // deep rather than three that agree today.
+                assert_eq!(
+                    fragment_frame_fec(&frame, mtu, 4).unwrap(),
+                    fragment_frame_fec_on(&frame, mtu, 4, 0).unwrap(),
+                    "len {len}, mtu {mtu} (with parity)"
+                );
             }
         }
     }
@@ -419,6 +545,7 @@ mod tests {
             frag_count: 5,
             keyframe: false,
             parity: false,
+            stream: 0,
             block_size: 0,
             last_frag_len: 0,
             timestamp_ms: 0,
@@ -436,6 +563,7 @@ mod tests {
             frag_count: 5,
             keyframe: false,
             parity: true,
+            stream: 0,
             block_size: 4,
             last_frag_len: 1,
             timestamp_ms: 0,
@@ -548,6 +676,7 @@ mod tests {
             frag_count: 1,
             keyframe: true,
             parity: false,
+            stream: 0,
             block_size: 0,
             last_frag_len: 0,
             timestamp_ms: 1234,
@@ -591,5 +720,265 @@ mod tests {
         let tiny = fragment_frame_fec(&mk(50), 1200, 10).unwrap();
         assert_eq!(tiny.len(), 1);
         assert!(!FragHeader::decode(&tiny[0]).unwrap().0.parity);
+    }
+
+    /// The stream tag must be its own bit in the shared flag space.
+    ///
+    /// Cheap, and it catches the one mistake that would be invisible in every
+    /// other test here: reusing a bit that already means something. Colliding
+    /// with `FLAG_KEYFRAME` or `FLAG_PARITY` would corrupt this module's own
+    /// decode; colliding with `FLAG_AUDIO` would make every stream-1 fragment
+    /// classify as audio in the datagram demux.
+    #[test]
+    fn stream1_flag_is_distinct() {
+        for other in [FLAG_KEYFRAME, FLAG_PARITY, FLAG_AUDIO] {
+            assert_eq!(
+                FLAG_STREAM1 & other,
+                0,
+                "FLAG_STREAM1 collides with an existing flag bit"
+            );
+        }
+        assert_eq!(FLAG_STREAM1.count_ones(), 1, "the tag must be a single bit");
+    }
+
+    #[test]
+    fn stream1_header_roundtrip() {
+        // Data fragment on stream 1.
+        let mut buf = Vec::new();
+        let h = FragHeader {
+            frame_id: 11,
+            frag_index: 2,
+            frag_count: 5,
+            keyframe: true,
+            parity: false,
+            stream: 1,
+            block_size: 0,
+            last_frag_len: 0,
+            timestamp_ms: 99,
+        };
+        h.encode(&mut buf);
+        buf.push(0xFF);
+        let (back, payload) = FragHeader::decode(&buf).unwrap();
+        assert_eq!(h, back);
+        assert_eq!(back.stream, 1);
+        assert_eq!(payload, &[0xFF]);
+
+        // Parity fragment on stream 1: the tag rides parity headers too, or a
+        // receiver demuxing on the bit would XOR it into the wrong stream.
+        let mut pbuf = Vec::new();
+        let p = FragHeader {
+            frame_id: 11,
+            frag_index: 1,
+            frag_count: 5,
+            keyframe: false,
+            parity: true,
+            stream: 1,
+            block_size: 4,
+            last_frag_len: 321,
+            timestamp_ms: 0,
+        };
+        p.encode(&mut pbuf);
+        pbuf.push(0xFF);
+        let (pback, ppayload) = FragHeader::decode(&pbuf).unwrap();
+        assert_eq!(p, pback);
+        assert_eq!(pback.stream, 1);
+        assert!(pback.parity);
+        assert_eq!(ppayload, &[0xFF]);
+    }
+
+    /// A `stream: 0` header must encode to exactly the bytes it encoded to
+    /// before the stream tag existed.
+    ///
+    /// This is the anti-brick assertion for the whole multi-monitor datagram
+    /// change. The 14-byte header is fixed-width and positional, with no
+    /// version and nothing for a receiver to negotiate — an already-deployed
+    /// client parses byte 8 as flags and bytes 10..14 as a timestamp no matter
+    /// what this commit believes. Expected bytes are written out by hand rather
+    /// than round-tripped through `encode` on purpose: a test that asks the new
+    /// code what it produces cannot notice the new code producing something
+    /// different from the old.
+    #[test]
+    fn stream0_headers_are_byte_identical_to_before_multi_monitor() {
+        let mut data = Vec::new();
+        FragHeader {
+            frame_id: 1,
+            frag_index: 2,
+            frag_count: 5,
+            keyframe: true,
+            parity: false,
+            stream: 0,
+            block_size: 0,
+            last_frag_len: 0,
+            timestamp_ms: 99,
+        }
+        .encode(&mut data);
+        assert_eq!(
+            data,
+            vec![
+                0x01, 0x00, 0x00, 0x00, // frame_id     u32 LE 1
+                0x02, 0x00, // frag_index           u16 LE 2
+                0x05, 0x00, // frag_count           u16 LE 5
+                0x01, // flags: FLAG_KEYFRAME only — NO stream bit
+                0x00, // block_size 0 (no FEC)
+                0x63, 0x00, 0x00, 0x00, // timestamp_ms u32 LE 99
+            ],
+            "a stream-0 data header changed shape — every deployed peer parses \
+             this layout positionally, with no version field to save it"
+        );
+
+        let mut parity = Vec::new();
+        FragHeader {
+            frame_id: 7,
+            frag_index: 1,
+            frag_count: 5,
+            keyframe: false,
+            parity: true,
+            stream: 0,
+            block_size: 4,
+            last_frag_len: 321,
+            timestamp_ms: 0,
+        }
+        .encode(&mut parity);
+        assert_eq!(
+            parity,
+            vec![
+                0x07, 0x00, 0x00, 0x00, // frame_id  u32 LE 7
+                0x01, 0x00, // frag_index (block index) u16 LE 1
+                0x05, 0x00, // frag_count               u16 LE 5
+                0x02, // flags: FLAG_PARITY only — NO stream bit
+                0x04, // block_size K=4
+                0x41, 0x01, // last_frag_len u16 LE 321 (repurposed timestamp)
+                0x00, 0x00, // zero pad
+            ],
+            "a stream-0 parity header changed shape"
+        );
+
+        // And the tag is exactly one bit of difference, in the flags byte and
+        // nowhere else — proof that stream 1 is a flag, not a layout change.
+        let mut tagged = Vec::new();
+        FragHeader {
+            frame_id: 1,
+            frag_index: 2,
+            frag_count: 5,
+            keyframe: true,
+            parity: false,
+            stream: 1,
+            block_size: 0,
+            last_frag_len: 0,
+            timestamp_ms: 99,
+        }
+        .encode(&mut tagged);
+        let mut expected = data.clone();
+        expected[FRAG_FLAGS_OFFSET] |= FLAG_STREAM1;
+        assert_eq!(tagged, expected);
+        assert_eq!(tagged.len(), FRAG_HEADER_LEN);
+    }
+
+    /// `decode` accepts the stream bit, and the widened mask stops there.
+    ///
+    /// The mask grew from `!(KEYFRAME | PARITY)` to
+    /// `!(KEYFRAME | PARITY | STREAM1)` for this feature, so this test pins
+    /// both halves of that: the new bit gets through, and the bits either side
+    /// of it — `FLAG_AUDIO` below, the first reserved bit above — still do not.
+    /// `video_decode_still_rejects_the_audio_flag` is the standalone tripwire
+    /// for the audio bit and is deliberately left untouched; the case here is
+    /// the *combination* it cannot cover, a datagram carrying both bits.
+    #[test]
+    fn decode_accepts_stream1_and_still_rejects_the_rest() {
+        let mut buf = Vec::new();
+        FragHeader {
+            frame_id: 3,
+            frag_index: 0,
+            frag_count: 1,
+            keyframe: true,
+            parity: false,
+            stream: 1,
+            block_size: 0,
+            last_frag_len: 0,
+            timestamp_ms: 5,
+        }
+        .encode(&mut buf);
+        buf.push(0xFF);
+        let (h, _) = FragHeader::decode(&buf).expect("the stream tag must decode");
+        assert_eq!(h.stream, 1);
+        assert!(h.keyframe);
+
+        // Audio bit *on top of* the stream bit: still rejected. A mask widened
+        // one bit too far would let this through as a stream-1 video fragment.
+        let mut with_audio = buf.clone();
+        with_audio[FRAG_FLAGS_OFFSET] |= FLAG_AUDIO;
+        let err = FragHeader::decode(&with_audio)
+            .expect_err("FLAG_AUDIO must stay rejected, stream tag or not");
+        match err {
+            Error::Invalid(msg) => assert!(
+                msg.contains("unknown flags"),
+                "expected the unknown-flags rejection, got: {msg}"
+            ),
+            other => panic!("expected Error::Invalid(unknown flags), got: {other}"),
+        }
+
+        // The first bit above the stream tag is still reserved.
+        let mut reserved = buf.clone();
+        reserved[FRAG_FLAGS_OFFSET] |= 0b1_0000;
+        assert!(
+            FragHeader::decode(&reserved).is_err(),
+            "reserved flag bits must stay rejected"
+        );
+    }
+
+    /// The one-byte demux is total: it runs before anything has checked a
+    /// length, and QUIC permits a zero-length datagram.
+    #[test]
+    fn datagram_stream_id_never_panics() {
+        assert_eq!(datagram_stream_id(&[]), 0, "empty datagram");
+        assert_eq!(
+            datagram_stream_id(&[0u8; FRAG_FLAGS_OFFSET]),
+            0,
+            "one byte short of the flags byte"
+        );
+
+        let frame = mk(3000);
+        for f in fragment_frame_fec_on(&frame, 1200, 4, 1).unwrap() {
+            assert_eq!(datagram_stream_id(&f), 1);
+        }
+        for f in fragment_frame_fec_on(&frame, 1200, 4, 0).unwrap() {
+            assert_eq!(datagram_stream_id(&f), 0);
+        }
+    }
+
+    /// Every datagram of a stream-1 frame carries the tag — parity included.
+    #[test]
+    fn fragment_frame_fec_on_tags_every_fragment() {
+        let frame = mk(10_000);
+        let mtu = 1200;
+        let k = 4u8;
+        let frags = fragment_frame_fec_on(&frame, mtu, k, 1).unwrap();
+
+        let n = frame.data.len().div_ceil(mtu - FRAG_HEADER_LEN);
+        let num_blocks = n.div_ceil(k as usize);
+        assert_eq!(
+            frags.len(),
+            n + num_blocks,
+            "want data and parity fragments"
+        );
+
+        let mut saw_parity = false;
+        for f in &frags {
+            assert_eq!(f[FRAG_FLAGS_OFFSET] & FLAG_STREAM1, FLAG_STREAM1);
+            let (h, _) = FragHeader::decode(f).expect("a tagged fragment must decode");
+            assert_eq!(h.stream, 1);
+            saw_parity |= h.parity;
+        }
+        assert!(saw_parity, "fixture must include parity fragments");
+
+        // Stream 0 stays untagged over the same fixture — the two paths differ
+        // by exactly the flag bit and nothing else.
+        let plain = fragment_frame_fec_on(&frame, mtu, k, 0).unwrap();
+        assert_eq!(plain.len(), frags.len());
+        for (untagged, tagged) in plain.iter().zip(&frags) {
+            let mut want = untagged.clone();
+            want[FRAG_FLAGS_OFFSET] |= FLAG_STREAM1;
+            assert_eq!(&want, tagged);
+        }
     }
 }

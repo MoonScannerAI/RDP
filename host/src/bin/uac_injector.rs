@@ -284,6 +284,17 @@ fn handle_input(inj: &mut WinInjector, geom: Option<(u32, u32, i32, i32)>, input
             return;
         }
         InputMsg::Event(ev) => ev,
+        // Appended alongside `features::MULTI_MONITOR`, which nothing
+        // negotiates yet, so nothing can put this on the UAC pipe. Dropped
+        // rather than unwrapped to its inner event: this process injects as
+        // SYSTEM against the consent dialog, and it must not widen what it
+        // will inject on the strength of a variant no code path produces.
+        InputMsg::EventOn { .. } => {
+            tracing::debug!(
+                "EventOn on the UAC pipe before multi-monitor input is wired; dropping"
+            );
+            return;
+        }
     };
 
     // GUARDRAIL 1: only inject while the real consent dialog owns the foreground.

@@ -101,6 +101,36 @@ pub mod features {
     /// `ControlMsg` variant for the reason the wire-stability tests below spell
     /// out: both of those brick an already-deployed remote host.
     pub const SYSTEM_AUDIO: u64 = 1 << 4;
+    /// Multi-monitor streaming: the host enumerates its outputs
+    /// ([`super::ControlMsg::MonitorList`]), the client picks which ones it
+    /// wants ([`super::ControlMsg::SelectMonitors`]), and a second video stream
+    /// — tagged with [`crate::video::FLAG_STREAM1`] in the datagram flags byte —
+    /// carries the extra output alongside the existing one.
+    ///
+    /// Negotiated as an intersection, exactly like [`LOSSLESS_TILES`] and
+    /// [`SYSTEM_AUDIO`]: the client sets the bit in its `Hello` to say it can
+    /// render more than one output, and the host echoes it only if it too
+    /// supports the feature **and** is configured for it. The host sends no
+    /// `MonitorList`, no `StreamConfig`, and no stream-1 datagram unless the bit
+    /// came back mutual, and the client sends no `SelectMonitors` and no
+    /// `InputMsg::EventOn` — so a peer that predates this feature sees a session
+    /// byte-for-byte identical to today's single-monitor one.
+    ///
+    /// That gate is load-bearing in both directions, and more so here than for
+    /// tiles or audio. The new `ControlMsg` and `InputMsg` variants are appended
+    /// discriminants, which an old peer's `decode_strict` rejects as an unknown
+    /// variant — fatal on the control stream, and fatal on the *input* stream,
+    /// where it would kill the operator's keyboard and mouse. Stream-1 video
+    /// datagrams are the gentler case: an old peer's `FragHeader::decode`
+    /// rejects the flag and drops the datagram with a warning, which costs a
+    /// second window rather than the session. "Never sent unless mutual" is what
+    /// keeps all of that theoretical.
+    ///
+    /// This is a feature bit rather than a `PROTOCOL_VERSION` bump for the
+    /// reason the wire-stability tests below spell out: a bump bricks an
+    /// already-deployed remote host, and the host is reachable only through the
+    /// session this protocol carries.
+    pub const MULTI_MONITOR: u64 = 1 << 5;
 }
 
 /// Pairing + steady-state authentication messages.
@@ -147,6 +177,64 @@ pub enum AuthMsg {
     AuthFail {
         reason: String,
     },
+}
+
+/// Hard cap on how many monitors a `MonitorList` may describe.
+///
+/// A receiver-side sanity bound, not a statement about hardware: it exists so
+/// that a `Vec<MonitorInfo>` arriving from the network is never sized from a
+/// count the peer chose. Sixteen outputs is far past any real desk and still
+/// trivially cheap to hold. Pair it with [`MAX_VIDEO_STREAMS`]: **never
+/// allocate from a wire-declared count beyond these two.** The
+/// [`MAX_CONTROL_MSG`] frame cap already bounds the bytes, but a decoder that
+/// pre-sizes from a length field is a distinct mistake, and postcard's own
+/// length prefix is peer-controlled.
+pub const MAX_MONITORS: usize = 16;
+/// Hard cap on concurrent video streams in one session: stream 0 (the legacy,
+/// always-present one) plus at most one tagged second stream.
+///
+/// Two is the number the datagram wire can actually express — the fragment
+/// flags byte spends exactly one bit on the stream tag
+/// ([`crate::video::FLAG_STREAM1`]), so a third stream is not a config change
+/// but a wire change. The host truncates `SelectMonitors` to this length rather
+/// than erroring, and the client allocates at most this many decoders; neither
+/// side sizes anything from a peer-declared count.
+pub const MAX_VIDEO_STREAMS: u8 = 2;
+
+/// One capturable output on the host, as advertised in
+/// [`ControlMsg::MonitorList`].
+///
+/// **`id` is SESSION-scoped and is not stable across reconnects.** It is an
+/// index the host assigns when it enumerates, not a Windows display id, an
+/// adapter id, or anything the operating system would recognise: id `0` is
+/// ALWAYS the primary output — the one today's single stream already shows —
+/// and `1..N` are the remaining outputs sorted by `(origin_y, origin_x)`, i.e.
+/// top-to-bottom then left-to-right in virtual-desktop coordinates. That
+/// ordering is a stable *function of the topology*, which is the most a client
+/// may assume: unplug a monitor, dock a laptop, or simply reconnect, and the
+/// same physical panel can come back under a different id. A client that wants
+/// to remember "the operator was watching the right-hand screen" must key that
+/// memory off [`name`](Self::name) or the geometry, never off `id`.
+///
+/// `origin_x` / `origin_y` are signed because the Windows virtual desktop puts
+/// the primary monitor's top-left at `(0, 0)`, so anything above or to the left
+/// of it has negative coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    /// Session-scoped index; `0` is always the primary output. See the type
+    /// docs — this is not stable across reconnects.
+    pub id: u8,
+    pub width: u32,
+    pub height: u32,
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub is_primary: bool,
+    /// GDI device name (e.g. `\\.\DISPLAY1`). **Display only** — never parsed,
+    /// never used to address a monitor, and never trusted: it comes off the
+    /// wire and lands in a UI label. The host caps it at 64 bytes when it
+    /// enumerates, so a client rendering it is not sizing a widget from
+    /// peer-controlled length.
+    pub name: String,
 }
 
 /// Session control messages (Control channel, after auth).
@@ -208,6 +296,82 @@ pub enum ControlMsg {
     Pong {
         token: u64,
     },
+    // -- Appended for MULTI_MONITOR. Sent only when the feature bit came back
+    // -- mutual; see `features::MULTI_MONITOR` for why that gate is load-bearing.
+    /// Host → client: every output the host can capture.
+    ///
+    /// Written raw-framed onto the control stream immediately after `AuthOk`,
+    /// which makes it the **guaranteed first post-`AuthOk` host message** when
+    /// the feature is mutual. The client therefore knows the topology before it
+    /// asks for a stream, so its `StartStream` and any `SelectMonitors` can be
+    /// one decision rather than a start-then-correct flicker.
+    ///
+    /// Re-sent whenever the topology changes (a monitor plugged, unplugged,
+    /// re-arranged, or a resolution change): a `MonitorList` always describes
+    /// the *whole* current set and replaces the client's previous copy outright.
+    /// Because ids are session-scoped and re-derived on every enumeration (see
+    /// [`MonitorInfo`]), a re-send may renumber outputs the client is already
+    /// watching — the host reconciles by re-sending the affected
+    /// [`StreamConfig`](Self::StreamConfig) or
+    /// [`StreamStopped`](Self::StreamStopped), never by expecting the client to
+    /// guess.
+    MonitorList {
+        monitors: Vec<MonitorInfo>,
+    },
+    /// Client → host: which outputs to stream, and in which slot.
+    ///
+    /// **Ordered, not a set**: `ids[0]` rides video stream 0 and `ids[1]` rides
+    /// stream 1. That is the whole reason it is a `Vec` rather than a bitmask —
+    /// the operator's choice of *which* screen is the main one is exactly the
+    /// order of this list.
+    ///
+    /// Idempotent and re-sendable mid-session: the client may send it at any
+    /// time to add, drop, or swap outputs, and sending the same list twice is a
+    /// no-op. The host is forgiving by construction rather than by erroring,
+    /// because a client's view of the topology can legitimately be one
+    /// `MonitorList` out of date: it filters out ids it does not recognise,
+    /// de-duplicates, and truncates to [`MAX_VIDEO_STREAMS`]. If nothing
+    /// survives that filtering the host **keeps its current selection** — a
+    /// stale request must never black out a working session.
+    SelectMonitors {
+        ids: Vec<u8>,
+    },
+    /// Host → client: the video format of a *secondary* stream.
+    ///
+    /// Sent for `id != 0` ONLY. Stream 0 stays described by the legacy
+    /// [`VideoConfig`](Self::VideoConfig), with byte-identical old semantics, so
+    /// that the single-monitor path — the one every deployed peer runs — is not
+    /// touched by this feature at all. A `StreamConfig { id: 0, .. }` is a bug,
+    /// not a synonym.
+    ///
+    /// Like `VideoConfig`, it implies a **discontinuity**: the receiver resets
+    /// that stream's fragment reassembly and its decoder, and expects fresh
+    /// SPS/PPS followed by an IDR. Anything still in flight for the old format
+    /// is undecodable by definition, so dropping it is the correct handling
+    /// rather than a lost-frame event worth reporting.
+    StreamConfig {
+        id: u8,
+        monitor: u8,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+        codec: Codec,
+    },
+    /// Host → client: a secondary stream has ended. `id` is never 0.
+    ///
+    /// Covers every way a second stream can stop — the client deselected it,
+    /// the monitor was unplugged or disabled, or the capture/encode pipeline
+    /// for it failed — because from the client's side the correct response is
+    /// the same in all three: close that window. `reason` is human-readable
+    /// text for the log and the UI, never a code to branch on.
+    ///
+    /// Stream 0 does not have an equivalent: it ends with the session (`Bye`)
+    /// or with `StopStream`, exactly as it does today.
+    StreamStopped {
+        id: u8,
+        reason: String,
+    },
 }
 
 /// Input events ride their own reliable stream (except mouse-move → datagram).
@@ -217,6 +381,27 @@ pub enum InputMsg {
     /// Client explicitly released input (chord or focus loss) — host must
     /// release any held keys/buttons NOW.
     ReleaseAll,
+    /// Client → host: an input event aimed at a specific video stream.
+    ///
+    /// Sent **only** when [`features::MULTI_MONITOR`] came back mutual, and the
+    /// gate matters more on this enum than on any other. The input stream is
+    /// decoded with `decode_strict`, so an old host handed an unknown variant
+    /// does not skip the message — it errors, and the error kills the input
+    /// stream. The operator's keyboard and mouse stop working against a host
+    /// that is otherwise perfectly healthy, on a session whose video keeps
+    /// running, which reads as a hung remote machine rather than a protocol
+    /// mismatch. One unguarded send is enough to produce that.
+    ///
+    /// Legacy [`Event`](Self::Event) remains exactly "stream 0" and stays the
+    /// only thing a single-monitor client sends. The host treats
+    /// `EventOn { id: 0, event: e }` as identical to `Event(e)`, so the two
+    /// spellings never disagree about the primary output; `id` exists to say
+    /// *which* window's coordinate space a click was normalized against, which
+    /// is unanswerable once a second monitor is on screen.
+    EventOn {
+        id: u8,
+        event: InputEvent,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +652,71 @@ mod tests {
             postcard::to_stdvec(&h3).unwrap(),
             vec![0x01, 0x10, 0x01, 0x64]
         );
+
+        // And for the multi-monitor bit. 32 is still one varint byte — the
+        // frame stays four bytes long, `agent` has not moved, and an old peer
+        // parses it as a Hello carrying a feature it does not recognise and
+        // therefore does not echo. `1 << 6` is the last bit that fits in a
+        // single varint byte; `1 << 7` will make this frame five bytes. That is
+        // a *length* change, not a structural one — postcard reads the varint
+        // rather than a fixed width, so an old peer still finds `agent` — but
+        // the assertion here will need its own new line, and that is the point:
+        // each bit costs one line to prove it is still only a value in the
+        // existing u64.
+        let h4 = Hello {
+            features: features::MULTI_MONITOR,
+            ..h3
+        };
+        assert_eq!(
+            postcard::to_stdvec(&h4).unwrap(),
+            vec![0x01, 0x20, 0x01, 0x64]
+        );
+    }
+
+    /// `MonitorInfo`'s postcard encoding must not move, for the same reason
+    /// `ConnStats`' must not.
+    ///
+    /// It rides inside `ControlMsg::MonitorList` and is decoded with
+    /// `decode_strict`, so it is positional with no field names: adding,
+    /// removing, reordering or retyping a field makes a peer built from another
+    /// commit read every following field out of the wrong bytes — and then fail
+    /// on trailing bytes, which closes the control stream. Unlike `ConnStats`
+    /// this message arrives once, right after `AuthOk`, so the failure is not
+    /// "the session dies a second in" but "the session never starts".
+    ///
+    /// Distinctive values on purpose: an all-default struct encodes every
+    /// integer as a 1-byte varint and would not notice a `u32` widening to
+    /// `u64`, nor the signed `origin_*` fields losing their zigzag encoding.
+    /// The negative origins are the ones that matter — they are what a monitor
+    /// placed above or to the left of the primary produces.
+    #[test]
+    fn monitor_info_encoding_is_pinned() {
+        let m = MonitorInfo {
+            id: 1,
+            width: 2560,
+            height: 1600,
+            origin_x: -1920,
+            origin_y: -120,
+            is_primary: false,
+            name: "D2".into(),
+        };
+        let got = postcard::to_stdvec(&m).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                0x01, // id             u8 1
+                0x80, 0x14, // width    u32 varint 2560
+                0xc0, 0x0c, // height   u32 varint 1600
+                0xff, 0x1d, // origin_x i32 zigzag varint -1920
+                0xef, 0x01, // origin_y i32 zigzag varint -120
+                0x00, // is_primary     bool false
+                0x02, 0x44, 0x32, // name len=2 "D2"
+            ],
+            "MonitorInfo's encoding moved: it is positional, so adding, \
+             removing, reordering or retyping a field makes a peer built from \
+             another commit misparse the MonitorList that arrives immediately \
+             after AuthOk — the session never starts"
+        );
     }
 
     /// Adding a `ConnStats` field breaks every already-deployed peer.
@@ -528,9 +778,14 @@ mod tests {
     ///
     /// New variants may only be APPENDED, and only once both ends are known to
     /// support them. This test pins the existing order.
+    ///
+    /// The tail past `Pong` (15) is the multi-monitor block, 16..=19, appended
+    /// under `features::MULTI_MONITOR` and sent only when that bit is mutual.
+    /// Those four are pinned here for the same reason as the rest: the next
+    /// feature must append at 20, not tidy itself into the middle.
     #[test]
     fn control_msg_discriminants_are_pinned() {
-        let cases: [(ControlMsg, u8); 6] = [
+        let cases: [(ControlMsg, u8); 10] = [
             (ControlMsg::StopStream, 1),
             (ControlMsg::RequestKeyframe, 2),
             (
@@ -542,6 +797,27 @@ mod tests {
             (ControlMsg::Ping { token: 0 }, 14),
             (ControlMsg::Pong { token: 0 }, 15),
             (ControlMsg::ElevationEnded, 12),
+            (ControlMsg::MonitorList { monitors: vec![] }, 16),
+            (ControlMsg::SelectMonitors { ids: vec![] }, 17),
+            (
+                ControlMsg::StreamConfig {
+                    id: 1,
+                    monitor: 1,
+                    width: 0,
+                    height: 0,
+                    fps: 0,
+                    bitrate_kbps: 0,
+                    codec: Codec::H264,
+                },
+                18,
+            ),
+            (
+                ControlMsg::StreamStopped {
+                    id: 1,
+                    reason: String::new(),
+                },
+                19,
+            ),
         ];
         for (msg, want) in cases {
             let got = postcard::to_stdvec(&msg).unwrap()[0];
@@ -550,6 +826,42 @@ mod tests {
                 "discriminant moved for {msg:?} — a variant was \
                  inserted rather than appended; old peers will misparse every \
                  later variant"
+            );
+        }
+    }
+
+    /// `InputMsg`'s discriminants are pinned for the same positional reason as
+    /// `ControlMsg`'s, with a worse failure mode.
+    ///
+    /// This enum is small enough to look safe to reorganise, and it is the one
+    /// place where a renumbering costs the operator their keyboard: the input
+    /// stream is decoded with `decode_strict`, so a `ReleaseAll` read as an
+    /// `Event`, or an unknown discriminant on an old host, errors out and takes
+    /// the input stream with it. Video keeps flowing, so the symptom is a
+    /// remote machine that appears alive and ignores every key.
+    ///
+    /// `EventOn` is appended at 2 under `features::MULTI_MONITOR` and is sent
+    /// only when that bit is mutual — an old host has no variant 2 at all.
+    #[test]
+    fn input_msg_discriminants_are_pinned() {
+        let cases: [(InputMsg, u8); 3] = [
+            (InputMsg::Event(InputEvent::MouseMove { x: 0, y: 0 }), 0),
+            (InputMsg::ReleaseAll, 1),
+            (
+                InputMsg::EventOn {
+                    id: 0,
+                    event: InputEvent::MouseMove { x: 0, y: 0 },
+                },
+                2,
+            ),
+        ];
+        for (msg, want) in cases {
+            let got = postcard::to_stdvec(&msg).unwrap()[0];
+            assert_eq!(
+                got, want,
+                "discriminant moved for {msg:?} — a variant was \
+                 inserted rather than appended; old peers will misparse every \
+                 later variant and drop the input stream"
             );
         }
     }
@@ -564,6 +876,7 @@ mod tests {
             features::ADAPTIVE_BITRATE,
             features::LOSSLESS_TILES,
             features::SYSTEM_AUDIO,
+            features::MULTI_MONITOR,
         ];
         for (i, a) in bits.iter().enumerate() {
             assert!(a.count_ones() == 1, "feature bits must be single bits");

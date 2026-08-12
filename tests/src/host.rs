@@ -215,6 +215,10 @@ impl SimHost {
             match decode_strict::<InputMsg>(&body) {
                 Ok(InputMsg::Event(ev)) => self.inject(ctx, ev),
                 Ok(InputMsg::ReleaseAll) => {}
+                // Appended alongside `features::MULTI_MONITOR`; nothing
+                // negotiates the bit yet, so the simulated host ignores it the
+                // same way it ignores ReleaseAll.
+                Ok(InputMsg::EventOn { .. }) => {}
                 Err(e) => ctx.log.push(SimEvent::ControlRejected {
                     at_ms: ctx.now_ms,
                     reason: format!("input decode: {e}"),

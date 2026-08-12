@@ -330,6 +330,20 @@ async fn input_loop(mut rx: mpsc::Receiver<InputMsg>, pipeline: Arc<HostSession>
                 tracing::info!("client asked for a full input release");
                 pipeline.release_all_input();
             }
+            // Appended alongside `features::MULTI_MONITOR`, which nothing
+            // negotiates yet: no client offers the bit and this host never
+            // echoes it, so no peer can produce this message. Dropped rather
+            // than unwrapped to `Event(ev)` — the stream-aware injection path
+            // (which needs to know *which* window's coordinate space `ev` was
+            // normalized against) lands with the rest of multi-monitor input,
+            // and until then "identical to before the variant existed" is the
+            // only correct behaviour.
+            InputMsg::EventOn { id, .. } => {
+                tracing::debug!(
+                    stream = id,
+                    "EventOn before multi-monitor input is wired; dropping"
+                );
+            }
         }
     }
 }
