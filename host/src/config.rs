@@ -538,6 +538,7 @@ impl HostConfig {
             lossless_tile_deflate_level: self.lossless_tile_deflate_level,
             lossless_tile_lease_ms: self.lossless_tile_lease_ms,
             lossless_tiles_per_pass: self.lossless_tiles_per_pass,
+            monitor: crate::capture::MonitorSelector::Primary,
         }
     }
 }

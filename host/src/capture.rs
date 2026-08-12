@@ -17,6 +17,7 @@
 
 use std::time::{Duration, Instant};
 
+use directdesk_shared::protocol::{MonitorInfo, MAX_MONITORS};
 use directdesk_shared::traits::{FrameSource, PixelFormat, RawFrame};
 use directdesk_shared::{Error, Result};
 use windows::core::Interface;
@@ -80,6 +81,28 @@ impl AdapterInfo {
     pub fn short(&self) -> String {
         format!("{} [{}]", self.name, self.output_name)
     }
+}
+
+/// Stable identity for one output within a session (per-boot stable; survives
+/// duplication rebuilds and DISPLAYn renumbering via the luid+origin tie-break).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorKey {
+    pub adapter_luid: u64,
+    /// e.g. `\\.\DISPLAY2` — the primary match key.
+    pub device_name: String,
+    /// Top-left of the output in virtual-desktop coordinates — tie-breaker.
+    pub origin: (i32, i32),
+}
+
+/// Which output [`DdaCapture::new`] should duplicate.
+#[derive(Debug, Clone)]
+pub enum MonitorSelector {
+    /// Today's behavior: the output whose `HMONITOR` matches
+    /// `MonitorFromPoint(_, MONITOR_DEFAULTTOPRIMARY)`, falling back to the
+    /// first desktop-attached output if none matches.
+    Primary,
+    /// A specific output, addressed by its [`MonitorKey`].
+    Key(MonitorKey),
 }
 
 /// A captured desktop image still resident on the GPU.
@@ -198,11 +221,17 @@ pub struct DdaCapture {
 }
 
 impl DdaCapture {
-    /// Duplicate the primary monitor, creating the D3D11 device on its adapter.
-    pub fn new() -> Result<Self> {
+    /// Duplicate the output `selector` picks, creating the D3D11 device on its
+    /// adapter.
+    ///
+    /// With [`MonitorSelector::Primary`] this reproduces the pre-multi-monitor
+    /// behavior exactly: same enumeration walk, same `AttachedToDesktop`
+    /// filter, same primary-`HMONITOR` match with the same first-attached
+    /// fallback. See [`resolve_output`] and [`select_output`].
+    pub fn new(selector: &MonitorSelector) -> Result<Self> {
         // Must happen before we ask DXGI for any geometry.
         set_process_dpi_aware();
-        let (adapter, output, info) = find_primary_output()?;
+        let (adapter, output, info) = resolve_output(selector)?;
         let (device, context) = create_device(&adapter)?;
 
         let desc = unsafe { output.GetDesc() }.map_err(cap_err("IDXGIOutput::GetDesc"))?;
@@ -776,15 +805,47 @@ fn create_staging_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D1
     tex.ok_or_else(|| Error::Capture("CreateTexture2D(staging) returned null".into()))
 }
 
-/// Walk every adapter/output pair and return the one whose `HMONITOR` matches
-/// the primary monitor. Falls back to adapter 0 / output 0.
-fn find_primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
+/// Plain-data description of one enumerated output — everything
+/// [`select_output`] needs to decide between candidates, with no COM types, so
+/// the selection policy is constructible and testable without a live DXGI
+/// enumeration.
+#[derive(Debug, Clone, PartialEq)]
+struct CandidateInfo {
+    adapter_luid: u64,
+    device_name: String,
+    origin: (i32, i32),
+    width: u32,
+    height: u32,
+    /// Exact `HMONITOR` match against `MonitorFromPoint(_,
+    /// MONITOR_DEFAULTTOPRIMARY)` — the same test `find_primary_output` used
+    /// to make pre-refactor.
+    is_primary: bool,
+}
+
+/// One desktop-attached output discovered by [`enumerate_outputs`], pairing
+/// the live COM handles (needed to actually duplicate it) with the plain-data
+/// [`CandidateInfo`] (needed to pick it) and the raw [`DXGI_OUTPUT_DESC`]
+/// (needed by [`adapter_info`] once a candidate is chosen).
+struct EnumeratedOutput {
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput1,
+    desc: DXGI_OUTPUT_DESC,
+    candidate: CandidateInfo,
+}
+
+/// Walk every adapter/output pair and collect the desktop-attached ones.
+///
+/// Same walk and the same `AttachedToDesktop` filter as the pre-refactor
+/// `find_primary_output`; the only behavioral difference is that every
+/// attached output is collected instead of returning as soon as the primary
+/// match is found — selection is now a separate, pure step ([`select_output`]).
+fn enumerate_outputs() -> Result<Vec<EnumeratedOutput>> {
     // SAFETY: DXGI enumeration; every call's result is checked before use.
     unsafe {
         let primary: HMONITOR = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
         let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(cap_err("CreateDXGIFactory1"))?;
 
-        let mut fallback: Option<(IDXGIAdapter1, IDXGIOutput1, DXGI_OUTPUT_DESC)> = None;
+        let mut found = Vec::new();
 
         let mut ai = 0u32;
         loop {
@@ -794,6 +855,11 @@ fn find_primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
                 Err(e) => return Err(Error::Capture(format!("EnumAdapters1: {e}"))),
             };
             ai += 1;
+            let Ok(adapter_desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            let adapter_luid = ((adapter_desc.AdapterLuid.HighPart as u64) << 32)
+                | adapter_desc.AdapterLuid.LowPart as u64;
 
             let mut oi = 0u32;
             loop {
@@ -809,27 +875,144 @@ fn find_primary_output() -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
                 if !desc.AttachedToDesktop.as_bool() {
                     continue;
                 }
-                if desc.Monitor == primary {
-                    let info = adapter_info(&adapter, &desc)?;
-                    return Ok((adapter, out1, info));
-                }
-                if fallback.is_none() {
-                    fallback = Some((adapter.clone(), out1, desc));
-                }
+                let origin = (desc.DesktopCoordinates.left, desc.DesktopCoordinates.top);
+                let width =
+                    (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left).unsigned_abs();
+                let height =
+                    (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top).unsigned_abs();
+                found.push(EnumeratedOutput {
+                    adapter: adapter.clone(),
+                    output: out1,
+                    desc,
+                    candidate: CandidateInfo {
+                        adapter_luid,
+                        device_name: wide_to_string(&desc.DeviceName),
+                        origin,
+                        width,
+                        height,
+                        is_primary: desc.Monitor == primary,
+                    },
+                });
             }
         }
-
-        match fallback {
-            Some((adapter, out1, desc)) => {
-                tracing::warn!("no output matched the primary HMONITOR; using first attached one");
-                let info = adapter_info(&adapter, &desc)?;
-                Ok((adapter, out1, info))
-            }
-            None => Err(Error::Capture(
-                "no desktop-attached DXGI output found".into(),
-            )),
-        }
+        Ok(found)
     }
+}
+
+/// Pick which of `candidates` should be duplicated. Pure — no COM, no I/O —
+/// so it is directly unit-testable.
+///
+/// * [`MonitorSelector::Primary`] — exactly `find_primary_output`'s old rule:
+///   the candidate flagged `is_primary`, else the first candidate in
+///   enumeration order (adapter-0/output-0-first, same as the old fallback).
+/// * [`MonitorSelector::Key`] — match by `device_name` first (holds across a
+///   duplication rebuild that kept the same GDI device name), else by
+///   `(adapter_luid, origin)` (holds across a DISPLAYn renumbering that keeps
+///   the physical panel on the same adapter at the same desktop position).
+///   `None` if neither matches.
+fn select_output(candidates: &[CandidateInfo], selector: &MonitorSelector) -> Option<usize> {
+    match selector {
+        MonitorSelector::Primary => candidates
+            .iter()
+            .position(|c| c.is_primary)
+            .or_else(|| (!candidates.is_empty()).then_some(0)),
+        MonitorSelector::Key(key) => candidates
+            .iter()
+            .position(|c| c.device_name == key.device_name)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .position(|c| c.adapter_luid == key.adapter_luid && c.origin == key.origin)
+            }),
+    }
+}
+
+/// Enumerate outputs, apply `selector`, and build the [`AdapterInfo`] the
+/// caller needs to finish constructing the capture. The glue between the pure
+/// [`select_output`] and the COM handles [`enumerate_outputs`] collected.
+fn resolve_output(selector: &MonitorSelector) -> Result<(IDXGIAdapter1, IDXGIOutput1, AdapterInfo)> {
+    let outputs = enumerate_outputs()?;
+    if outputs.is_empty() {
+        return Err(Error::Capture(
+            "no desktop-attached DXGI output found".into(),
+        ));
+    }
+    let candidates: Vec<CandidateInfo> = outputs.iter().map(|o| o.candidate.clone()).collect();
+    let idx = select_output(&candidates, selector).ok_or_else(|| {
+        Error::Capture("no DXGI output matched the requested monitor selector".into())
+    })?;
+    if matches!(selector, MonitorSelector::Primary) && !candidates[idx].is_primary {
+        tracing::warn!("no output matched the primary HMONITOR; using first attached one");
+    }
+    let EnumeratedOutput {
+        adapter,
+        output,
+        desc,
+        ..
+    } = outputs
+        .into_iter()
+        .nth(idx)
+        .expect("idx returned by select_output is in range");
+    let info = adapter_info(&adapter, &desc)?;
+    Ok((adapter, output, info))
+}
+
+/// Enumerate capturable outputs without creating any D3D device or
+/// duplication — cheap enough to call for every `MonitorList` refresh.
+///
+/// Id `0` is always the primary output (session-scoped — see
+/// [`MonitorInfo`]'s docs); the rest are sorted `(origin_y, origin_x)`,
+/// top-to-bottom then left-to-right, and the list is capped at
+/// [`MAX_MONITORS`]. Returns the [`MonitorKey`] alongside each entry, in the
+/// same order, so a caller can build the id -> key table `SelectMonitors`
+/// needs.
+pub fn list_monitors() -> Result<Vec<(MonitorInfo, MonitorKey)>> {
+    let outputs = enumerate_outputs()?;
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut candidates: Vec<CandidateInfo> = outputs.into_iter().map(|o| o.candidate).collect();
+
+    // Same primary rule as `select_output(Primary, ..)`: the flagged
+    // candidate, else the first in enumeration order.
+    let primary_idx = candidates.iter().position(|c| c.is_primary).unwrap_or(0);
+    let primary = candidates.remove(primary_idx);
+    candidates.sort_by_key(|c| (c.origin.1, c.origin.0));
+
+    let mut ordered = Vec::with_capacity(candidates.len() + 1);
+    ordered.push(primary);
+    ordered.extend(candidates);
+    ordered.truncate(MAX_MONITORS);
+
+    Ok(ordered
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let key = MonitorKey {
+                adapter_luid: c.adapter_luid,
+                device_name: c.device_name.clone(),
+                origin: c.origin,
+            };
+            let mut name = c.device_name;
+            if name.len() > 64 {
+                let mut end = 64;
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                name.truncate(end);
+            }
+            let info = MonitorInfo {
+                id: i as u8,
+                width: c.width,
+                height: c.height,
+                origin_x: c.origin.0,
+                origin_y: c.origin.1,
+                is_primary: i == 0,
+                name,
+            };
+            (info, key)
+        })
+        .collect())
 }
 
 fn adapter_info(adapter: &IDXGIAdapter1, out: &DXGI_OUTPUT_DESC) -> Result<AdapterInfo> {
@@ -896,5 +1079,132 @@ mod tests {
         // A duplication rebuild is transparent to the session; only the
         // secure desktop pauses the loop.
         assert_eq!(pause_reason(CaptureState::NeedsRecreate), None);
+    }
+
+    // -- select_output: pure, so exercised without any live DXGI enumeration --
+
+    fn candidate(luid: u64, name: &str, origin: (i32, i32), is_primary: bool) -> CandidateInfo {
+        CandidateInfo {
+            adapter_luid: luid,
+            device_name: name.into(),
+            origin,
+            width: 1920,
+            height: 1080,
+            is_primary,
+        }
+    }
+
+    #[test]
+    fn select_primary_picks_the_flagged_candidate_regardless_of_position() {
+        let cands = vec![
+            candidate(1, r"\\.\DISPLAY1", (0, 0), false),
+            candidate(2, r"\\.\DISPLAY2", (1920, 0), true),
+            candidate(3, r"\\.\DISPLAY3", (-1920, 0), false),
+        ];
+        assert_eq!(select_output(&cands, &MonitorSelector::Primary), Some(1));
+    }
+
+    #[test]
+    fn select_primary_falls_back_to_first_when_none_flagged() {
+        // Mirrors the old `find_primary_output` fallback: no HMONITOR match
+        // (e.g. between a mode change and the next enumeration) still yields
+        // a usable output rather than failing the whole capture.
+        let cands = vec![
+            candidate(1, r"\\.\DISPLAY1", (0, 0), false),
+            candidate(2, r"\\.\DISPLAY2", (1920, 0), false),
+        ];
+        assert_eq!(select_output(&cands, &MonitorSelector::Primary), Some(0));
+    }
+
+    #[test]
+    fn select_key_matches_by_device_name() {
+        let cands = vec![
+            candidate(1, r"\\.\DISPLAY1", (0, 0), true),
+            candidate(2, r"\\.\DISPLAY2", (1920, 0), false),
+        ];
+        let key = MonitorKey {
+            adapter_luid: 999, // deliberately stale — name must win first.
+            device_name: r"\\.\DISPLAY2".into(),
+            origin: (0, 0), // deliberately stale too.
+        };
+        assert_eq!(
+            select_output(&cands, &MonitorSelector::Key(key)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn select_key_falls_back_to_luid_and_origin_when_names_have_been_renumbered() {
+        // Windows renumbered \\.\DISPLAY2 to \\.\DISPLAY3 (e.g. a monitor was
+        // unplugged and replugged) but the physical panel is still on the same
+        // adapter at the same desktop position.
+        let cands = vec![
+            candidate(1, r"\\.\DISPLAY1", (0, 0), true),
+            candidate(2, r"\\.\DISPLAY3", (1920, 0), false),
+        ];
+        let key = MonitorKey {
+            adapter_luid: 2,
+            device_name: r"\\.\DISPLAY2".into(),
+            origin: (1920, 0),
+        };
+        assert_eq!(
+            select_output(&cands, &MonitorSelector::Key(key)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn select_key_matching_nothing_is_none() {
+        let cands = vec![candidate(1, r"\\.\DISPLAY1", (0, 0), true)];
+        let key = MonitorKey {
+            adapter_luid: 404,
+            device_name: r"\\.\DISPLAY9".into(),
+            origin: (5000, 5000),
+        };
+        assert_eq!(select_output(&cands, &MonitorSelector::Key(key)), None);
+    }
+
+    #[test]
+    fn select_output_on_empty_list_is_always_none() {
+        assert_eq!(select_output(&[], &MonitorSelector::Primary), None);
+        let key = MonitorKey {
+            adapter_luid: 1,
+            device_name: r"\\.\DISPLAY1".into(),
+            origin: (0, 0),
+        };
+        assert_eq!(select_output(&[], &MonitorSelector::Key(key)), None);
+    }
+
+    // -- list_monitors: touches real DXGI enumeration, so only invariants that
+    // hold for any topology are asserted; mirrors the "skip gracefully when
+    // there's no usable hardware" idiom used for the encoder in mf_encoder.rs.
+    #[test]
+    #[cfg(windows)]
+    fn list_monitors_invariants_hold_for_this_machines_topology() {
+        let Ok(monitors) = list_monitors() else {
+            // No DXGI adapters/outputs available (e.g. a bare CI runner).
+            // Nothing to assert; a missing GPU is not this test's subject.
+            return;
+        };
+        if monitors.is_empty() {
+            return;
+        }
+        assert!(monitors.len() <= MAX_MONITORS);
+        // Ids are dense and match position: 0, 1, 2, ...
+        for (i, (info, _key)) in monitors.iter().enumerate() {
+            assert_eq!(info.id as usize, i);
+        }
+        // Id 0, and only id 0, is primary.
+        assert!(monitors[0].0.is_primary);
+        assert!(monitors[1..].iter().all(|(info, _)| !info.is_primary));
+        // The rest are sorted (origin_y, origin_x), top-to-bottom then
+        // left-to-right.
+        for w in monitors[1..].windows(2) {
+            let a = (w[0].0.origin_y, w[0].0.origin_x);
+            let b = (w[1].0.origin_y, w[1].0.origin_x);
+            assert!(a <= b, "not sorted: {a:?} should precede {b:?}");
+        }
+        // One key per monitor, same order.
+        assert_eq!(monitors.len(), monitors.iter().map(|(_, k)| k).count());
     }
 }
