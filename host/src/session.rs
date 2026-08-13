@@ -29,7 +29,7 @@ use directdesk_shared::video::{EncodedFrame, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAM
 use directdesk_shared::{Error, Result};
 use parking_lot::Mutex;
 
-use crate::capture::{pause_reason, CaptureState, DdaCapture, GpuFrame};
+use crate::capture::{pause_reason, CaptureState, DdaCapture, GpuFrame, MonitorSelector};
 use crate::convert::{bgra_to_nv12, GpuConverter};
 use crate::input_inject::WinInjector;
 use crate::mf_encoder::{
@@ -83,6 +83,10 @@ pub struct SessionConfig {
     /// Strips compressed per refinement pass, bounding how much of the frame
     /// budget's idle slack the pass may consume.
     pub lossless_tiles_per_pass: u32,
+    /// Which output `build_pipeline` duplicates. Defaults to the primary
+    /// monitor — today's only behavior, preserved exactly by
+    /// [`MonitorSelector::Primary`].
+    pub monitor: MonitorSelector,
 }
 
 /// How long the desktop must sit unchanged before the encoder is given one
@@ -172,6 +176,7 @@ impl Default for SessionConfig {
             lossless_tile_deflate_level: 6,
             lossless_tile_lease_ms: 4_000,
             lossless_tiles_per_pass: 32,
+            monitor: MonitorSelector::Primary,
         }
     }
 }
@@ -2415,7 +2420,7 @@ type Pipeline = (
 );
 
 pub fn build_pipeline(cfg: &SessionConfig) -> Result<Pipeline> {
-    let mut capture = DdaCapture::new()?;
+    let mut capture = DdaCapture::new(&cfg.monitor)?;
     if cfg.idle_repeat_ms == 0 {
         capture.set_repeat_after(Duration::MAX);
     } else {

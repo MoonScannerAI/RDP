@@ -28,17 +28,20 @@
 //! Senders fragment with [`crate::video::fragment_frame_fec`] and call
 //! [`Connection::send_datagram`] themselves.
 //!
-//! # One datagram path, two kinds of media
+//! # One datagram path, three kinds of media
 //!
-//! Audio and video share the unreliable QUIC datagram path, so
-//! `datagram_recv_loop` — the only `read_datagram` caller in the workspace —
-//! is also the demux. Every datagram is classified by
-//! [`crate::audio::is_audio_datagram`] *before* anything parses it, and audio
-//! is routed to its own channel rather than into the video [`Reassembler`].
+//! Audio, primary video and second-monitor video all share the unreliable QUIC
+//! datagram path, so `datagram_recv_loop` — the only `read_datagram` caller in
+//! the workspace — is also the demux. Every datagram is classified by
+//! [`crate::audio::is_audio_datagram`] and then, if it is video, by
+//! [`crate::video::datagram_stream_id`], both *before* anything parses it.
+//! Audio goes to its own channel; each video stream goes to its own
+//! [`Reassembler`], which keeps its own `frame_id` space.
 //!
-//! The classification is unconditional; only delivery is gated on
-//! [`SessionConfig::receive_audio`]. See the comment at the demux itself for
-//! why both of those properties are load-bearing rather than stylistic.
+//! The classification is unconditional; only delivery is gated, on
+//! [`SessionConfig::receive_audio`] and [`SessionConfig::receive_video_1`].
+//! See the comment at the demux itself for why both of those properties are
+//! load-bearing rather than stylistic.
 //!
 //! # Why a trait
 //!
@@ -172,6 +175,39 @@ pub struct SessionConfig {
     /// (Deliberately not an intra-doc link, for the reason given on
     /// [`SessionConfig::receive_video`].)
     pub receive_audio: bool,
+
+    /// Whether to **deliver** inbound video for the *second monitor*.
+    ///
+    /// Off by default, like [`SessionConfig::receive_audio`] and for the same
+    /// reason: a second stream is negotiated per session by
+    /// [`crate::protocol::features::MULTI_MONITOR`] and costs the receiving
+    /// side a second [`Reassembler`] and a second decoder. A session that never
+    /// asked for a second monitor should not be handed its frames, and should
+    /// not pay to reassemble them.
+    ///
+    /// **This gates delivery only, never the demux** — the same split
+    /// [`SessionConfig::receive_audio`] describes, and it matters here for a
+    /// sharper reason. `datagram_recv_loop` classifies every video datagram
+    /// with [`crate::video::datagram_stream_id`] whatever this is set to; with
+    /// the flag off, a stream-1 datagram is dropped before any parse and
+    /// without ever being offered to the stream-0 reassembler. Gate the
+    /// classification instead and those datagrams would land in
+    /// [`Reassembler::push`], which refuses them by
+    /// [`ReassemblyConfig::expected_stream`] and counts `fragments_rejected` —
+    /// a counter that reads as "the video wire is corrupt" for traffic that is
+    /// perfectly well formed and merely unwanted, and that feeds a `video_loss`
+    /// figure the bitrate adaptor steers on. The rejection in `push` is the
+    /// backstop, not the plan; see its comment for what it is a backstop
+    /// *against*.
+    ///
+    /// Independent of [`SessionConfig::receive_video`], which gates stream 0,
+    /// so the two monitors can be armed separately. Both off and
+    /// `receive_audio` off means no datagram loop is spawned at all.
+    ///
+    /// QUIC only, for the reason given on [`SessionConfig::receive_video`]:
+    /// `transport::tcp::TcpSession` has no datagram path, and its inline media
+    /// framing has no second video stream to carry.
+    pub receive_video_1: bool,
 }
 
 impl Default for SessionConfig {
@@ -187,6 +223,10 @@ impl Default for SessionConfig {
             reassembly: ReassemblyConfig::default(),
             receive_video: true,
             receive_audio: false,
+            // Off until negotiated, like `receive_audio`: a single-monitor
+            // session is every session that has ever run, and it must not start
+            // paying for a second reassembler because a field appeared.
+            receive_video_1: false,
         }
     }
 }
@@ -220,9 +260,20 @@ pub struct SessionReceivers {
     pub control: mpsc::Receiver<ControlMsg>,
     /// Inbound input messages.
     pub input: mpsc::Receiver<InputMsg>,
-    /// Inbound reassembled video frames. Yields `None` immediately when the
-    /// session was started with [`SessionConfig::receive_video`] off.
+    /// Inbound reassembled video frames for the primary monitor (stream 0).
+    /// Yields `None` immediately when the session was started with
+    /// [`SessionConfig::receive_video`] off.
     pub video: mpsc::Receiver<EncodedFrame>,
+    /// Inbound reassembled video frames for the second monitor (stream 1).
+    /// Yields `None` immediately when the session was started with
+    /// [`SessionConfig::receive_video_1`] off — which is the default, so most
+    /// sessions see a closed receiver here.
+    ///
+    /// A separate channel rather than a tagged frame on `video` on purpose: the
+    /// two streams are two independent encoders with two `frame_id` spaces, and
+    /// a consumer that merged them would have to re-split them before it could
+    /// feed either decoder.
+    pub video1: mpsc::Receiver<EncodedFrame>,
     /// Inbound audio packets. Yields `None` immediately when the session was
     /// started with [`SessionConfig::receive_audio`] off — which is the
     /// default, so most sessions see a closed receiver here.
@@ -340,6 +391,11 @@ impl QuicSession {
         // one shape for every caller. Dropping the unused sender below is what
         // makes `rx.video.recv()` return `None` straight away.
         let (video_in_tx, video_in_rx) = mpsc::channel(config.video_capacity);
+        // Same again for the second monitor, which is off by default: the
+        // channel always exists, and it is the sender's fate that differs. Its
+        // own queue, at the same depth, because the two monitors are two
+        // independent frame rates and one stalling must not throttle the other.
+        let (video1_in_tx, video1_in_rx) = mpsc::channel(config.video_capacity);
         // Same for audio, which is off by default: the channel always exists,
         // and it is the sender's fate that differs.
         let (audio_in_tx, audio_in_rx) = mpsc::channel(config.audio_capacity);
@@ -388,16 +444,34 @@ impl QuicSession {
         // `then_some` moves each sender into the `Some` or drops it on the
         // spot, which is precisely the gate: a `None` here means the matching
         // receiver is already closed and the loop has nowhere to put that kind
-        // of datagram. The video half carries its reassembly policy with it so
+        // of datagram. Each video half carries its reassembly policy with it so
         // that the loop cannot build a `Reassembler` it has no channel for.
-        let video_sink = config
-            .receive_video
-            .then_some((video_in_tx, config.reassembly));
+        //
+        // `expected_stream` is set here and not taken from `config.reassembly`,
+        // whatever a caller put there. It is not a tuning knob but the identity
+        // of the reassembler being built, and it must agree with the demux
+        // arm that feeds it or the stream is deaf: pairing the two in one
+        // expression is what keeps them from drifting apart.
+        let video_sink = config.receive_video.then_some((
+            video_in_tx,
+            ReassemblyConfig {
+                expected_stream: 0,
+                ..config.reassembly
+            },
+        ));
+        let video1_sink = config.receive_video_1.then_some((
+            video1_in_tx,
+            ReassemblyConfig {
+                expected_stream: 1,
+                ..config.reassembly
+            },
+        ));
         let audio_sink = config.receive_audio.then_some(audio_in_tx);
-        if config.receive_video || config.receive_audio {
+        if config.receive_video || config.receive_video_1 || config.receive_audio {
             tasks.push(tokio::spawn(datagram_recv_loop(
                 shared.clone(),
                 video_sink,
+                video1_sink,
                 audio_sink,
             )));
         }
@@ -423,6 +497,7 @@ impl QuicSession {
             control: control_in_rx,
             input: input_in_rx,
             video: video_in_rx,
+            video1: video1_in_rx,
             audio: audio_in_rx,
             events: events_rx,
         };
@@ -680,15 +755,27 @@ async fn input_read_loop(shared: Arc<Shared>, mut stream: RecvStream, tx: mpsc::
 /// `video` is `Some` only when [`SessionConfig::receive_video`] is set, and
 /// carries the reassembly policy so the [`Reassembler`] — much the most
 /// expensive state in this loop — is built only when there is somewhere for
-/// its frames to go. `audio` is `Some` only when
-/// [`SessionConfig::receive_audio`] is set. Both `None` is not a state
+/// its frames to go. `video1` is the same for the second monitor and
+/// [`SessionConfig::receive_video_1`], and `audio_tx` the same for
+/// [`SessionConfig::receive_audio`]. All three `None` is not a state
 /// [`QuicSession::start`] produces: it does not spawn this loop at all then.
+///
+/// The two video streams get one reassembler each, indexed by stream id, and
+/// share nothing: separate `frame_id` windows, separate slots, separate ready
+/// queues. That separation is the point — see [`ReassemblyConfig::expected_stream`]
+/// — and it is why the reassembler is per stream rather than per session.
 async fn datagram_recv_loop(
     shared: Arc<Shared>,
     video: Option<(mpsc::Sender<EncodedFrame>, ReassemblyConfig)>,
+    video1: Option<(mpsc::Sender<EncodedFrame>, ReassemblyConfig)>,
     audio_tx: Option<mpsc::Sender<AudioFrame>>,
 ) {
-    let mut video = video.map(|(tx, config)| (tx, Reassembler::new(config)));
+    // Indexed by the stream id `datagram_stream_id` returns, so routing is an
+    // array lookup rather than a branch that could disagree with the tag.
+    let mut streams: [Option<(mpsc::Sender<EncodedFrame>, Reassembler)>; 2] = [
+        video.map(|(tx, config)| (tx, Reassembler::new(config))),
+        video1.map(|(tx, config)| (tx, Reassembler::new(config))),
+    ];
     loop {
         let datagram = match shared.conn.read_datagram().await {
             Ok(d) => d,
@@ -752,10 +839,33 @@ async fn datagram_recv_loop(
             continue;
         }
 
-        let Some((tx, reassembler)) = video.as_mut() else {
-            // Audio-only session. A video datagram is not ours to reassemble
-            // and there is nowhere to put the result; silently ignored, for
-            // the same anti-flood reason as above.
+        // --- Second demux: which monitor is this? ---
+        //
+        // Not audio, so it is video for *some* stream, and which one is again
+        // one byte read through `.get()` before any parse — the flags byte
+        // `is_audio_datagram` just looked at, one bit over. Everything the
+        // paragraphs above say about reading a slice of unknown provenance
+        // applies here unchanged, which is exactly why the two demuxes share
+        // that byte.
+        //
+        // This classification is UNCONDITIONAL for the same reason the audio
+        // one is; only *delivery* is gated, by the slot being `None`. A
+        // stream-1 datagram on a session that did not negotiate a second
+        // monitor is dropped right here — before any parse, and without ever
+        // being offered to the stream-0 reassembler. Route it into stream 0
+        // instead and `Reassembler::push` would refuse it on
+        // `expected_stream` and climb `fragments_rejected`, which reads as "the
+        // video wire is corrupt" for traffic that is well formed and merely
+        // unwanted, and which feeds the `video_loss` figure the bitrate adaptor
+        // steers on. That rejection in `push` is the backstop for a routing
+        // mistake, not the routing.
+        let Some((tx, reassembler)) = streams
+            .get_mut(crate::video::datagram_stream_id(&datagram) as usize)
+            .and_then(Option::as_mut)
+        else {
+            // Nowhere to put this stream's frames: an audio-only session, or a
+            // single-monitor session handed a second monitor's datagram.
+            // Silently ignored, for the same anti-flood reason as above.
             continue;
         };
         let now_ms = shared.now_ms();
@@ -776,6 +886,12 @@ async fn datagram_recv_loop(
             }
         }
 
+        // Keyframe demand is per reassembler — each stream loses its own
+        // fragments — but the request on the wire is not: `RequestKeyframe`
+        // carries no stream, so it asks the host to refresh what it is sending.
+        // The per-reassembler rate limiter still applies, so a link dropping
+        // both monitors at once asks at most twice per interval rather than
+        // once, which is the honest report of two independent stalls.
         if reassembler.take_keyframe_request(now_ms) {
             shared
                 .counters
@@ -785,10 +901,18 @@ async fn datagram_recv_loop(
             shared.emit(SessionEvent::KeyframeNeeded);
         }
 
-        // Publish the reassembler's counters for the stats sampler. Cheap: a
-        // `Copy` of a handful of `u64`s under an uncontended lock, once per
-        // datagram.
-        *shared.reassembly.lock() = reassembler.stats();
+        // Publish the reassemblers' counters for the stats sampler, summed
+        // across every armed stream: `video_loss` and the adaptor above it
+        // reason about the *link*, and the link is what the monitors share.
+        // Cheap: a `Copy` of a handful of `u64`s under an uncontended lock,
+        // once per datagram.
+        let merged = streams
+            .iter()
+            .flatten()
+            .fold(ReassemblyStats::default(), |acc, (_, r)| {
+                acc.merge(r.stats())
+            });
+        *shared.reassembly.lock() = merged;
     }
 }
 
@@ -1024,6 +1148,41 @@ mod tests {
         }
     }
 
+    /// The same, tagged for a given video stream — what a multi-monitor host's
+    /// second `video_pump` puts on the wire.
+    fn frags_on(conn: &Connection, frame: &EncodedFrame, stream: u8) -> Vec<Vec<u8>> {
+        let mtu = quic::max_datagram(conn).expect("datagrams");
+        crate::video::fragment_frame_fec_on(frame, mtu, 0, stream).expect("fragment")
+    }
+
+    fn send_frame_on(conn: &Connection, frame: &EncodedFrame, stream: u8) {
+        for f in frags_on(conn, frame, stream) {
+            conn.send_datagram(bytes::Bytes::from(f)).expect("datagram");
+        }
+    }
+
+    /// Wait until the driver has published a reassembly snapshot satisfying
+    /// `done`, then return it (or whatever it has, at the deadline).
+    ///
+    /// Not decoration: `datagram_recv_loop` hands a completed frame to its
+    /// channel *before* it republishes the counters, so a test that read them
+    /// the instant `recv()` returned would be one datagram behind and would
+    /// fail perhaps one run in ten. Polling rather than sleeping a fixed
+    /// interval keeps the passing case fast and the failing case bounded.
+    async fn reassembly_when(
+        session: &QuicSession,
+        done: impl Fn(&ReassemblyStats) -> bool,
+    ) -> ReassemblyStats {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = *session.shared.reassembly.lock();
+            if done(&snapshot) || Instant::now() >= deadline {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// The sender half of the audio path, which the driver does not own either.
     /// There is no `fragment_*` step to mirror: one AAC-LC access unit is one
     /// datagram, always, so an audio packet is either delivered whole or lost.
@@ -1072,6 +1231,9 @@ mod tests {
         assert!(bad_audio.validate().is_err());
         // Off by default, so no session pays for audio it did not negotiate.
         assert!(!SessionConfig::default().receive_audio);
+        // Same for the second monitor: every session that has ever run is a
+        // single-monitor session, and must stay one until it negotiates.
+        assert!(!SessionConfig::default().receive_video_1);
     }
 
     #[test]
@@ -1745,6 +1907,334 @@ mod tests {
             assert_eq!(packet.format, AudioFormat::Stereo48k);
             assert_eq!(packet.data, vec![seq as u8; AUDIO_PAYLOAD_LEN]);
         }
+
+        assert!(!session.is_closed());
+        tokio::time::timeout(Duration::from_secs(15), host_task)
+            .await
+            .unwrap()
+            .unwrap();
+        session.close("test done");
+        client_ep.wait_idle().await;
+    }
+
+    /// With [`SessionConfig::receive_video_1`] off — the default — `rx.video1`
+    /// is closed from the start rather than merely idle, exactly as
+    /// `receive_audio_false_closes_the_audio_receiver` pins for audio.
+    ///
+    /// The second half is the interesting one, and it is a *stronger* claim
+    /// than the audio test's. A host sends twenty stream-1 fragments at a
+    /// client that never negotiated a second monitor, threaded through a
+    /// stream-0 frame, and afterwards the stream-0 reassembler's counters are
+    /// untouched — `fragments_rejected` still a clean zero. That is the
+    /// delivery gate observed from outside: an unarmed stream-1 datagram is
+    /// dropped by the demux *before* any parse, so it is never offered to the
+    /// stream-0 reassembler at all. Gate the classification instead and those
+    /// twenty would land in `Reassembler::push`, be refused on
+    /// `expected_stream`, and inflate the very counter [`video_loss`] is built
+    /// from — the second monitor reporting itself as loss on the first.
+    #[tokio::test]
+    async fn receive_video_1_false_closes_the_second_video_receiver() {
+        // Comfortably past `resync_after` (8), so if these ever did reach the
+        // stream-0 reassembler they would do real damage and not merely count.
+        const FOREIGN: u32 = 20;
+
+        fn stream1_frame(id: u32) -> EncodedFrame {
+            EncodedFrame {
+                frame_id: id,
+                keyframe: false,
+                timestamp_ms: 5_000 + id,
+                data: vec![0xC3; 300],
+            }
+        }
+
+        fn stream0_frame(id: u32) -> EncodedFrame {
+            EncodedFrame {
+                frame_id: id,
+                keyframe: id == 20,
+                timestamp_ms: 900 + id,
+                data: (0..8000u32)
+                    .map(|i| (i.wrapping_add(id) % 251) as u8)
+                    .collect(),
+            }
+        }
+
+        let id = HostIdentity::generate("no-second-monitor-host").unwrap();
+        let params = QuicParams::default();
+        let server =
+            quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let host_task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let streams = quic::accept_streams(&conn).await.expect("accept streams");
+            let (session, mut rx) = QuicSession::start(
+                conn,
+                streams,
+                TransportRoute::DirectUdp,
+                SessionConfig {
+                    heartbeat_ms: 0,
+                    stats_interval_ms: 0,
+                    receive_video: false,
+                    receive_audio: false,
+                    ..Default::default()
+                },
+            )
+            .expect("host session");
+
+            // Rendezvous, so the datagrams below cannot race the client's
+            // session coming up.
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.control.recv())
+                .await
+                .expect("control timeout")
+                .expect("control closed");
+            assert!(matches!(msg, ControlMsg::StartStream { .. }));
+
+            let conn = session.connection();
+            let frame_a = stream0_frame(20);
+            let frags_a = frags_on(conn, &frame_a, 0);
+            assert!(frags_a.len() > 1, "the fixture must need reassembly");
+
+            // Second-monitor fragments at ids far outside stream 0's window and
+            // consecutive with each other — the shape that accumulates a resync
+            // run — threaded *between* stream 0's fragments so they land on a
+            // live reassembly slot rather than only at a frame boundary.
+            for i in 0..FOREIGN {
+                send_frame_on(conn, &stream1_frame(0x4000_0000u32.wrapping_add(i)), 1);
+                if let Some(f) = frags_a.get(i as usize) {
+                    conn.send_datagram(bytes::Bytes::from(f.clone()))
+                        .expect("datagram");
+                }
+            }
+            for f in frags_a.iter().skip(FOREIGN as usize) {
+                conn.send_datagram(bytes::Bytes::from(f.clone()))
+                    .expect("datagram");
+            }
+            // A whole stream-0 frame after all of it. Its arrival is the client's
+            // proof that every datagram above has already been through the loop,
+            // since the counters are republished after each one in order.
+            send_frame_on(conn, &stream0_frame(21), 0);
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(!session.is_closed());
+        });
+
+        let client_ep = quic::client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
+        let conn = quic::connect(&client_ep, server_addr)
+            .await
+            .expect("connect");
+        let streams = quic::open_streams(&conn).await.expect("open streams");
+        // Plain `default()`: `receive_video_1` is false without anyone saying
+        // so, which is the state every existing caller is already in.
+        let (session, mut rx) = QuicSession::start(
+            conn,
+            streams,
+            TransportRoute::DirectUdp,
+            SessionConfig::default(),
+        )
+        .expect("client session");
+
+        session
+            .send_control(ControlMsg::StartStream {
+                max_width: 1920,
+                max_height: 1080,
+                preferred_fps: 60,
+                quality_mode: crate::protocol::QualityMode::Balanced,
+            })
+            .expect("send control");
+
+        // Closed, not idle: the sender was dropped at `start`, so this returns
+        // without waiting for anything.
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.video1.recv())
+            .await
+            .expect("video1 receiver should close, not hang");
+        assert!(got.is_none(), "no second monitor should ever be delivered");
+
+        // The primary monitor is untouched by the second one that just went
+        // past it, byte for byte, both frames.
+        for id in [20u32, 21] {
+            let frame = tokio::time::timeout(Duration::from_secs(10), rx.video.recv())
+                .await
+                .expect("video timeout")
+                .expect("video closed");
+            assert_same_frame(&frame, &stream0_frame(id));
+        }
+
+        // The whole claim, in one counter. Twenty well-formed stream-1
+        // datagrams went past the stream-0 reassembler and it never saw one of
+        // them — not even to reject it.
+        let stats = reassembly_when(&session, |s| s.frames_completed >= 2).await;
+        assert_eq!(
+            stats.fragments_rejected, 0,
+            "an unarmed second monitor reached the stream-0 reassembler and \
+             reported itself as video corruption"
+        );
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+        assert_eq!(stats.frames_dropped_stale, 0);
+        assert_eq!(stats.frames_completed, 2);
+        assert!(!session.is_closed());
+
+        tokio::time::timeout(Duration::from_secs(15), host_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        session.close("test done");
+        client_ep.wait_idle().await;
+    }
+
+    /// Two monitors interleaved on the one datagram path, over loopback QUIC:
+    /// each comes out on its own receiver, undamaged.
+    ///
+    /// The fixture deliberately gives both streams the **same frame ids** with
+    /// different content and different timestamps. That is the discriminator: a
+    /// single shared reassembler would see the second stream's fragments as
+    /// contradicting a live slot (same id, different timestamp) and reject
+    /// them, so this test cannot be passed by a demux that routes to one
+    /// reassembler and merely tags the output. It is also the honest wire
+    /// picture — two monitors are two independent encoders, and nothing keeps
+    /// their numbering apart.
+    ///
+    /// The interleaving is fragment by fragment, not frame by frame, so the
+    /// classification runs mid-frame with both reassemblers holding a live slot.
+    #[tokio::test]
+    async fn loopback_session_demuxes_two_video_streams() {
+        fn frame_on(stream: u8, id: u32) -> EncodedFrame {
+            EncodedFrame {
+                frame_id: id,
+                keyframe: id == 100,
+                // Different per stream, so a slot shared between them would
+                // contradict rather than silently merge.
+                timestamp_ms: 1_000 * u32::from(stream) + id,
+                data: (0..8000u32)
+                    .map(|i| (i.wrapping_add(id).wrapping_add(u32::from(stream) * 37) % 251) as u8)
+                    .collect(),
+            }
+        }
+
+        let id = HostIdentity::generate("two-monitor-host").unwrap();
+        let params = QuicParams::default();
+        let server =
+            quic::server_endpoint("127.0.0.1:0".parse().unwrap(), id.tls(), &params).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let host_task = tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("handshake");
+            let streams = quic::accept_streams(&conn).await.expect("accept streams");
+            let (session, mut rx) = QuicSession::start(
+                conn,
+                streams,
+                TransportRoute::DirectUdp,
+                SessionConfig {
+                    heartbeat_ms: 0,
+                    stats_interval_ms: 0,
+                    // A pure sender, on both monitors.
+                    receive_video: false,
+                    receive_audio: false,
+                    ..Default::default()
+                },
+            )
+            .expect("host session");
+
+            let msg = tokio::time::timeout(Duration::from_secs(10), rx.control.recv())
+                .await
+                .expect("control timeout")
+                .expect("control closed");
+            assert!(matches!(msg, ControlMsg::StartStream { .. }));
+
+            let conn = session.connection();
+            for id in [100u32, 101] {
+                let on_0 = frags_on(conn, &frame_on(0, id), 0);
+                let on_1 = frags_on(conn, &frame_on(1, id), 1);
+                assert!(on_0.len() > 1, "the fixture must need reassembly");
+                assert_eq!(on_0.len(), on_1.len(), "same geometry, different tag");
+                for (a, b) in on_0.iter().zip(&on_1) {
+                    conn.send_datagram(bytes::Bytes::from(a.clone()))
+                        .expect("datagram");
+                    conn.send_datagram(bytes::Bytes::from(b.clone()))
+                        .expect("datagram");
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(!session.is_closed());
+        });
+
+        let client_ep = quic::client_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerPinning::Pinned(*id.spki_sha256()),
+            &params,
+        )
+        .unwrap();
+        let conn = quic::connect(&client_ep, server_addr)
+            .await
+            .expect("connect");
+        let streams = quic::open_streams(&conn).await.expect("open streams");
+        let (session, mut rx) = QuicSession::start(
+            conn,
+            streams,
+            TransportRoute::DirectUdp,
+            SessionConfig {
+                heartbeat_ms: 0,
+                stats_interval_ms: 0,
+                receive_video_1: true,
+                ..Default::default()
+            },
+        )
+        .expect("client session");
+
+        session
+            .send_control(ControlMsg::StartStream {
+                max_width: 1920,
+                max_height: 1080,
+                preferred_fps: 60,
+                quality_mode: crate::protocol::QualityMode::Balanced,
+            })
+            .expect("send control");
+
+        for id in [100u32, 101] {
+            let frame = tokio::time::timeout(Duration::from_secs(10), rx.video.recv())
+                .await
+                .expect("video timeout")
+                .expect("video closed");
+            assert_same_frame(&frame, &frame_on(0, id));
+
+            let frame1 = tokio::time::timeout(Duration::from_secs(10), rx.video1.recv())
+                .await
+                .expect("video1 timeout")
+                .expect("video1 closed");
+            assert_same_frame(&frame1, &frame_on(1, id));
+        }
+
+        // Both reassemblers healthy, and the published figure is their sum: two
+        // frames each, four in all, with nothing rejected on either side.
+        let stats = reassembly_when(&session, |s| s.frames_completed >= 4).await;
+        assert_eq!(
+            stats.frames_completed, 4,
+            "the published counters must be the sum across both streams"
+        );
+        assert_eq!(stats.fragments_rejected, 0);
+        assert_eq!(stats.frames_dropped_incomplete, 0);
+        assert_eq!(stats.frames_dropped_stale, 0);
+        assert_eq!(
+            video_loss(&ReassemblyStats::default(), &stats),
+            0.0,
+            "two clean monitors read as video loss"
+        );
 
         assert!(!session.is_closed());
         tokio::time::timeout(Duration::from_secs(15), host_task)

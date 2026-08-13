@@ -271,6 +271,31 @@ pub fn is_release_chord(key: egui::Key, m: egui::Modifiers) -> bool {
     m.ctrl && m.alt && m.shift && matches!(key, egui::Key::F12)
 }
 
+/// Was the release chord *pressed* anywhere in this batch of egui events?
+///
+/// Pure, and the single detector both windows use. Each OS window has its own
+/// `InputState`, so the chord typed into the second monitor's window is invisible
+/// to the main window's event stream and vice versa — two hand-rolled loops would
+/// be two chances to disagree about what the escape hatch is. Only the press
+/// counts: the matching release is swallowed from forwarding but must not toggle
+/// capture a second time.
+pub fn chord_pressed(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            // The physical key is what the user actually pressed; a remapped
+            // layout can report something else as `key`.
+            } if is_release_chord(physical_key.unwrap_or(*key), *modifiers)
+        )
+    })
+}
+
 /// Map an egui logical/physical key to a US Set-1 hardware scan code and its
 /// extended flag — the wire format the host injects with `KEYEVENTF_SCANCODE`.
 /// Returns `None` for keys egui does not model (skipped). The nav cluster and
@@ -757,6 +782,415 @@ mod hook {
 pub use hook::inject_test_key;
 
 // ---------------------------------------------------------------------------
+// Per-window forwarders
+// ---------------------------------------------------------------------------
+
+/// Pointer, wheel and button forwarding for **one** window.
+///
+/// Split out of [`InputCapture`] because a second monitor means a second OS
+/// window, and every part of the pointer path is per-window:
+///
+/// * the mapping is against *that* window's drawn [`VideoView`], so the same
+///   egui point in two windows is two different remote coordinates;
+/// * the [`MoveCoalescer`] must not be shared — one 250 Hz slot between two
+///   windows would let motion in window A starve window B's, and the struct is
+///   five fields;
+/// * the stream tag answers the question a second monitor makes unanswerable:
+///   *which* coordinate space was this click normalized against.
+///
+/// The keyboard deliberately has no such split; see [`EguiKeyForwarder`].
+pub struct PointerForwarder {
+    tx: mpsc::Sender<InputMsg>,
+    /// `None` → legacy [`InputMsg::Event`]: byte-identical to what a
+    /// single-monitor client has always put on the wire, and the only thing
+    /// stream 0 ever sends. `Some(id)` → `InputMsg::EventOn { id, .. }`.
+    stream: Option<u8>,
+    /// Whether a *tagged* forwarder may put `EventOn` on the wire at all.
+    ///
+    /// Load-bearing. The input stream is read with `decode_strict`, so a host
+    /// that never echoed `features::MULTI_MONITOR` does not skip an unknown
+    /// variant — it errors, and that error kills the input stream. The operator
+    /// then has a session whose video is perfectly healthy and whose keyboard
+    /// and mouse are dead, which reads as a hung remote machine. One unguarded
+    /// send is enough. The second window only exists on a negotiated session,
+    /// so this is belt and braces on top of that — deliberately, because the
+    /// cost of the belt is a bool and the cost of being wrong is the whole
+    /// session's input.
+    armed: bool,
+    moves: MoveCoalescer,
+    /// Buttons this window is holding down on the host. Non-zero means a drag
+    /// is live and this window owns the gesture until it ends.
+    buttons_held: u32,
+}
+
+impl PointerForwarder {
+    /// A stream-0 forwarder: legacy `InputMsg::Event`, always allowed on the
+    /// wire because every host that ever existed understands it.
+    pub fn legacy(tx: mpsc::Sender<InputMsg>) -> Self {
+        Self {
+            tx,
+            stream: None,
+            armed: true,
+            moves: MoveCoalescer::new(MOUSE_MOVE_HZ),
+            buttons_held: 0,
+        }
+    }
+
+    /// A forwarder that tags its events with `id`. Starts **disarmed**: nothing
+    /// reaches the wire until the session proves it negotiated multi-monitor.
+    pub fn on_stream(tx: mpsc::Sender<InputMsg>, id: u8) -> Self {
+        Self {
+            tx,
+            stream: Some(id),
+            armed: false,
+            moves: MoveCoalescer::new(MOUSE_MOVE_HZ),
+            buttons_held: 0,
+        }
+    }
+
+    /// Mirror "this session negotiated `MULTI_MONITOR`" down from the UI, which
+    /// is the only place that knows it (the arrival of a `MonitorList` is the
+    /// proof). No effect on a legacy forwarder.
+    pub fn set_armed(&mut self, armed: bool) {
+        self.armed = armed;
+    }
+
+    /// How this forwarder spells one event on the wire — the whole difference
+    /// between the two windows, in one match.
+    fn wrap(&self, event: InputEvent) -> InputMsg {
+        match self.stream {
+            None => InputMsg::Event(event),
+            Some(id) => InputMsg::EventOn { id, event },
+        }
+    }
+
+    /// Legacy is unconditional; a tagged forwarder needs the negotiated bit.
+    fn wire_allowed(&self) -> bool {
+        self.stream.is_none() || self.armed
+    }
+
+    fn send(&self, event: InputEvent) -> bool {
+        send_input(&self.tx, self.wrap(event))
+    }
+
+    /// A gesture is live: some button is down on the host because of *this*
+    /// window.
+    pub fn is_dragging(&self) -> bool {
+        self.buttons_held > 0
+    }
+
+    /// Forward one frame's worth of egui events for this window.
+    ///
+    /// `viewport` is the whole video area (the main window's central panel
+    /// below the toolbar; the child window's entire panel, since it has no
+    /// chrome), `view` the letterboxed rect the picture actually occupies, and
+    /// `cached_pointer` the last known position — `MouseWheel` events carry
+    /// none of their own.
+    ///
+    /// **The drag latch lives here.** Once a button is down, this window owns
+    /// the gesture: moves and the release are forwarded wherever the cursor
+    /// has got to, instead of being dropped for leaving the video area. The OS
+    /// captures the mouse to the window the press landed in, so those events
+    /// keep arriving here — and they must keep going to *this* window's stream,
+    /// because a drag started on monitor 1 is still a drag on monitor 1 no
+    /// matter which window the cursor is over. Without the latch, a release
+    /// that happens off the video leaves the button stuck down on the host with
+    /// nothing left to lift it.
+    pub fn handle_events(
+        &mut self,
+        events: &[egui::Event],
+        viewport: egui::Rect,
+        view: &VideoView,
+        cached_pointer: Option<egui::Pos2>,
+    ) {
+        if !self.wire_allowed() {
+            // Don't even accumulate: a disarmed forwarder must not report a
+            // pending move and keep its window repainting for nothing.
+            return;
+        }
+        for event in events {
+            match event {
+                egui::Event::PointerMoved(pos) if self.is_dragging() || viewport.contains(*pos) => {
+                    self.on_pointer_moved(*pos, view);
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } if self.is_dragging() || viewport.contains(*pos) => {
+                    self.on_pointer_button(*pos, view, *button, *pressed);
+                }
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    let Some(pos) = cached_pointer else { continue };
+                    if !viewport.contains(pos) {
+                        continue;
+                    }
+                    if delta.y != 0.0 {
+                        self.on_wheel(pos, view, wheel_delta(*unit, delta.y), false);
+                    }
+                    if delta.x != 0.0 {
+                        self.on_wheel(pos, view, wheel_delta(*unit, delta.x), true);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Queue a pointer position (coalesced, rate-capped).
+    pub fn on_pointer_moved(&mut self, pos: egui::Pos2, view: &VideoView) {
+        if let Some((x, y)) = map_pointer_clamped(pos, view) {
+            self.moves.push(x, y);
+        }
+    }
+
+    /// Forward a button press/release. Presses in the letterbox margin are
+    /// ignored; releases are always delivered (clamped) so nothing sticks.
+    pub fn on_pointer_button(
+        &mut self,
+        pos: egui::Pos2,
+        view: &VideoView,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) {
+        let Some(button) = map_button(button) else {
+            return;
+        };
+        let mapped = if pressed {
+            map_pointer(pos, view)
+        } else {
+            map_pointer_clamped(pos, view)
+        };
+        let Some((x, y)) = mapped else { return };
+
+        // A button event carries its own position; flush any pending move first
+        // so the host never sees the click land at a stale coordinate.
+        self.flush_move_now(x, y);
+
+        if pressed {
+            self.buttons_held += 1;
+        } else {
+            self.buttons_held = self.buttons_held.saturating_sub(1);
+        }
+        self.send(InputEvent::MouseButton {
+            button,
+            action: if pressed {
+                KeyAction::Down
+            } else {
+                KeyAction::Up
+            },
+            x,
+            y,
+        });
+    }
+
+    pub fn on_wheel(&mut self, pos: egui::Pos2, view: &VideoView, delta: i16, horizontal: bool) {
+        if delta == 0 {
+            return;
+        }
+        let Some((x, y)) = map_pointer(pos, view) else {
+            return;
+        };
+        self.send(InputEvent::MouseWheel {
+            delta,
+            horizontal,
+            x,
+            y,
+        });
+    }
+
+    /// Send `(x, y)` immediately, bypassing the rate cap.
+    ///
+    /// The cap exists to thin out continuous motion; a click must never land
+    /// at a stale coordinate on the host. Any coalesced move still pending is
+    /// dropped, because this position supersedes it.
+    fn flush_move_now(&mut self, x: u16, y: u16) {
+        self.moves.clear();
+        self.send(InputEvent::MouseMove { x, y });
+    }
+
+    /// Drain the coalescing slot. Call once per pass of the window that owns
+    /// this forwarder.
+    pub fn pump(&mut self) {
+        if let Some((x, y)) = self.moves.take_due(Instant::now()) {
+            self.send(InputEvent::MouseMove { x, y });
+        }
+    }
+
+    /// Forget the pending move and the held-button count without sending
+    /// anything. The caller has just emitted (or is about to emit) a global
+    /// `ReleaseAll`, which drops everything on the host in one message.
+    pub fn clear_gesture(&mut self) {
+        self.moves.clear();
+        self.buttons_held = 0;
+    }
+
+    pub fn moves_sent(&self) -> u64 {
+        self.moves.emitted_count()
+    }
+
+    pub fn moves_coalesced(&self) -> u64 {
+        self.moves.coalesced_count()
+    }
+
+    pub fn has_pending_move(&self) -> bool {
+        self.moves.has_pending()
+    }
+}
+
+/// egui-path keyboard forwarding for **one** window.
+///
+/// Keys are *not* per-stream and this type has no stream tag: scan-code
+/// injection on the host has no monitor, and the host keeps its held-key state
+/// on a single injector — so everything here rides legacy [`InputMsg::Event`]
+/// whichever window it was typed into. Splitting keys per window on the wire
+/// would invent a distinction the host does not have.
+///
+/// What *is* per-window is the synthesized-modifier bookkeeping. egui reports
+/// modifier *state* rather than Ctrl/Alt/Shift key events, each window's
+/// `InputState` reports its own, and the modifiers we synthesize from a diff
+/// have to be released when the window that synthesized them loses focus. Only
+/// one window is focused at a time, so two forwarders can never both be
+/// tracking.
+pub struct EguiKeyForwarder {
+    tx: mpsc::Sender<InputMsg>,
+    /// Modifier state last mirrored to the host from the egui key path.
+    tracked_shift: bool,
+    tracked_ctrl: bool,
+    tracked_alt: bool,
+    /// This window's own focus, for the falling edge.
+    focused: bool,
+}
+
+impl EguiKeyForwarder {
+    pub fn new(tx: mpsc::Sender<InputMsg>) -> Self {
+        Self {
+            tx,
+            tracked_shift: false,
+            tracked_ctrl: false,
+            tracked_alt: false,
+            focused: false,
+        }
+    }
+
+    /// Track *this window's* focus. On losing it, release any modifier this
+    /// forwarder is holding down on the host, so nothing sticks when the
+    /// operator tabs away — or moves to the other DirectDesk window, which is
+    /// exactly why the flag is per-window and not the global foreground gate.
+    pub fn set_focused(&mut self, focused: bool) {
+        let was = std::mem::replace(&mut self.focused, focused);
+        if was && !focused {
+            self.release_synth_mods();
+        }
+    }
+
+    /// Forward one frame's worth of egui key events, minus the release chord.
+    ///
+    /// The chord is ours, not the host's: both its press and its release are
+    /// swallowed so no half of it lands on the remote machine. Detection is
+    /// [`chord_pressed`], which the caller has already acted on.
+    pub fn forward_events(&mut self, events: &[egui::Event]) {
+        for event in events {
+            if let egui::Event::Key {
+                key,
+                physical_key,
+                pressed,
+                modifiers,
+                ..
+            } = event
+            {
+                if is_release_chord(physical_key.unwrap_or(*key), *modifiers) {
+                    continue;
+                }
+                self.on_key_event(*physical_key, *key, *pressed, *modifiers);
+            }
+        }
+    }
+
+    /// Focused-window keyboard capture (mirrors the mouse egui path). Maps the
+    /// key to a scan code, synthesizes modifier scan codes from egui's modifier
+    /// state, and forwards `InputEvent::Key`. Only used while the window is the
+    /// foreground window, where the global hook is unreliable.
+    pub fn on_key_event(
+        &mut self,
+        physical_key: Option<egui::Key>,
+        logical_key: egui::Key,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    ) {
+        let key = physical_key.unwrap_or(logical_key);
+
+        // Mirror modifier transitions to the host before the key so capitals
+        // and Ctrl/Alt combos reproduce. A lone modifier release (no egui key
+        // event) is corrected on the next key press, and on focus loss.
+        if modifiers.shift != self.tracked_shift {
+            self.tracked_shift = modifiers.shift;
+            self.send_scan(SC_LSHIFT, false, modifiers.shift);
+        }
+        if modifiers.ctrl != self.tracked_ctrl {
+            self.tracked_ctrl = modifiers.ctrl;
+            self.send_scan(SC_CTRL, false, modifiers.ctrl);
+        }
+        if modifiers.alt != self.tracked_alt {
+            self.tracked_alt = modifiers.alt;
+            self.send_scan(SC_ALT, false, modifiers.alt);
+        }
+
+        if let Some((scan, extended)) = egui_key_to_scancode(key) {
+            self.send_scan(scan, extended, pressed);
+        }
+    }
+
+    /// Send one raw scan-code key event and count it like the hook path does.
+    /// Always legacy `Event` — see the type docs.
+    fn send_scan(&self, scan_code: u16, extended: bool, down: bool) {
+        if scan_code == 0 || scan_code > 0xFF {
+            return;
+        }
+        let ok = send_input(
+            &self.tx,
+            InputMsg::Event(InputEvent::Key {
+                scan_code,
+                extended,
+                action: if down { KeyAction::Down } else { KeyAction::Up },
+            }),
+        );
+        if ok {
+            KEYS_FORWARDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Release any modifier this forwarder is holding down on the host.
+    pub fn release_synth_mods(&mut self) {
+        if self.tracked_shift {
+            self.tracked_shift = false;
+            self.send_scan(SC_LSHIFT, false, false);
+        }
+        if self.tracked_ctrl {
+            self.tracked_ctrl = false;
+            self.send_scan(SC_CTRL, false, false);
+        }
+        if self.tracked_alt {
+            self.tracked_alt = false;
+            self.send_scan(SC_ALT, false, false);
+        }
+    }
+
+    /// Drop the tracked modifiers *without* sending ups: the caller has emitted
+    /// a `ReleaseAll`, which already dropped every held key on the host.
+    pub fn forget_synth_mods(&mut self) {
+        self.tracked_shift = false;
+        self.tracked_ctrl = false;
+        self.tracked_alt = false;
+    }
+
+    pub fn tracked_modifiers(&self) -> (bool, bool, bool) {
+        (self.tracked_ctrl, self.tracked_alt, self.tracked_shift)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Facade used by the UI
 // ---------------------------------------------------------------------------
 
@@ -781,42 +1215,47 @@ pub struct InputCapture {
     /// What the user asked for. Drives the UI, and is authoritative for
     /// toggling, because hook installation is asynchronous.
     capture_requested: bool,
-    moves: MoveCoalescer,
-    buttons_held: u32,
+    /// The main window's pointer path. Legacy `InputMsg::Event` — stream 0 — so
+    /// the wire is byte-identical to a single-monitor client's on the dominant
+    /// path. The second window owns a forwarder of its own.
+    pointer: PointerForwarder,
+    /// The main window's egui key path. Keys are global, so this one's output
+    /// is legacy `Event` too, and so is the second window's.
+    keys: EguiKeyForwarder,
     last_error: Option<String>,
-    /// Modifier state last mirrored to the host from the egui key path. egui
-    /// reports modifier *state* (not Shift/Ctrl/Alt key events), so we diff
-    /// against this and synthesize modifier scan codes on transitions.
-    tracked_shift: bool,
-    tracked_ctrl: bool,
-    tracked_alt: bool,
 }
 
 impl InputCapture {
     pub fn new(tx: mpsc::Sender<InputMsg>) -> Self {
         HOOK_STATE.lock().tx = Some(tx.clone());
         Self {
+            pointer: PointerForwarder::legacy(tx.clone()),
+            keys: EguiKeyForwarder::new(tx.clone()),
             tx,
             hook: None,
             capture_requested: false,
-            moves: MoveCoalescer::new(MOUSE_MOVE_HZ),
-            buttons_held: 0,
             last_error: None,
-            tracked_shift: false,
-            tracked_ctrl: false,
-            tracked_alt: false,
         }
     }
 
-    /// Track the window's foreground state. When focused, the egui key path
-    /// owns capture and the low-level hook passes through (see
-    /// [`WINDOW_FOREGROUND`]). On losing focus, release any modifier we
-    /// synthesized so nothing sticks down on the host.
-    pub fn set_window_foreground(&mut self, focused: bool) {
-        let was = WINDOW_FOREGROUND.swap(focused, Ordering::SeqCst);
-        if was && !focused {
-            self.release_synth_mods();
-        }
+    /// Mirror "**any** DirectDesk window is the foreground window" into the
+    /// hook's pass-through gate ([`WINDOW_FOREGROUND`]).
+    ///
+    /// Any, not just the main one: while either window is focused the egui path
+    /// owns keys, so the hook must pass them through or they would be sent
+    /// twice. The hook itself has no window context and never gains one — this
+    /// is a single process-wide bit, and [`swallow_decision`] reads it exactly
+    /// as it always has.
+    pub fn set_any_window_foreground(&mut self, focused: bool) {
+        WINDOW_FOREGROUND.store(focused, Ordering::SeqCst);
+    }
+
+    /// Track the **main** window's own focus, which is what governs the main
+    /// window's synthesized modifiers: they must be released when *this* window
+    /// loses focus, even if the second window is picking it up and the
+    /// process-wide foreground bit therefore stays set.
+    pub fn set_window_focused(&mut self, focused: bool) {
+        self.keys.set_focused(focused);
     }
 
     /// Mirror whether the session is live. Background swallowing is gated on
@@ -833,76 +1272,15 @@ impl InputCapture {
         BACKGROUND_CAPTURE.store(on, Ordering::Relaxed);
     }
 
-    /// Focused-window keyboard capture (mirrors the mouse egui path). Maps the
-    /// key to a scan code, synthesizes modifier scan codes from egui's modifier
-    /// state, and forwards `InputEvent::Key`. Only used while the window is the
-    /// foreground window, where the global hook is unreliable.
-    pub fn on_key_event(
-        &mut self,
-        physical_key: Option<egui::Key>,
-        logical_key: egui::Key,
-        pressed: bool,
-        modifiers: egui::Modifiers,
-    ) {
-        let key = physical_key.unwrap_or(logical_key);
-
-        // The release chord is handled by the UI's global detector (every
-        // frame, every view) and filtered out of the forwarded event stream
-        // before it gets here — see `is_release_chord`.
-
-        // Mirror modifier transitions to the host before the key so capitals
-        // and Ctrl/Alt combos reproduce. A lone modifier release (no egui key
-        // event) is corrected on the next key press, and on focus loss.
-        if modifiers.shift != self.tracked_shift {
-            self.tracked_shift = modifiers.shift;
-            self.send_scan(SC_LSHIFT, false, modifiers.shift);
-        }
-        if modifiers.ctrl != self.tracked_ctrl {
-            self.tracked_ctrl = modifiers.ctrl;
-            self.send_scan(SC_CTRL, false, modifiers.ctrl);
-        }
-        if modifiers.alt != self.tracked_alt {
-            self.tracked_alt = modifiers.alt;
-            self.send_scan(SC_ALT, false, modifiers.alt);
-        }
-
-        if let Some((scan, extended)) = egui_key_to_scancode(key) {
-            self.send_scan(scan, extended, pressed);
-        }
-    }
-
-    /// Send one raw scan-code key event and count it like the hook path does.
-    fn send_scan(&self, scan_code: u16, extended: bool, down: bool) {
-        if scan_code == 0 || scan_code > 0xFF {
+    /// Forward the main window's keystrokes, minus the release chord.
+    ///
+    /// Gated on capture being enabled so the toggle and the release chord still
+    /// govern it. The chord itself has already been serviced by the caller.
+    pub fn forward_key_events(&mut self, events: &[egui::Event]) {
+        if !self.capture_requested {
             return;
         }
-        let ok = send_input(
-            &self.tx,
-            InputMsg::Event(InputEvent::Key {
-                scan_code,
-                extended,
-                action: if down { KeyAction::Down } else { KeyAction::Up },
-            }),
-        );
-        if ok {
-            KEYS_FORWARDED.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Release any modifier the egui path is holding down on the host.
-    fn release_synth_mods(&mut self) {
-        if self.tracked_shift {
-            self.tracked_shift = false;
-            self.send_scan(SC_LSHIFT, false, false);
-        }
-        if self.tracked_ctrl {
-            self.tracked_ctrl = false;
-            self.send_scan(SC_CTRL, false, false);
-        }
-        if self.tracked_alt {
-            self.tracked_alt = false;
-            self.send_scan(SC_ALT, false, false);
-        }
+        self.keys.forward_events(events);
     }
 
     pub fn is_capturing(&self) -> bool {
@@ -959,14 +1337,15 @@ impl InputCapture {
     }
 
     /// Emit `ReleaseAll` and clear local pointer/coalescer state.
+    ///
+    /// `ReleaseAll` is deliberately never stream-tagged: it means "drop
+    /// everything you are holding", the host holds that state on one injector,
+    /// and a per-stream release would be a distinction the host cannot honour.
     pub fn release_all(&mut self) {
-        self.moves.clear();
-        self.buttons_held = 0;
+        self.pointer.clear_gesture();
         // The host's ReleaseAll drops every held key, so just forget our
         // synthesized-modifier state (don't send individual ups after it).
-        self.tracked_shift = false;
-        self.tracked_ctrl = false;
-        self.tracked_alt = false;
+        self.keys.forget_synth_mods();
         send_input(&self.tx, InputMsg::ReleaseAll);
         tracing::debug!("sent ReleaseAll");
     }
@@ -981,8 +1360,8 @@ impl InputCapture {
                 thread.uninstall();
             }
             // The hook already emitted ReleaseAll; just clear local state.
-            self.moves.clear();
-            self.buttons_held = 0;
+            self.pointer.clear_gesture();
+            self.keys.forget_synth_mods();
             return Some(CaptureLoss::ChordRelease);
         }
         if self.capture_requested {
@@ -996,89 +1375,23 @@ impl InputCapture {
         None
     }
 
-    /// Queue a pointer position (coalesced, rate-capped).
-    pub fn on_pointer_moved(&mut self, pos: egui::Pos2, view: &VideoView) {
-        if let Some((x, y)) = map_pointer_clamped(pos, view) {
-            self.moves.push(x, y);
-        }
-    }
-
-    /// Forward a button press/release. Presses in the letterbox margin are
-    /// ignored; releases are always delivered (clamped) so nothing sticks.
-    pub fn on_pointer_button(
+    /// Forward the main window's pointer events. See
+    /// [`PointerForwarder::handle_events`] — including the drag latch, which is
+    /// shared with the second window rather than reimplemented per window.
+    pub fn forward_pointer_events(
         &mut self,
-        pos: egui::Pos2,
+        events: &[egui::Event],
+        viewport: egui::Rect,
         view: &VideoView,
-        button: egui::PointerButton,
-        pressed: bool,
+        cached_pointer: Option<egui::Pos2>,
     ) {
-        let Some(button) = map_button(button) else {
-            return;
-        };
-        let mapped = if pressed {
-            map_pointer(pos, view)
-        } else {
-            map_pointer_clamped(pos, view)
-        };
-        let Some((x, y)) = mapped else { return };
-
-        // A button event carries its own position; flush any pending move first
-        // so the host never sees the click land at a stale coordinate.
-        self.flush_move_now(x, y);
-
-        if pressed {
-            self.buttons_held += 1;
-        } else {
-            self.buttons_held = self.buttons_held.saturating_sub(1);
-        }
-        send_input(
-            &self.tx,
-            InputMsg::Event(InputEvent::MouseButton {
-                button,
-                action: if pressed {
-                    KeyAction::Down
-                } else {
-                    KeyAction::Up
-                },
-                x,
-                y,
-            }),
-        );
-    }
-
-    pub fn on_wheel(&mut self, pos: egui::Pos2, view: &VideoView, delta: i16, horizontal: bool) {
-        if delta == 0 {
-            return;
-        }
-        let Some((x, y)) = map_pointer(pos, view) else {
-            return;
-        };
-        send_input(
-            &self.tx,
-            InputMsg::Event(InputEvent::MouseWheel {
-                delta,
-                horizontal,
-                x,
-                y,
-            }),
-        );
-    }
-
-    /// Send `(x, y)` immediately, bypassing the rate cap.
-    ///
-    /// The cap exists to thin out continuous motion; a click must never land
-    /// at a stale coordinate on the host. Any coalesced move still pending is
-    /// dropped, because this position supersedes it.
-    fn flush_move_now(&mut self, x: u16, y: u16) {
-        self.moves.clear();
-        send_input(&self.tx, InputMsg::Event(InputEvent::MouseMove { x, y }));
+        self.pointer
+            .handle_events(events, viewport, view, cached_pointer);
     }
 
     /// Drain the coalescing slot. Call once per UI frame.
     pub fn pump(&mut self) {
-        if let Some((x, y)) = self.moves.take_due(Instant::now()) {
-            send_input(&self.tx, InputMsg::Event(InputEvent::MouseMove { x, y }));
-        }
+        self.pointer.pump();
     }
 
     pub fn keys_forwarded(&self) -> u64 {
@@ -1092,15 +1405,15 @@ impl InputCapture {
     }
 
     pub fn moves_sent(&self) -> u64 {
-        self.moves.emitted_count()
+        self.pointer.moves_sent()
     }
 
     pub fn moves_coalesced(&self) -> u64 {
-        self.moves.coalesced_count()
+        self.pointer.moves_coalesced()
     }
 
     pub fn has_pending_move(&self) -> bool {
-        self.moves.has_pending()
+        self.pointer.has_pending_move()
     }
 }
 
@@ -1463,6 +1776,412 @@ mod tests {
             y: 0
         })
         .is_ok());
+    }
+
+    // -- per-window forwarders --------------------------------------------
+
+    /// A forwarder plus the receiving end of its wire, so a test can read
+    /// exactly what that window put on the channel.
+    fn wired(stream: Option<u8>) -> (PointerForwarder, mpsc::Receiver<InputMsg>) {
+        let (tx, rx) = mpsc::channel(256);
+        let mut fwd = match stream {
+            None => PointerForwarder::legacy(tx),
+            Some(id) => PointerForwarder::on_stream(tx, id),
+        };
+        // A tagged forwarder ships nothing until the session proves it
+        // negotiated the feature; every test below that isn't *about* the gate
+        // starts past it.
+        fwd.set_armed(true);
+        (fwd, rx)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<InputMsg>) -> Vec<InputMsg> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    /// A view whose rect starts at `origin` and shows `remote_w x remote_h`
+    /// scaled to fit `size` — i.e. what `Presenter::draw` hands the forwarder.
+    fn view_at(origin: (f32, f32), size: (u32, u32), remote: (u32, u32)) -> VideoView {
+        let (x, y, w, h) = fit_rect(remote.0, remote.1, size.0, size.1);
+        VideoView {
+            rect: egui::Rect::from_min_size(
+                egui::pos2(origin.0 + x as f32, origin.1 + y as f32),
+                egui::vec2(w as f32, h as f32),
+            ),
+            remote_w: remote.0,
+            remote_h: remote.1,
+        }
+    }
+
+    fn moved(x: f32, y: f32) -> egui::Event {
+        egui::Event::PointerMoved(egui::pos2(x, y))
+    }
+
+    fn clicked(x: f32, y: f32, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn key_event(key: egui::Key, pressed: bool, m: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: m,
+        }
+    }
+
+    #[test]
+    fn two_windows_map_the_same_point_through_their_own_views() {
+        // The whole reason the pointer path is per-window: an egui point is
+        // meaningless without the view it was drawn in, and the two windows
+        // never share one.
+        let main = view_at((0.0, 40.0), (1000, 1000), (1920, 1080)); // letterboxed, below a toolbar
+        let child = view_at((0.0, 0.0), (800, 450), (2560, 1440)); // full-bleed, other monitor
+        let probe = egui::pos2(200.0, 120.0);
+
+        let (mut a, mut rx_a) = wired(None);
+        let (mut b, mut rx_b) = wired(Some(1));
+        a.on_pointer_moved(probe, &main);
+        b.on_pointer_moved(probe, &child);
+        a.pump();
+        b.pump();
+
+        let unwrap_move = |msgs: Vec<InputMsg>| match msgs.as_slice() {
+            [InputMsg::Event(InputEvent::MouseMove { x, y })] => (*x, *y),
+            [InputMsg::EventOn {
+                event: InputEvent::MouseMove { x, y },
+                ..
+            }] => (*x, *y),
+            other => panic!("expected exactly one move, got {other:?}"),
+        };
+        let from_main = unwrap_move(drain(&mut rx_a));
+        let from_child = unwrap_move(drain(&mut rx_b));
+        assert_ne!(
+            from_main, from_child,
+            "one point, two windows, two remote coordinates"
+        );
+        // And each agrees with its own view's pure mapping.
+        assert_eq!(from_main, map_pointer_clamped(probe, &main).unwrap());
+        assert_eq!(from_child, map_pointer_clamped(probe, &child).unwrap());
+    }
+
+    #[test]
+    fn one_windows_saturated_rate_cap_never_withholds_the_others_moves() {
+        // A single shared `MoveCoalescer` would let a window that is moving
+        // continuously eat the whole 250 Hz budget and leave the other window's
+        // cursor frozen. Each forwarder owns one.
+        let view = view_at((0.0, 0.0), (800, 450), (1920, 1080));
+        let (mut a, mut rx_a) = wired(None);
+        let (mut b, mut rx_b) = wired(Some(1));
+
+        // Saturate A: it emits once, then its cap withholds everything else.
+        for i in 0..64 {
+            a.on_pointer_moved(view.rect.center() + egui::vec2(i as f32 * 0.5, 0.0), &view);
+            a.pump();
+        }
+        assert!(
+            a.has_pending_move(),
+            "A's own cap should be withholding by now"
+        );
+
+        // B has emitted nothing yet, so its own cap is wide open.
+        b.on_pointer_moved(view.rect.center(), &view);
+        b.pump();
+        assert_eq!(
+            b.moves_sent(),
+            1,
+            "B's first move goes out regardless of how hard A is moving"
+        );
+        assert!(!b.has_pending_move());
+        assert!(!drain(&mut rx_b).is_empty());
+        assert!(!drain(&mut rx_a).is_empty());
+    }
+
+    #[test]
+    fn the_tagged_forwarder_wraps_every_pointer_kind_and_the_legacy_one_wraps_none() {
+        let view = view_at((0.0, 0.0), (800, 450), (1920, 1080));
+        let viewport = view.rect;
+        let centre = view.rect.center();
+        let events = vec![
+            moved(centre.x, centre.y),
+            clicked(centre.x, centre.y, true),
+            clicked(centre.x, centre.y, false),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+
+        let (mut child, mut rx_child) = wired(Some(1));
+        child.handle_events(&events, viewport, &view, Some(centre));
+        child.pump();
+        let from_child = drain(&mut rx_child);
+        assert!(
+            from_child.len() >= 4,
+            "expected moves, both button edges and the wheel: {from_child:?}"
+        );
+        for msg in &from_child {
+            match msg {
+                InputMsg::EventOn { id, event } => {
+                    assert_eq!(*id, 1);
+                    assert!(
+                        !matches!(event, InputEvent::Key { .. }),
+                        "keys are never stream-tagged: {event:?}"
+                    );
+                }
+                other => panic!("second window must tag every pointer event: {other:?}"),
+            }
+        }
+
+        let (mut main, mut rx_main) = wired(None);
+        main.handle_events(&events, viewport, &view, Some(centre));
+        main.pump();
+        let from_main = drain(&mut rx_main);
+        assert_eq!(from_main.len(), from_child.len(), "same events, same count");
+        assert!(
+            from_main.iter().all(|m| matches!(m, InputMsg::Event(_))),
+            "stream 0 stays byte-identical to a single-monitor client: {from_main:?}"
+        );
+    }
+
+    #[test]
+    fn a_disarmed_tagged_forwarder_puts_nothing_on_the_wire() {
+        // The C2 rule: an `EventOn` reaching a host that never echoed
+        // MULTI_MONITOR errors its `decode_strict` reader and kills the input
+        // stream for the whole session.
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut fwd = PointerForwarder::on_stream(tx, 1);
+        let view = view_at((0.0, 0.0), (800, 450), (1920, 1080));
+        let centre = view.rect.center();
+        fwd.handle_events(
+            &[moved(centre.x, centre.y), clicked(centre.x, centre.y, true)],
+            view.rect,
+            &view,
+            Some(centre),
+        );
+        fwd.pump();
+        assert!(drain(&mut rx).is_empty(), "disarmed means silent");
+        assert!(
+            !fwd.has_pending_move(),
+            "and it should not even be asking for repaints"
+        );
+
+        // Armed, the same batch goes out.
+        fwd.set_armed(true);
+        fwd.handle_events(&[moved(centre.x, centre.y)], view.rect, &view, Some(centre));
+        fwd.pump();
+        assert!(!drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_window_stays_on_the_stream_it_started_on() {
+        // The OS captures the mouse to the window the press landed in, so these
+        // events keep arriving here — and a drag begun on monitor 2 is still a
+        // drag on monitor 2 wherever the cursor has got to. Dropping the
+        // release for being out of bounds would leave the button stuck down on
+        // the host with nothing left alive to lift it.
+        let view = view_at((0.0, 0.0), (800, 450), (1920, 1080));
+        let viewport = view.rect;
+        let centre = view.rect.center();
+        let outside = egui::pos2(viewport.max.x + 300.0, viewport.center().y);
+
+        let (mut child, mut rx) = wired(Some(1));
+        child.handle_events(&[clicked(centre.x, centre.y, true)], viewport, &view, None);
+        assert!(child.is_dragging(), "button down latches the gesture");
+        child.handle_events(&[moved(outside.x, outside.y)], viewport, &view, None);
+        child.pump();
+        child.handle_events(
+            &[clicked(outside.x, outside.y, false)],
+            viewport,
+            &view,
+            None,
+        );
+        assert!(!child.is_dragging(), "the release ends it");
+
+        let msgs = drain(&mut rx);
+        for msg in &msgs {
+            assert!(
+                matches!(msg, InputMsg::EventOn { id: 1, .. }),
+                "every event of the drag belongs to stream 1: {msg:?}"
+            );
+        }
+        let ups = msgs
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    InputMsg::EventOn {
+                        event: InputEvent::MouseButton {
+                            action: KeyAction::Up,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(ups, 1, "the release must reach the host: {msgs:?}");
+        let out_of_bounds_move = msgs.iter().any(|m| {
+            matches!(
+                m,
+                InputMsg::EventOn {
+                    event: InputEvent::MouseMove { x: u16::MAX, .. },
+                    ..
+                }
+            )
+        });
+        assert!(
+            out_of_bounds_move,
+            "the mid-drag move should track, clamped to the edge: {msgs:?}"
+        );
+
+        // Without a drag in flight the same off-view move is still ignored.
+        let (mut idle, mut rx_idle) = wired(Some(1));
+        idle.handle_events(&[moved(outside.x, outside.y)], viewport, &view, None);
+        idle.pump();
+        assert!(drain(&mut rx_idle).is_empty());
+    }
+
+    #[test]
+    fn both_windows_detect_the_release_chord_with_the_same_predicate() {
+        // Each OS window has its own `InputState`, so the chord typed into one
+        // is invisible to the other. One pure detector is what makes the escape
+        // hatch mean the same thing from either window.
+        let all = mods(true, true, true);
+        assert!(chord_pressed(&[key_event(egui::Key::F12, true, all)]));
+        assert!(
+            !chord_pressed(&[key_event(egui::Key::F12, false, all)]),
+            "only the press toggles; the release must not toggle back"
+        );
+        assert!(!chord_pressed(&[key_event(
+            egui::Key::F12,
+            true,
+            mods(true, false, true)
+        )]));
+        assert!(!chord_pressed(&[key_event(egui::Key::F11, true, all)]));
+        assert!(!chord_pressed(&[moved(1.0, 1.0)]));
+        // Found anywhere in the batch, not just first.
+        assert!(chord_pressed(&[
+            key_event(egui::Key::A, true, egui::Modifiers::default()),
+            key_event(egui::Key::F12, true, all),
+        ]));
+    }
+
+    #[test]
+    fn neither_windows_key_forwarder_lets_the_chord_reach_the_host() {
+        // Both halves of the chord are swallowed: half a chord landing on the
+        // remote machine is a stray Ctrl+Alt+Shift+F12 over there.
+        let all = mods(true, true, true);
+        let events = vec![
+            key_event(egui::Key::F12, true, all),
+            key_event(egui::Key::F12, false, all),
+        ];
+        for _window in 0..2 {
+            let (tx, mut rx) = mpsc::channel(64);
+            let mut keys = EguiKeyForwarder::new(tx);
+            keys.set_focused(true);
+            keys.forward_events(&events);
+            let msgs = drain(&mut rx);
+            let f12 = msgs.iter().any(|m| {
+                matches!(
+                    m,
+                    InputMsg::Event(InputEvent::Key {
+                        scan_code: SC_F12,
+                        ..
+                    })
+                )
+            });
+            assert!(!f12, "the chord is ours, not the host's: {msgs:?}");
+        }
+    }
+
+    #[test]
+    fn keys_from_either_window_ride_the_legacy_untagged_event() {
+        // The host injects scan codes with no notion of a monitor and keeps
+        // held-key state on one injector, so a per-window key tag would be an
+        // invention. Both windows' key forwarders are the same type for exactly
+        // this reason — this asserts the type's only wire spelling.
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut keys = EguiKeyForwarder::new(tx);
+        keys.set_focused(true);
+        keys.forward_events(&[key_event(
+            egui::Key::A,
+            true,
+            egui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        )]);
+        let msgs = drain(&mut rx);
+        assert!(
+            msgs.iter().all(|m| matches!(m, InputMsg::Event(_))),
+            "no key is ever stream-tagged: {msgs:?}"
+        );
+        // Shift is synthesized ahead of the letter so the capital reproduces.
+        assert!(matches!(
+            msgs.first(),
+            Some(InputMsg::Event(InputEvent::Key {
+                scan_code: SC_LSHIFT,
+                action: KeyAction::Down,
+                ..
+            }))
+        ));
+        assert_eq!(keys.tracked_modifiers(), (false, false, true));
+    }
+
+    #[test]
+    fn a_key_forwarder_releases_its_own_modifiers_when_its_own_window_loses_focus() {
+        // Per-window, and that is the point: tabbing from one DirectDesk window
+        // to the other keeps the *process* in the foreground, so only the
+        // window's own focus can say whose synthesized Shift to lift.
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut keys = EguiKeyForwarder::new(tx);
+        keys.set_focused(true);
+        keys.forward_events(&[key_event(
+            egui::Key::A,
+            true,
+            mods(true, false, true), // ctrl+shift held
+        )]);
+        drain(&mut rx);
+        assert_eq!(keys.tracked_modifiers(), (true, false, true));
+
+        keys.set_focused(false);
+        let ups = drain(&mut rx);
+        assert_eq!(keys.tracked_modifiers(), (false, false, false));
+        for want in [SC_LSHIFT, SC_CTRL] {
+            assert!(
+                ups.iter().any(|m| matches!(
+                    m,
+                    InputMsg::Event(InputEvent::Key {
+                        scan_code,
+                        action: KeyAction::Up,
+                        ..
+                    }) if *scan_code == want
+                )),
+                "modifier {want:#x} must be lifted on focus loss: {ups:?}"
+            );
+        }
+
+        // Forgetting is the other half: after a global ReleaseAll there is
+        // nothing left to lift, and sending ups anyway would be noise.
+        keys.set_focused(true);
+        keys.forward_events(&[key_event(egui::Key::A, true, mods(false, true, false))]);
+        drain(&mut rx);
+        keys.forget_synth_mods();
+        keys.set_focused(false);
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]

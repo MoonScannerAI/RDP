@@ -47,9 +47,18 @@ not "probably fine, just untested."
 - **Clipboard is text-only.** `ControlMsg::ClipboardText(String)` exists
   and is capped at `MAX_CLIPBOARD_BYTES` (1 MiB); images, files, and rich
   formats on the clipboard are not synchronized — only plain text.
-- **Single monitor.** The MVP captures and streams one display/adapter
-  output. Multi-monitor host setups are not selectable or spanned; whichever
-  single display is configured is what you get.
+- **Up to two monitors, not full multi-monitor.** A client can stream the
+  host's primary display, a second display, or both at once — but the cap
+  is two, not however many the host actually has. Within that cap: quality
+  and fps controls are session-wide, not per-stream; lossless tiles and
+  system audio stay primary-stream-only; the secondary window has no
+  toolbar and no fullscreen/snap handling yet; a loss-triggered keyframe
+  request refreshes both streams together, not just the one that lost a
+  frame; and monitor ids can be reassigned by Windows mid-session (e.g. the
+  primary display changes) — the client re-resolves its Primary/Second/Both
+  choice against the current topology each time it connects, rather than
+  live-updating a running session. See "Multi-monitor" below for the
+  negotiation, the rollout gating, and what has and hasn't been verified.
 - **No relay, no hole punch** — repeated here deliberately since it's the
   single most consequential gap for a WAN deployment behind restrictive
   NAT: see above.
@@ -135,6 +144,77 @@ audio feature does.
   bounded, it does not eliminate it, and it does nothing for the A/V sync gap
   described above.
 
+## Multi-monitor (up to two displays, opt-in on the host)
+
+A client can now stream the host's primary display, a second display, or
+both — but read every bullet below before assuming this is full
+multi-monitor support.
+
+- **Off by default on the host, like audio.** It's negotiated as a
+  `Hello.features` bit (`features::MULTI_MONITOR`, `1<<5`,
+  `shared/src/protocol.rs`) and gated by `HostConfig::multi_monitor_enabled`,
+  which defaults to `false` (`host/src/config.rs`). The client always offers
+  the bit; the host only echoes it back when the operator has turned it on.
+  When it's off, negotiation is a no-op and a build with this feature
+  behaves exactly like one without it.
+- **Wire-identical rollout, in two steps** — the same shape as the tiles and
+  audio rollouts: **step 1**, deploy the updated host and client binaries
+  with `multi_monitor_enabled` still `false` — the wire behavior is
+  byte-identical to a pre-feature build, so this step alone carries no
+  compatibility risk. **Step 2**, once both ends are updated, set
+  `multi_monitor_enabled: true` in `host.json` and restart the host (see
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the restart procedure and a
+  config-file footgun to avoid when editing `host.json`). An old client
+  against a new host, and a new client against an old or still-disabled
+  host, are both wire-identical to a pre-feature build —
+  `host/tests/multimon_interop.rs` gates exactly this across four scenarios.
+- **The second stream is a tagged flag on the existing datagram path, not a
+  second QUIC stream.** `Both` opens two H.264 streams over the one QUIC
+  connection; the second is distinguished by a flags bit on the video
+  datagram header (`FLAG_STREAM1`), not a new transport-level stream.
+  `Second monitor` alone reuses the same single-stream path `Primary` does
+  — it just retargets it, so it costs nothing extra over streaming the
+  primary.
+- **One shared bitrate budget, split by pixel area — not two independent
+  quality settings.** Quality mode and fps targets apply to the whole
+  session; there is one adaptive-bitrate controller, and it splits capacity
+  between the two streams rather than giving each its own ceiling. A
+  loss-triggered keyframe request refreshes both streams, even when only
+  one of them actually lost anything.
+- **Lossless tiles and system audio remain primary-stream-only.** The
+  second stream never gets tile refinement and carries no audio of its
+  own — see "Audio" above; nothing about that changes for this feature.
+- **Hardware encoder session limits can silently demote the second stream
+  to software encoding.** Consumer NVIDIA GPUs support only 2-3 concurrent
+  NVENC sessions; if the primary stream (and anything else on the box) has
+  already claimed them, the second stream's encoder falls back to
+  software. This is a quality/CPU tradeoff, not an error, and it shows up
+  in the host's own log and internal status (`hardware_encoder: false` on
+  the secondary stream) — not anywhere in the client.
+- **The secondary window is a plain, chrome-less window.** No toolbar, no
+  fullscreen/snap handling — those exist only on the primary window in this
+  MVP. Closing it tells the host to stop encoding that stream (it isn't
+  just hidden locally, so it also saves the encode and the bandwidth); the
+  toolbar's second-monitor button re-adds it.
+- **Topology changes are handled, but not invisible.** If the second
+  monitor's output disappears, the host ends that stream and the client
+  closes its window with a notice; monitor ids can also be reassigned
+  mid-session (e.g. Windows moves which display is primary) — the host
+  tracks its persistent stream by the monitor's identity, not its numeric
+  id, but the client's Primary/Second/Both choice is resolved once, against
+  the topology at connect time, not live-updated while a session runs. See
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the specific symptoms.
+- **Verified so far on one machine only.** The interop suite
+  (`host/tests/multimon_interop.rs`) ran its dual-monitor scenario in full
+  on a two-output box (a physical panel plus a virtual display), including
+  the tagged-datagram demux, independent keyframe fan-out on both lanes, and
+  stream teardown. That suite drives a hand-rolled wire client, not
+  `DirectDeskClient.exe` itself — end-to-end verification through the real
+  client UI has not been done yet, and none of this has been exercised over
+  the real Philippines-client ↔ Ohio-host WAN link. Treat multi-monitor as
+  "works in a controlled two-output loopback test," not yet "works on the
+  reference deployment," until a milestone test entry says otherwise.
+
 ## Trust and distribution
 
 - **Binaries are unsigned.** No code-signing certificate is used for
@@ -161,6 +241,12 @@ audio feature does.
   confirmed live session across that specific link — treat the WAN
   behavior sections as "should work, not yet proven" until a milestone
   test entry says otherwise.
+- **Multi-monitor is verified only on one two-output dev machine so far**
+  (panel + virtual display, interop suite, dual-monitor scenario run in
+  full) — not yet over the real WAN link above, and not yet exercised
+  through the real client UI end-to-end (the interop suite uses a
+  hand-rolled wire client). See "Multi-monitor" above for the full
+  breakdown.
 - **Not tested against Sunshine/GameStream actually running concurrently**
   — the port-collision risk (47990 inside 47984–48010) is a documented,
   structural fact about the port ranges, not something confirmed by a

@@ -39,6 +39,7 @@ use directdesk_shared::video::EncodedFrame;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::monitors::MonitorChoice;
 use crate::net::{self, ConnectParams};
 use crate::session::{ConnectionState, TransportEndpoints, CONTROL_QUEUE_DEPTH, INPUT_QUEUE_DEPTH};
 use directdesk_shared::protocol::InputMsg;
@@ -70,6 +71,13 @@ pub struct StreamCaps {
     /// user of an audio-enabled host had to find a second switch to get the
     /// feature the operator already turned on.
     pub system_audio: bool,
+    /// Which outputs to ask the host for. Default `Primary` — a single
+    /// stream, exactly today's behaviour; `Second`/`Both` take effect only
+    /// once the host echoes `features::MULTI_MONITOR` and reports a second
+    /// output, and degrade to the primary (with a note) when it does not.
+    /// Seeded from [`crate::config::ClientConfig::monitor_choice`] and
+    /// updated live by [`ConnectSupervisor::set_monitor_choice`].
+    pub monitor_choice: MonitorChoice,
 }
 
 impl Default for StreamCaps {
@@ -85,6 +93,7 @@ impl Default for StreamCaps {
             preferred_fps: 0,
             lossless_tiles: true,
             system_audio: true,
+            monitor_choice: MonitorChoice::default(),
         }
     }
 }
@@ -114,6 +123,7 @@ impl ConnectRequest {
             preferred_fps: caps.preferred_fps,
             lossless_tiles: caps.lossless_tiles,
             system_audio: caps.system_audio,
+            monitor_choice: caps.monitor_choice,
         }
     }
 }
@@ -139,6 +149,11 @@ pub struct ConnectSupervisor {
     control_in_tx: crossbeam_channel::Sender<ControlMsg>,
     tiles_tx: crossbeam_channel::Sender<directdesk_shared::tiles::TileMsg>,
     audio_tx: crossbeam_channel::Sender<directdesk_shared::audio::AudioFrame>,
+    /// The second monitor's frames. Held for the app's lifetime like every
+    /// other inbound sender, even for the (overwhelmingly common) sessions
+    /// that never negotiate a second stream: the UI's `video2_rx` must not see
+    /// a closed channel just because this connection is single-monitor.
+    video2_tx: crossbeam_channel::Sender<EncodedFrame>,
 
     // Outbound (UI -> transport). The pumps forward to whichever sender is
     // installed here; `None` means "no active connection, drop the message".
@@ -167,6 +182,7 @@ impl ConnectSupervisor {
             control_tx: control_in_tx,
             tiles_tx,
             audio_tx,
+            video2_tx,
             input_rx,
             control_rx,
         } = transport;
@@ -187,6 +203,7 @@ impl ConnectSupervisor {
             control_in_tx,
             tiles_tx,
             audio_tx,
+            video2_tx,
             input_target,
             control_target,
             current: None,
@@ -205,6 +222,33 @@ impl ConnectSupervisor {
     /// directly on the session's control channel.
     pub fn set_preferred_fps(&mut self, fps: u32) {
         self.caps.preferred_fps = fps;
+    }
+
+    /// Update the monitor choice the *next* `connect()` carries, for the same
+    /// reason and with the same scope as [`set_preferred_fps`](Self::set_preferred_fps):
+    /// it does not touch a currently-live connection. Calling it is what makes
+    /// `run_client`'s own internal reconnect re-negotiate the operator's
+    /// latest choice rather than the one in effect when the driver started.
+    ///
+    /// # Why the mid-session re-send is not here
+    ///
+    /// `ControlMsg::SelectMonitors` is idempotent and re-sendable at any time,
+    /// and the path for it already exists end to end: the UI's
+    /// `ClientSession::send_control` feeds the outbound pump below, which
+    /// hands it to whichever connection is live. What the supervisor does
+    /// *not* have is the one fact that makes such a send safe — whether this
+    /// session negotiated `features::MULTI_MONITOR`. That answer lives where
+    /// the host's `MonitorList` lands (the UI's inbound control lane), and the
+    /// gate is load-bearing rather than tidy: `SelectMonitors` is an appended
+    /// discriminant, so a host that predates the feature does not skip it, it
+    /// fails `decode_strict` and the control stream dies. So the send stays
+    /// with the code that can prove the bit came back mutual, and the
+    /// supervisor keeps only the reconnect-scoped choice.
+    ///
+    /// (The proof that a `SelectMonitors` sent that way does reach the live
+    /// connection is `a_mid_session_selection_reaches_the_live_connection`.)
+    pub fn set_monitor_choice(&mut self, choice: MonitorChoice) {
+        self.caps.monitor_choice = choice;
     }
 
     /// Spawn `run_client` for `request`, cancelling any prior attempt first so a
@@ -226,6 +270,7 @@ impl ConnectSupervisor {
             control_tx: self.control_in_tx.clone(),
             tiles_tx: self.tiles_tx.clone(),
             audio_tx: self.audio_tx.clone(),
+            video2_tx: self.video2_tx.clone(),
             input_rx,
             control_rx: control_out_rx,
         };
@@ -380,6 +425,69 @@ mod tests {
         assert!(sup.is_connected());
         sup.disconnect();
         assert!(!sup.is_connected());
+    }
+
+    /// The mid-session re-selection path, end to end through the seam the UI
+    /// actually uses: `ClientSession::send_control` -> the app-lifetime pump ->
+    /// the currently-installed connection. Pinned here because milestone C3
+    /// reopens/closes the second window by re-sending `SelectMonitors` on it,
+    /// and because the *other* half of that contract — that nothing sends it
+    /// unless the host echoed `MULTI_MONITOR` — is only defensible if the send
+    /// itself is known to work without a reconnect.
+    #[tokio::test]
+    async fn a_mid_session_selection_reaches_the_live_connection() {
+        let (src_tx, src_rx) = mpsc::channel::<ControlMsg>(16);
+        let (target_tx, target_rx) = watch::channel(None);
+        tokio::spawn(outbound_pump(src_rx, target_rx));
+
+        let (dst_tx, mut dst_rx) = mpsc::channel::<ControlMsg>(16);
+        target_tx.send(Some(dst_tx.clone())).unwrap();
+
+        src_tx
+            .send(ControlMsg::SelectMonitors { ids: vec![0, 1] })
+            .await
+            .unwrap();
+        match dst_rx.recv().await.unwrap() {
+            ControlMsg::SelectMonitors { ids } => assert_eq!(ids, vec![0, 1]),
+            other => panic!("wrong message reached the session: {other:?}"),
+        }
+
+        // Dropping back to the primary is the same path, and must not need a
+        // reconnect either (closing the second window uses it).
+        src_tx
+            .send(ControlMsg::SelectMonitors { ids: vec![0] })
+            .await
+            .unwrap();
+        match dst_rx.recv().await.unwrap() {
+            ControlMsg::SelectMonitors { ids } => assert_eq!(ids, vec![0]),
+            other => panic!("wrong message reached the session: {other:?}"),
+        }
+    }
+
+    /// The choice reaches `ConnectParams` — the only route by which the
+    /// handshake can learn it — and a later `set_monitor_choice` is what the
+    /// *next* connect carries.
+    #[test]
+    fn the_monitor_choice_rides_caps_into_connect_params() {
+        let caps = StreamCaps::default();
+        assert_eq!(
+            caps.monitor_choice,
+            MonitorChoice::Primary,
+            "today's default"
+        );
+        assert_eq!(
+            request().into_params(caps).monitor_choice,
+            MonitorChoice::Primary
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_session, mut sup) = supervisor(&rt);
+        sup.set_monitor_choice(MonitorChoice::Both);
+        assert_eq!(
+            request().into_params(sup.caps).monitor_choice,
+            MonitorChoice::Both,
+            "the next connect must carry the operator's latest choice"
+        );
     }
 
     #[tokio::test]

@@ -183,8 +183,10 @@ If the client shows black but the host is not on a secure desktop:
 2. Confirm the host isn't rendering to a display that's actually powered
    off/disconnected (e.g. RDP'd in over a *different* tool that changed the
    active display configuration, or a monitor put to sleep by Windows power
-   settings) — DirectDesk MVP is single-monitor and captures a specific
-   adapter/output; if that output goes away, capture has nothing to read.
+   settings) — each captured output is a specific adapter/output; if that
+   output goes away, capture has nothing to read. This MVP caps a session at
+   two monitors even when multi-monitor is on — see the "Multi-monitor"
+   section below for what happens to a stream whose output disappears.
 3. Check for a `Encoder`/`Decoder` error in the logs — a hardware encoder
    MFT can occasionally fail to initialize (driver issue) and should fall
    back to software; a stuck black screen with encoder errors in the log
@@ -315,6 +317,72 @@ and no encoder setting can compensate for either.
    many tiles are resident and what share of the screen they cover, plus a
    **highlight** toggle that tints refined regions so you can see exactly what
    has converged.
+
+## Multi-monitor: enabling it, a second monitor that won't show, or a config edit with no effect
+
+### Turning it on
+
+Multi-monitor follows the same two-step, wire-identical rollout as system
+audio and lossless tiles:
+
+1. **Deploy the updated binaries on both ends first**, with
+   `multi_monitor_enabled` still `false` (the shipped default). The wire
+   behavior is byte-identical to a pre-feature build at this point —
+   `host/tests/multimon_interop.rs` gates exactly this — so this step alone
+   carries no compatibility risk even before the other end has updated.
+2. **Once both ends are updated**, set `multi_monitor_enabled: true` in
+   `host.json` and restart `DirectDeskHost.exe`.
+
+If step 2 doesn't seem to take effect — the client's Monitors picker still
+only offers Primary, or a second monitor never streams — **check that
+`host.json` was saved without a UTF-8 byte-order mark**.
+`HostConfig::load_or_create` (`host/src/config.rs`) treats a BOM'd file as
+unparseable JSON, logs `host config unreadable (...); using defaults`, and
+silently falls back to every default — `multi_monitor_enabled: false`
+included — with no error dialog and nothing visibly wrong until you read
+the host log. This is a general `host.json` footgun, not specific to this
+setting (the same trap applies to any hand-edit, e.g. `idle_repeat_ms`
+above); re-save the file BOM-less and restart the host.
+
+### The second monitor's output disappears mid-session
+
+If the second monitor's actual output goes away — a virtual display turned
+off, a cable pulled — the host doesn't hang: its topology watchdog notices
+that stream has produced nothing for about 5 seconds, confirms the
+monitor's key no longer resolves, and ends that stream with reason
+`"monitor detached"`. The client closes that window with a notice; the
+primary stream and window are unaffected.
+
+The reverse case — the *primary* monitor disappears and Windows falls the
+primary pipeline back onto the same physical output the second stream was
+already duplicating — ends the second stream too, with reason `"monitor is
+now the primary"`: Desktop Duplication cannot hand one output to two
+duplications in the same process, so the second stream cannot recover and
+stops rather than sit there failing forever. Both are expected behavior,
+not bugs.
+
+A `StreamStopped` notice for a second monitor whose window you never saw
+open is also legal — it means the host failed to build that stream's
+pipeline in the first place. It doesn't affect the primary session.
+
+### The second monitor looks softer or stutters more than the primary
+
+Check the host log for that stream's `pipeline: ...` line (or the host's
+internal status). Consumer NVIDIA GPUs support only 2-3 concurrent NVENC
+sessions; if those are already spoken for, the second stream's encoder is
+demoted to software rather than failing outright — visible as
+`hardware_encoder: false` for the secondary stream. That's a quality/CPU
+tradeoff, not an error — the same "which encoder actually got selected"
+check from the High latency checklist above applies per-stream here.
+
+### Diagnosing without a second physical monitor
+
+The client's diagnostics panel gets a **Stream 1 (second monitor)** section
+(decode fps, frames decoded/presented, source) whenever a second stream is
+actually live. To exercise both windows on one machine without a real
+second display, `DirectDeskClient.exe --loopback-demo --demo-second-window`
+feeds a synthetic source into the second window the same way
+`--loopback-demo` does for the first.
 
 ## Quick reference: log file locations
 

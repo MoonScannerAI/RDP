@@ -10,22 +10,24 @@
 
 pub mod connect_form;
 pub mod diagnostics;
+pub mod second_window;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use directdesk_shared::protocol::{ControlMsg, QualityMode};
+use directdesk_shared::protocol::{ControlMsg, MonitorInfo, QualityMode};
 use directdesk_shared::stats::{validate_stats, ConnStats, TransportRoute};
+use parking_lot::Mutex;
 
 use crate::config::ClientConfig;
 use crate::connect::ConnectSupervisor;
-use crate::input_capture::{
-    is_release_chord, wheel_delta, CaptureLoss, InputCapture, RELEASE_CHORD,
-};
-use crate::pipeline::Pipeline;
-use crate::renderer::{describe_scale, is_exact_scale, FrameSlot, Presenter, VideoView};
+use crate::input_capture::{chord_pressed, CaptureLoss, InputCapture, RELEASE_CHORD};
+use crate::monitors::{self, MonitorChoice};
+use crate::pipeline::{Pipeline, SourceStatus};
+use crate::renderer::{describe_scale, is_exact_scale, FrameSlot, Presenter, MAIN_VIDEO_TEXTURE};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
 use crate::tiles::TileStore;
+use crate::ui::second_window::SecondaryShared;
 
 /// An outstanding UAC prompt on the remote host, awaiting an operator
 /// decision. Shown as a banner over the session view; auto-dismisses so a
@@ -69,6 +71,12 @@ pub struct AppInit {
     /// Kept alive so the channels stay open until a transport claims them.
     pub transport: Option<TransportEndpoints>,
     pub slot: Arc<FrameSlot>,
+    /// The stream-1 frame slot, written by the second decode thread.
+    pub slot2: Arc<FrameSlot>,
+    /// The second decode path's own status gauges. Separate from
+    /// `pipeline.status` (stream 0's) so neither stream's numbers can be a lie
+    /// about the other.
+    pub stream1_status: Arc<SourceStatus>,
     pub pipeline: Pipeline,
     pub mode: SourceMode,
     /// Drives `net::run_client` on the shared runtime in response to the connect
@@ -89,6 +97,14 @@ pub struct AppInit {
     /// release chord, tears it down). Lets the capture path be exercised on a
     /// machine where another app keeps stealing foreground focus.
     pub hold_capture: bool,
+    /// Test aid (`--demo-second-window`): the caller has already attached a
+    /// second synthetic source to `slot2` (mirroring `--loopback-demo`'s
+    /// primary source), so open the second window immediately rather than
+    /// waiting for a `MonitorList` that a loopback session will never
+    /// receive. `main`'s arg parsing rejects this flag without
+    /// `--loopback-demo`, so it is meaningless (and never set) under
+    /// `SourceMode::Live`.
+    pub demo_second_window: bool,
 }
 
 pub struct ClientApp {
@@ -174,6 +190,47 @@ pub struct ClientApp {
     /// Bring-up aid; mirrored into the pipeline (which the decode thread
     /// reads) whenever it changes. Deliberately not persisted.
     tile_highlight: bool,
+
+    // -- Second monitor (stream 1). All of this is inert on a session that
+    // -- never negotiated MULTI_MONITOR: `monitors` stays `None`, which is the
+    // -- single gate every one of these paths reads.
+    /// The stream-1 frame slot. Held here (as well as inside `stream1`) because
+    /// the teardown sites clear it without needing the lock.
+    stream1_slot: Arc<FrameSlot>,
+    /// Stream 1's decode gauges, for the metrics dump.
+    stream1_status: Arc<SourceStatus>,
+    /// State the deferred child viewport's paint callback shares with this
+    /// struct. See `second_window` for why it has to live behind a mutex.
+    stream1: Arc<Mutex<SecondaryShared>>,
+    /// UI intent: whether the second OS window should exist this pass. The
+    /// deferred viewport lives only while it is re-declared, so this flag *is*
+    /// the window's lifetime.
+    stream1_window_open: bool,
+    /// What the operator has said about the second window *this session*.
+    ///
+    /// The host re-sends its whole `MonitorList` on any topology change — a
+    /// resolution change or a re-arrange, not only a plug/unplug — so the
+    /// decision of whether a second window should be up cannot be re-derived
+    /// from the persisted connect-screen choice each time: that would slam a
+    /// toolbar-opened window shut, and re-open one the operator had dismissed.
+    /// This field is what survives those re-sends. A host-driven `StreamStopped`
+    /// deliberately does **not** touch it: that is not the operator's decision,
+    /// so a monitor that comes back brings its window back with it.
+    stream1_intent: SecondWindowIntent,
+    /// Stream 1's dims/fps/bitrate from the most recent `StreamConfig { id: 1 }`,
+    /// for the window title. The stream-1 twin of `host_video`.
+    stream1_video: Option<(u32, u32, u32, u32)>,
+    /// Which monitor id stream 1 is showing, per the host's `StreamConfig`.
+    /// Used only to look its name up for the title.
+    stream1_monitor: Option<u8>,
+    /// The host's `MonitorList` for this session, or `None` when none ever
+    /// arrived.
+    ///
+    /// **`None` is the degrade signal**: an old host that does not echo the
+    /// `MULTI_MONITOR` bit sends no list at all, so this is also the gate on
+    /// every mid-session `SelectMonitors` re-send — the UI is the only place
+    /// that knows whether the feature was negotiated.
+    monitors: Option<Vec<MonitorInfo>>,
 }
 
 impl ClientApp {
@@ -182,7 +239,8 @@ impl ClientApp {
         // system theme preference then overrides. Pin the preference instead:
         // a remote screen belongs on a dark surround, always.
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-        let input = InputCapture::new(init.session.input_tx.clone());
+        let input_tx = init.session.input_tx.clone();
+        let input = InputCapture::new(input_tx.clone());
         let show_diagnostics = init.config.show_diagnostics;
         let auto_snap_scale = init.config.auto_snap_scale;
         let fullscreen = init.config.start_fullscreen;
@@ -197,6 +255,7 @@ impl ClientApp {
         let mut supervisor = init.supervisor;
         if let Some(sup) = supervisor.as_mut() {
             sup.set_preferred_fps(init.config.preferred_fps);
+            sup.set_monitor_choice(init.config.monitor_choice);
         }
 
         // Lossless refinement tiles. The store belongs to the pipeline (the
@@ -228,7 +287,7 @@ impl ClientApp {
             slot: init.slot,
             pipeline,
             tiles,
-            presenter: Presenter::new(),
+            presenter: Presenter::new(MAIN_VIDEO_TEXTURE),
             input,
             mode: init.mode,
             supervisor,
@@ -258,6 +317,19 @@ impl ClientApp {
             auto_snap_scale,
             pending_auto_snap: false,
             tile_highlight: false,
+            stream1: Arc::new(Mutex::new(SecondaryShared::new(
+                init.slot2.clone(),
+                input_tx,
+            ))),
+            stream1_slot: init.slot2,
+            stream1_status: init.stream1_status,
+            // Normally waits for a `MonitorList`/toolbar click; `--demo-second-window`
+            // has no host to send either, so it starts the window open directly.
+            stream1_window_open: init.demo_second_window,
+            stream1_intent: SecondWindowIntent::default(),
+            stream1_video: None,
+            stream1_monitor: None,
+            monitors: None,
         }
     }
 
@@ -293,6 +365,23 @@ impl ClientApp {
             host_injected = self.stats.map(|s| s.input_injected).unwrap_or(0),
             "client metrics"
         );
+
+        // Stream 1 gets its own line, and only while its window is up: a
+        // second set of always-present zeroes would read as a measurement of a
+        // stream that does not exist. This is what makes a two-monitor run
+        // verifiable from the log alone.
+        if self.second_window_visible() {
+            tracing::info!(
+                fps_decode1 = format_args!("{:.1}", self.stream1.lock().fps_decode()),
+                decoded1 = self.stream1_slot.decoded_count(),
+                presented1 = self.stream1_slot.presented_count(),
+                dropped1 = self.stream1_slot.dropped_at_present(),
+                gated1 = self.stream1_status.frames_gated(),
+                remote1 = format_args!("{:?}", self.stream1_slot.remote_dims()),
+                source_error1 = format_args!("{:?}", self.stream1_status.error()),
+                "stream 1 metrics"
+            );
+        }
 
         // Log presentation geometry separately: scale, resolution, and ppp are
         // the key diagnostics to determine whether the video is being drawn 1:1
@@ -340,6 +429,12 @@ impl ClientApp {
                 if !self.effective_background_capture() {
                     self.input.stop_capture();
                 }
+                // The second window belongs to the session that opened it: its
+                // monitor ids are session-scoped, and `run_client` reconnects
+                // on its own, so leaving it up would show the *old* session's
+                // pixels under a title derived from ids the next session may
+                // reuse for a different panel.
+                self.reset_second_window_for_session_end(true);
             }
             self.state = state;
         }
@@ -409,9 +504,139 @@ impl ClientApp {
                     self.last_fps_reassert = Some(now);
                 }
 
+                // The honest moment to tell the operator their monitor choice
+                // could not be honoured because the *host* is too old: a
+                // mutual-feature host's `MonitorList` is republished onto this
+                // same lane the instant the session goes live, i.e. strictly
+                // before the `VideoConfig` that answers our `StartStream`. So
+                // "first config, still no list" means there will never be one.
+                // Checking at the `Connected` transition instead would race the
+                // republish and cry wolf on every multi-monitor session.
+                if first_config {
+                    if let Some(note) =
+                        old_host_notice(self.monitors.is_some(), self.config.monitor_choice)
+                    {
+                        self.notice = Some(note);
+                    }
+                }
+
                 // A format change invalidates decoder state; the decode thread
                 // recovers on the next keyframe, so ask for one now.
                 self.session.send_control(ControlMsg::RequestKeyframe);
+            }
+            ControlMsg::MonitorList { monitors } => {
+                tracing::info!(count = monitors.len(), "host monitor list");
+                // The picker's label cache. Config belongs to the UI thread —
+                // nothing on the transport side may reach into it — which is
+                // exactly why the handshake republishes the list onto this lane
+                // instead of writing the cache itself.
+                self.config.cached_monitor_host = self.config.host_address.clone();
+                self.config.cached_monitors = monitors.clone();
+                self.config.save();
+
+                // The host re-sends the whole list on *any* topology change —
+                // a resolution change or a re-arrange, not just a plug/unplug —
+                // so the degrade note is shown once per session, on the first
+                // list. Re-showing it on every re-send would nag about a fact
+                // the operator already acted on.
+                let first_list = self.monitors.is_none();
+                let plan =
+                    plan_monitor_list(self.stream1_intent, self.config.monitor_choice, &monitors);
+                if first_list {
+                    if let Some(note) = plan.notice {
+                        self.notice = Some(note);
+                    }
+                }
+                self.monitors = Some(monitors);
+
+                if plan.want_second_window {
+                    self.stream1_window_open = true;
+                } else if self.stream1_window_open {
+                    // The topology no longer has a second output to show (the
+                    // operator's own dismissal is already folded into
+                    // `plan.want_second_window` via `stream1_intent`). The host
+                    // stops that stream on its own and says so with
+                    // `StreamStopped`, so this only drops the local window —
+                    // re-sending `SelectMonitors` here would be us telling the
+                    // host something it just told us.
+                    self.close_second_window(false);
+                }
+            }
+            ControlMsg::StreamConfig {
+                id,
+                monitor,
+                width,
+                height,
+                fps,
+                bitrate_kbps,
+                codec,
+            } => {
+                if id == 0 {
+                    // Contract: stream 0 is described by the legacy
+                    // `VideoConfig` and `StreamConfig { id: 0 }` "is a bug, not
+                    // a synonym". Treating it as an alias would let a buggy host
+                    // silently drive the main window through the second
+                    // window's state, so it is logged and ignored.
+                    tracing::warn!(
+                        "host sent StreamConfig for stream 0; ignoring (VideoConfig owns stream 0)"
+                    );
+                    return;
+                }
+                tracing::info!(
+                    "host stream {id} (monitor {monitor}): \
+                     {width}x{height} @{fps} {bitrate_kbps}kbps {codec:?}"
+                );
+                if id != 1 {
+                    // MAX_VIDEO_STREAMS is 2, so there is no slot to put this
+                    // in and no decoder that would read it.
+                    tracing::warn!("ignoring StreamConfig for unsupported stream {id}");
+                    return;
+                }
+                if self.stream1_intent == SecondWindowIntent::Dismissed {
+                    // A `StreamConfig` already in flight when the operator
+                    // dismissed the window. Ignored *whole*: recording its dims
+                    // would leave stale state describing a stream we just asked
+                    // the host to stop, and would title the window with it if
+                    // they re-opened before the next real config.
+                    tracing::debug!("ignoring StreamConfig for a window the operator closed");
+                    return;
+                }
+                // Only a genuine change of dimensions is a discontinuity worth
+                // blanking the window for. `StreamConfig` also arrives in reply
+                // to every `StartStream` — which this client sends on every fps
+                // re-assert and every quality change — so resetting
+                // unconditionally would flash the second window to black
+                // several times a minute. Exactly the reasoning (and the shape)
+                // of `tiles_invalidated_by_config` on the stream-0 path.
+                let discontinuity = stream1_format_changed(self.stream1_video, width, height);
+                self.stream1_video = Some((width, height, fps, bitrate_kbps));
+                self.stream1_monitor = Some(monitor);
+                if discontinuity {
+                    // Fresh SPS/PPS and an IDR are coming, and anything already
+                    // in flight for the old format is undecodable, so drop the
+                    // stale picture rather than showing it under the new title.
+                    // The decode thread's own `KeyframeGate` handles the
+                    // frame_id side.
+                    tracing::info!("stream 1 format changed; dropping its picture");
+                    self.stream1_slot.clear();
+                    self.stream1.lock().reset(true);
+                }
+                // Positive evidence the second stream is live.
+                self.stream1_window_open = true;
+            }
+            ControlMsg::StreamStopped { id, reason } => {
+                if id == 0 {
+                    tracing::warn!("host sent StreamStopped for stream 0; ignoring");
+                    return;
+                }
+                tracing::info!(id, %reason, "host stopped a secondary stream");
+                self.notice = Some(format!("Second monitor stopped: {reason}"));
+                // `by_user: false` on purpose. The host already stopped
+                // encoding, so there is nothing to ask it for, and the operator
+                // did not choose this — if the monitor comes back, the
+                // `MonitorList` that announces it should bring the window back
+                // too.
+                self.close_second_window(false);
             }
             ControlMsg::RouteReport(route) => self.route = Some(route),
             ControlMsg::Stats(stats) => self.accept_stats(stats),
@@ -455,9 +680,218 @@ impl ClientApp {
                 // otherwise survive a host-initiated disconnect and be blitted
                 // onto the first frame of whatever comes next.
                 self.tiles.clear();
+                // Same treatment for the second window, including the same
+                // deliberate omission: its presenter is reset, its slot is not.
+                self.reset_second_window_for_session_end(false);
             }
             other => tracing::debug!("unhandled control message: {other:?}"),
         }
+    }
+
+    /// Whether the second OS window should exist this pass: the UI intends it,
+    /// and there is a live session behind it. Both halves are required — see
+    /// the call site in `ui` for the channel-ordering reason.
+    fn second_window_visible(&self) -> bool {
+        stream1_should_be_visible(self.stream1_window_open, self.state.is_live())
+    }
+
+    /// Does the second monitor's window have focus right now?
+    ///
+    /// Always `false` when that window does not exist, which is what keeps the
+    /// single-window case bit-for-bit what it always was: nothing here is even
+    /// consulted, and the hook's foreground gate stays the main window's own
+    /// `i.focused`.
+    ///
+    /// Two sources, deliberately. `input_for` reads the child viewport's live
+    /// `InputState` from out here — safe for a *flag* (never for events) — and
+    /// is authoritative even on a frame the child did not paint. The latched
+    /// flag from the child's own pass covers the reverse: a focus change egui
+    /// has delivered to the child but not yet reflected in what the parent can
+    /// read. Either one saying "focused" is enough; being wrong in that
+    /// direction only means the hook passes keys through for one extra frame,
+    /// while being wrong the other way double-sends every keystroke in it.
+    fn second_window_focused(&self, ctx: &egui::Context) -> bool {
+        if !self.second_window_visible() {
+            return false;
+        }
+        // Two statements on purpose: the guard must be dropped before egui is
+        // called, so this never holds the child's lock across an egui call —
+        // the one shape that could deadlock against the child's own pass.
+        let latched = self.stream1.lock().focused;
+        latched || ctx.input_for(second_window::stream1_viewport_id(), |i| i.focused)
+    }
+
+    /// The second window's per-frame logic: push the capture gate down to the
+    /// child and consume anything its last pass reported.
+    ///
+    /// Runs in `logic`, never in `ui`, so the mutex is only ever taken outside
+    /// the parent's paint — the deferred callback takes the same lock, and
+    /// holding it across a paint is the one way these two could deadlock.
+    fn service_second_window(&mut self, ctx: &egui::Context) {
+        if !self.second_window_visible() {
+            return;
+        }
+        // Mirrored down rather than read up: the child's paint callback is a
+        // plain `Fn` that cannot reach `ClientApp`. Its forwarders gate on both.
+        let closed = {
+            let mut shared = self.stream1.lock();
+            shared.set_capturing(self.input.is_capturing());
+            // `monitors.is_some()` is the proof this session negotiated
+            // multi-monitor, and it is the gate on every tagged `EventOn` this
+            // window sends — same gate `send_select_monitors` uses, for the
+            // same reason: an old host's `decode_strict` reader errors on the
+            // variant and takes the whole input stream down with it.
+            shared.set_armed(self.monitors.is_some());
+            std::mem::take(&mut shared.close_requested)
+        };
+        // Belt and braces alongside the flag the child latched: `input_for`
+        // reads the child viewport's own `InputState` from out here, which is
+        // safe for a *flag* but never for events — those have to be consumed
+        // inside the child pass or they are read twice, or missed.
+        let closed = closed
+            || ctx.input_for(second_window::stream1_viewport_id(), |i| {
+                i.viewport().close_requested()
+            });
+        if closed {
+            tracing::info!("operator closed the second monitor window");
+            self.close_second_window(true);
+        }
+    }
+
+    /// Whether the "2nd monitor" toggle should appear at all: a live session
+    /// that negotiated the feature, against a host with something to show on it.
+    fn can_offer_second_window(&self) -> bool {
+        self.state.is_live() && self.monitors.as_ref().is_some_and(|m| m.len() >= 2)
+    }
+
+    /// Send a mid-session `SelectMonitors`, but only on a session that actually
+    /// negotiated the feature.
+    ///
+    /// The gate is `self.monitors.is_some()` — the arrival of a `MonitorList`
+    /// is the *only* proof the `MULTI_MONITOR` bit came back mutual, and the UI
+    /// is the only place that knows it. Sending one to a host that never echoed
+    /// the bit would put a variant on the wire that its `decode_strict` control
+    /// reader has no arm for.
+    fn send_select_monitors(&mut self, ids: Vec<u8>) {
+        if self.monitors.is_none() {
+            tracing::debug!(
+                ?ids,
+                "SelectMonitors suppressed: this session never negotiated multi-monitor"
+            );
+            return;
+        }
+        tracing::info!(?ids, "re-selecting monitors mid-session");
+        self.session
+            .send_control(ControlMsg::SelectMonitors { ids });
+    }
+
+    /// Open (or re-open) the second window and ask the host for its stream.
+    ///
+    /// The host re-IDRs when a stream is added, and stream 1's own
+    /// `KeyframeGate` starts out with no reference chain, so it simply waits for
+    /// that IDR — and asks for one itself if it does not come.
+    fn open_second_window(&mut self) {
+        let Some(monitors) = self.monitors.clone() else {
+            return;
+        };
+        // `Both` regardless of the persisted choice: this button *is* the
+        // request for two windows. The persisted choice stays whatever the
+        // connect-screen picker says, so it still governs the next connect.
+        let resolved = monitors::resolve_selection(MonitorChoice::Both, &monitors);
+        if resolved.degraded {
+            self.notice = Some(ONE_MONITOR_NOTICE.to_string());
+            return;
+        }
+        // Session intent, so the topology re-sends the host makes on any
+        // display change cannot slam this window shut again.
+        self.stream1_intent = SecondWindowIntent::Requested;
+        self.stream1_window_open = true;
+        self.send_select_monitors(resolved.ids);
+    }
+
+    /// Close the second window and drop everything it owned.
+    ///
+    /// `by_user` is the load-bearing distinction:
+    ///
+    /// * `true` — the operator closed it (title-bar X or the toolbar toggle).
+    ///   The host is still encoding that monitor, so tell it to stop, and record
+    ///   the intent so no later `MonitorList` can undo their decision.
+    /// * `false` — the host stopped the stream (`StreamStopped`) or the
+    ///   topology lost the monitor. Nothing to ask the host for, and the intent
+    ///   is left alone: if that output comes back, its window comes back too.
+    fn close_second_window(&mut self, by_user: bool) {
+        if by_user {
+            self.stream1_intent = SecondWindowIntent::Dismissed;
+            // Drop the stream so the host stops encoding and sending a picture
+            // nobody is looking at. `ids[0]` is whatever rides stream 0 under
+            // the operator's persisted choice, so this narrows the session to
+            // one stream without changing *which* monitor the main window
+            // shows.
+            let ids = self
+                .monitors
+                .as_ref()
+                .map(|m| monitors::resolve_selection(self.config.monitor_choice, m).ids)
+                .unwrap_or_else(|| vec![0]);
+            self.send_select_monitors(ids.into_iter().take(1).collect());
+        }
+        self.stream1_window_open = false;
+        self.stream1_video = None;
+        self.stream1_monitor = None;
+        // A window that goes away mid-drag leaves the host holding a button
+        // that nothing left alive can lift — no more events will ever come from
+        // that viewport. `ReleaseAll` is the only message that drops it, and it
+        // is deliberately global (the host keeps held state on one injector),
+        // so it is sent only when this window actually held something rather
+        // than on every close, where it would also drop the main window's keys.
+        let held = {
+            let mut shared = self.stream1.lock();
+            let held = shared.has_buttons_held();
+            shared.reset(true);
+            held
+        };
+        if held {
+            tracing::info!("second window closed mid-drag — releasing held input");
+            self.input.release_all();
+        }
+    }
+
+    /// Drop every piece of second-window state because the session that owned
+    /// it is over.
+    ///
+    /// Extends the three existing stream-0 teardown sites (`drain_session`'s
+    /// non-live branch, `Bye`, and `disconnect`). `clear_slot` mirrors the
+    /// asymmetry those sites already have: the `Bye` path deliberately leaves
+    /// the pending frame alone.
+    ///
+    /// `monitors = None` is the important one — it re-arms the "did this
+    /// session negotiate multi-monitor?" gate, so nothing is sent on a
+    /// connection that has not proven it can take it. `stream1_intent` is reset
+    /// too: a fresh connection should honour the persisted choice, not a
+    /// decision made about the last one.
+    fn reset_second_window_for_session_end(&mut self, clear_slot: bool) {
+        self.stream1_window_open = false;
+        self.stream1_intent = SecondWindowIntent::default();
+        self.stream1_video = None;
+        self.stream1_monitor = None;
+        self.monitors = None;
+        self.stream1.lock().reset(clear_slot);
+    }
+
+    /// Title for the second OS window, from whatever has actually been learned
+    /// about that monitor.
+    fn second_window_title(&self) -> String {
+        let dims = self
+            .stream1_video
+            .map(|(w, h, _, _)| (w, h))
+            .or_else(|| self.stream1_slot.remote_dims());
+        let name = self.stream1_monitor.and_then(|id| {
+            self.monitors
+                .as_ref()?
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.name.as_str())
+        });
+        second_window_title(name, dims)
     }
 
     /// Whether keys should keep reaching the host while DirectDesk is in the
@@ -502,23 +936,14 @@ impl ClientApp {
             None => {}
         }
 
-        let mut chord = false;
-        ctx.input(|i| {
-            for event in &i.events {
-                if let egui::Event::Key {
-                    key,
-                    physical_key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    // The physical key is what the user actually pressed; a
-                    // remapped layout can report something else as `key`.
-                    chord |= is_release_chord(physical_key.unwrap_or(*key), *modifiers);
-                }
-            }
-        });
+        // Two windows, two `InputState`s: the chord typed into the second
+        // monitor's window never appears in this one's events, so the child
+        // detects it with the same pure predicate and latches a one-shot for us
+        // to consume here. Both paths land on the single toggle below, so the
+        // chord means the same thing from either window and can never toggle
+        // twice for one press.
+        let child_chord = self.stream1.lock().take_chord_fired();
+        let chord = child_chord || ctx.input(|i| chord_pressed(&i.events));
         if !chord {
             return;
         }
@@ -536,13 +961,19 @@ impl ClientApp {
     }
 
     /// Capture must never survive losing focus, minimizing, or closing.
-    fn enforce_capture_invariants(&mut self, ctx: &egui::Context) {
+    ///
+    /// `focused` is the **any-window** answer: with a second monitor on screen,
+    /// clicking into its window is not "DirectDesk lost focus", and dropping
+    /// capture there would make the keyboard stop working the moment the
+    /// operator looked at the other monitor. `minimized` and `closing` stay the
+    /// *main* window's — closing it ends the session, and its close request is
+    /// what persists the config.
+    fn enforce_capture_invariants(&mut self, ctx: &egui::Context, focused: bool) {
         if !self.input.is_capturing() {
             return;
         }
-        let (focused, minimized, closing) = ctx.input(|i| {
+        let (minimized, closing) = ctx.input(|i| {
             (
-                i.focused,
                 i.viewport().minimized.unwrap_or(false),
                 i.viewport().close_requested(),
             )
@@ -642,6 +1073,29 @@ impl ClientApp {
             {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+            }
+
+            // Shown only where it can actually do something: a session that
+            // negotiated the feature (`monitors.is_some()`) against a host that
+            // really has a second output. Everywhere else it would be a button
+            // whose only possible outcome is an apology.
+            if self.can_offer_second_window() {
+                ui.separator();
+                let open = self.stream1_window_open;
+                if ui
+                    .add(egui::Button::new("2nd monitor").selected(open))
+                    .on_hover_text(
+                        "Show the host's second monitor in its own window.\n\
+                         Closing that window stops the host encoding it.",
+                    )
+                    .clicked()
+                {
+                    if open {
+                        self.close_second_window(true);
+                    } else {
+                        self.open_second_window();
+                    }
+                }
             }
 
             let host_dims = self.toolbar_scaling(ui, ctx);
@@ -925,11 +1379,53 @@ impl ClientApp {
                         self.session.send_control(ControlMsg::QualityChange(chosen));
                     }
                     ui.end_row();
+
+                    ui.label("Monitors");
+                    let current_choice = self.config.monitor_choice;
+                    let mut chosen_choice = current_choice;
+                    // Only trust the cache when it was written for exactly the
+                    // host currently typed into the form — never a stale cache
+                    // from a previous host reused by accident.
+                    let cache_matches_host = !self.config.cached_monitor_host.is_empty()
+                        && self.config.cached_monitor_host == self.address_input.trim();
+                    let selected_label = monitors::picker_label(
+                        current_choice,
+                        &self.config.cached_monitors,
+                        cache_matches_host,
+                    );
+                    egui::ComboBox::from_id_salt("monitor_choice")
+                        .selected_text(selected_label)
+                        .show_ui(ui, |ui| {
+                            for choice in [
+                                MonitorChoice::Primary,
+                                MonitorChoice::Second,
+                                MonitorChoice::Both,
+                            ] {
+                                let option_label = monitors::picker_label(
+                                    choice,
+                                    &self.config.cached_monitors,
+                                    cache_matches_host,
+                                );
+                                if ui
+                                    .selectable_label(current_choice == choice, option_label)
+                                    .clicked()
+                                {
+                                    chosen_choice = choice;
+                                }
+                            }
+                        });
+                    if chosen_choice != current_choice {
+                        self.config.monitor_choice = chosen_choice;
+                    }
+                    ui.end_row();
                 });
 
             ui.add_space(6.0);
             ui.weak("Enter the code shown on the host's 'Pair new device' window.");
             ui.weak("Leave the code blank to reconnect to a host you have paired before.");
+            ui.weak(
+                "Monitors: applied if the host reports more than one — otherwise primary only.",
+            );
 
             ui.add_space(12.0);
             // The button names the action it will take, so pairing vs. reconnect
@@ -1039,6 +1535,11 @@ impl ClientApp {
             pairing = request.pairing_code.is_some(),
             "connect requested"
         );
+        // Seeded once at startup (`ClientApp::new`), but the picker can change
+        // the choice afterwards without a reconnect happening in between — push
+        // the current config value so this connect carries whatever is showing
+        // in the combo right now, not a stale one from launch.
+        supervisor.set_monitor_choice(self.config.monitor_choice);
         supervisor.connect(request);
 
         // The route stays unknown until the transport reports one; the driver
@@ -1066,6 +1567,9 @@ impl ClientApp {
         // otherwise make that a one-time-per-process behaviour.
         self.host_video = None;
         self.pending_auto_snap = false;
+        // No `SelectMonitors` on this path: the connection is being torn down,
+        // so there is nothing left to tell the host on.
+        self.reset_second_window_for_session_end(true);
     }
 
     /// Resize the window so the host video renders at exactly `scale` screen
@@ -1117,77 +1621,15 @@ impl ClientApp {
 
         let (events, focused) = ui.ctx().input(|i| (i.events.clone(), i.focused));
         if focused {
-            self.forward_pointer_events(&events, viewport, &view);
-            self.forward_key_events(&events);
+            // Both paths live in `input_capture` now, shared with the second
+            // window's forwarders so the two windows cannot drift apart on the
+            // letterbox gate, the drag latch, or the chord filter. Keys are
+            // gated on capture inside; pointer events never were.
+            self.input
+                .forward_pointer_events(&events, viewport, &view, self.pointer);
+            self.input.forward_key_events(&events);
         }
         self.input.pump();
-    }
-
-    /// Forward keystrokes captured through the window (egui) while it is the
-    /// foreground window — the reliable path there, since Windows starves the
-    /// global low-level hook when our GPU-heavy window is focused. Gated on
-    /// capture being enabled so the toggle / release chord still governs it.
-    fn forward_key_events(&mut self, events: &[egui::Event]) {
-        if !self.input.is_capturing() {
-            return;
-        }
-        for event in events {
-            if let egui::Event::Key {
-                key,
-                physical_key,
-                pressed,
-                modifiers,
-                ..
-            } = event
-            {
-                // The release chord is ours, not the host's — swallow both the
-                // press and the release so no half of it lands on the remote
-                // machine (`reconcile_capture` already acted on it).
-                if is_release_chord(physical_key.unwrap_or(*key), *modifiers) {
-                    continue;
-                }
-                self.input
-                    .on_key_event(*physical_key, *key, *pressed, *modifiers);
-            }
-        }
-    }
-
-    fn forward_pointer_events(
-        &mut self,
-        events: &[egui::Event],
-        viewport: egui::Rect,
-        view: &VideoView,
-    ) {
-        for event in events {
-            match event {
-                egui::Event::PointerMoved(pos) if viewport.contains(*pos) => {
-                    self.input.on_pointer_moved(*pos, view);
-                }
-                egui::Event::PointerButton {
-                    pos,
-                    button,
-                    pressed,
-                    ..
-                } if viewport.contains(*pos) => {
-                    self.input.on_pointer_button(*pos, view, *button, *pressed);
-                }
-                egui::Event::MouseWheel { unit, delta, .. } => {
-                    let Some(pos) = self.pointer else { continue };
-                    if !viewport.contains(pos) {
-                        continue;
-                    }
-                    if delta.y != 0.0 {
-                        self.input
-                            .on_wheel(pos, view, wheel_delta(*unit, delta.y), false);
-                    }
-                    if delta.x != 0.0 {
-                        self.input
-                            .on_wheel(pos, view, wheel_delta(*unit, delta.x), true);
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     /// Draws the "host wants elevation" banner as a floating, non-modal
@@ -1253,6 +1695,29 @@ impl ClientApp {
         let error = self.pipeline.status.error();
         let audio = self.pipeline.audio_snapshot();
         let audio_error = self.pipeline.audio_error();
+
+        // Computed unconditionally (all cheap: an atomic load or a brief
+        // mutex lock, the same cost `log_metrics` already pays every 2 s and
+        // this pays every frame the panel is open) but only ever shown
+        // through `stream1`, which is `None` unless the window is actually
+        // live right now — see `stream1_should_be_visible`. Nothing here is
+        // fabricated for a session that never had a second stream; it is
+        // simply never read in that case.
+        let stream1_description = self.stream1_status.description();
+        let stream1_error = self.stream1_status.error();
+        let stream1 = self
+            .second_window_visible()
+            .then(|| diagnostics::Stream1Diag {
+                fps_decode: self.stream1.lock().fps_decode(),
+                source_description: &stream1_description,
+                source_error: stream1_error.as_deref(),
+                frames_decoded: self.stream1_slot.decoded_count(),
+                frames_presented: self.stream1_slot.presented_count(),
+                frames_dropped_at_present: self.stream1_slot.dropped_at_present(),
+                remote_dims: self.stream1_slot.remote_dims(),
+                frames_gated: self.stream1_status.frames_gated(),
+            });
+
         diagnostics::show(
             ctx,
             &mut open,
@@ -1273,6 +1738,7 @@ impl ClientApp {
                 audio,
                 audio_error: audio_error.as_deref(),
                 demo_mode: self.mode == SourceMode::LoopbackDemo,
+                stream1,
             },
         );
         self.show_diagnostics = open;
@@ -1393,6 +1859,15 @@ impl eframe::App for ClientApp {
         // chord, so the latch below reflects this frame's input.
         self.reconcile_capture(ctx);
 
+        // "Is DirectDesk the window the operator is typing into" — the answer
+        // every capture decision below turns on, and with a second monitor it
+        // is a question about *either* window. Computed once so the auto re-arm,
+        // the hook's foreground gate and `enforce_capture_invariants` can never
+        // disagree within a frame; on a single-window session it is exactly
+        // `i.focused`.
+        let main_focused = ctx.input(|i| i.focused);
+        let any_focused = main_focused || self.second_window_focused(ctx);
+
         // Wait for focus: the window is not focused on the first frame, and
         // `enforce_capture_invariants` would (correctly) drop capture again.
         // `--hold-capture` installs without waiting for focus (the whole point
@@ -1429,7 +1904,10 @@ impl eframe::App for ClientApp {
                 // `enforce_capture_invariants` releases it the instant focus is
                 // lost, so keystrokes typed into other local apps are never
                 // swallowed/forwarded.
-                let active = ctx.input(|i| i.focused && !i.viewport().minimized.unwrap_or(false));
+                // Any-window focus, matching the release rule in
+                // `enforce_capture_invariants`: working in the second monitor's
+                // window must acquire capture, not sit there unable to type.
+                let active = any_focused && !ctx.input(|i| i.viewport().minimized.unwrap_or(false));
                 if active && !self.input.is_capturing() {
                     self.input.start_capture();
                 }
@@ -1446,9 +1924,22 @@ impl eframe::App for ClientApp {
         }
 
         self.pointer = ctx.input(|i| i.pointer.latest_pos());
+        // This window's own focus, which is a different question from the one
+        // below: it is what releases the modifiers *this* window synthesized
+        // when it hands focus over — including to the other DirectDesk window,
+        // where the process-wide answer never changes at all.
+        self.input.set_window_focused(main_focused);
         // Route capture by focus: when we're foreground the egui key path owns
         // it and the low-level hook passes through; when not, the hook forwards.
-        self.input.set_window_foreground(ctx.input(|i| i.focused));
+        //
+        // "We" means *either* DirectDesk window. The hook is process-global and
+        // has no window context, so its gate has to be the OR: with a second
+        // monitor on screen the egui path owns keys while the operator is in
+        // the child window just as much as in this one, and letting the hook
+        // forward as well would double-send every keystroke. With no second
+        // window this is exactly `i.focused`, so the single-window semantics —
+        // and `swallow_decision` — are untouched.
+        self.input.set_any_window_foreground(any_focused);
         // Mirrored per frame rather than at the transition sites, because
         // `self.state` is assigned from several places (drain, Bye, connect,
         // disconnect) and the hook must never read a stale gate.
@@ -1461,8 +1952,9 @@ impl eframe::App for ClientApp {
                 self.elevation = None;
             }
         }
-        self.enforce_capture_invariants(ctx);
+        self.enforce_capture_invariants(ctx, any_focused);
         self.presenter.update(ctx, &self.slot);
+        self.service_second_window(ctx);
         self.log_metrics(ctx);
 
         // Streaming means continuous repaint: the frame slot is written by a
@@ -1507,6 +1999,22 @@ impl eframe::App for ClientApp {
                 ConnectionState::Disconnected => self.connect_screen(ui),
             });
 
+        // A deferred viewport exists only while it is re-declared, so this call
+        // *is* the second window's lifetime: not making it is what closes the
+        // OS window, which is why it sits here rather than behind any of the
+        // drawing branches above.
+        //
+        // The `is_live` half is not redundant with the teardown sites.
+        // `state_rx` and `control_rx` are separate channels, so a dropped
+        // connection's queued `MonitorList` can be applied *after* the state
+        // change that tore the window down — re-opening it for one pass over
+        // the connect screen. Requiring a live session makes that
+        // unrepresentable rather than merely unlikely.
+        if self.second_window_visible() {
+            let title = self.second_window_title();
+            second_window::show(&ctx, &self.stream1, &title);
+        }
+
         self.diagnostics_window(&ctx);
         self.elevation_banner(&ctx);
     }
@@ -1526,6 +2034,146 @@ impl Drop for ClientApp {
 /// so the way out is always spelled out.
 fn released_notice() -> String {
     format!("Input released ({RELEASE_CHORD}) — click Capture input or press the chord to resume")
+}
+
+/// The one wording for "the host only has one screen", shared by every path
+/// that can discover it (the `MonitorList` arm and the toolbar toggle) so the
+/// operator never sees two different explanations of the same fact.
+pub const ONE_MONITOR_NOTICE: &str = "Host reports one monitor — showing primary only.";
+
+/// The one wording for "this host is too old to know about monitors at all".
+/// Deliberately distinct from [`ONE_MONITOR_NOTICE`]: "your host cannot do this"
+/// and "your host has one screen" call for different actions from the operator.
+pub const OLD_HOST_NOTICE: &str = "Host doesn't support monitor selection — showing primary only.";
+
+/// What the operator has said about the second window during *this session*,
+/// as distinct from the persisted connect-screen choice.
+///
+/// The distinction exists because the host re-sends its entire `MonitorList` on
+/// any topology change. Deciding "should the second window be up?" purely from
+/// `ClientConfig::monitor_choice` would mean every such re-send re-litigates a
+/// decision the operator already made with the toolbar — closing a window they
+/// opened, or re-opening one they dismissed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecondWindowIntent {
+    /// The operator has not touched the toolbar toggle this session, so the
+    /// persisted choice governs.
+    #[default]
+    FromChoice,
+    /// They asked for the second window explicitly.
+    Requested,
+    /// They closed it explicitly.
+    Dismissed,
+}
+
+/// Whether the second window should be up, given the operator's session intent,
+/// their persisted choice, and what the host currently reports.
+///
+/// The single decision function for the window's existence, so the `MonitorList`
+/// arm and any future caller cannot disagree about it.
+pub fn wants_second_window(
+    intent: SecondWindowIntent,
+    choice: MonitorChoice,
+    monitors: &[MonitorInfo],
+) -> bool {
+    // Whether the host has a second output at all — the veto that outranks
+    // every intent, since there is nothing to put in the window without one.
+    let host_has_two = !monitors::resolve_selection(MonitorChoice::Both, monitors).degraded;
+    match intent {
+        SecondWindowIntent::Dismissed => false,
+        SecondWindowIntent::Requested => host_has_two,
+        SecondWindowIntent::FromChoice => {
+            monitors::resolve_selection(choice, monitors).ids.len() > 1
+        }
+    }
+}
+
+/// What a host `MonitorList` means for the second window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorListPlan {
+    /// Whether the second window should be up after this list.
+    pub want_second_window: bool,
+    /// Set when the persisted choice could not be honoured as asked. Shown once
+    /// per session, on the first list.
+    pub notice: Option<String>,
+}
+
+/// Resolve a freshly arrived `MonitorList` against session intent and the
+/// operator's persisted choice.
+///
+/// Pure so the cache write, the degrade notice and the window decision are all
+/// testable without a `Context`, a session, or a host — the arm in
+/// `handle_control` does nothing but apply what this returns.
+pub fn plan_monitor_list(
+    intent: SecondWindowIntent,
+    choice: MonitorChoice,
+    monitors: &[MonitorInfo],
+) -> MonitorListPlan {
+    MonitorListPlan {
+        want_second_window: wants_second_window(intent, choice, monitors),
+        // Reports on the *persisted* choice only. What the operator did with
+        // the toolbar afterwards is not a degradation of anything, so folding
+        // intent in here would either suppress a real note or invent one.
+        notice: (monitors::resolve_selection(choice, monitors).degraded
+            && choice != MonitorChoice::Primary)
+            .then(|| ONE_MONITOR_NOTICE.to_string()),
+    }
+}
+
+/// Whether a `StreamConfig { id: 1, .. }` describes a genuine format change.
+///
+/// The stream-1 twin of [`tiles_invalidated_by_config`], and it exists for the
+/// same reason: this message also arrives in reply to every `StartStream`, which
+/// this client sends on every fps re-assert and every quality change. Treating
+/// those as discontinuities would blank the second window several times a
+/// minute. Only the *dimensions* matter — a new fps or bitrate does not
+/// invalidate a single decoded pixel — and the first config of a stream is not a
+/// change either, since there is nothing yet to contradict.
+pub fn stream1_format_changed(prev: Option<(u32, u32, u32, u32)>, width: u32, height: u32) -> bool {
+    prev.is_some_and(|(w, h, _, _)| (w, h) != (width, height))
+}
+
+/// Pure core of [`ClientApp::second_window_visible`]: does the second window
+/// — and by extension its per-frame diagnostics section and its line in
+/// [`ClientApp::log_metrics`] — exist right now?
+///
+/// Split out so "no second stream this session" (either input `false`) is a
+/// plain unit test rather than something only checkable by eye against a live
+/// window. A closed window's counters are stale the instant it closes (its
+/// slot is cleared in the same call, see `close_second_window`), so the same
+/// gate that decides whether the OS window exists also decides whether the
+/// diagnostics panel's "Stream 1" section — and the log's "stream 1 metrics"
+/// line — exist: showing either from a window that is not currently up would
+/// be either empty or lying, and the panel's HONESTY RULE forbids both.
+fn stream1_should_be_visible(window_open: bool, live: bool) -> bool {
+    window_open && live
+}
+
+/// The notice for a host that never sent a `MonitorList` at all.
+///
+/// `saw_monitor_list` false means the `MULTI_MONITOR` bit never came back
+/// mutual — the graceful-degradation case the connect screen promises. Silent
+/// when the operator asked for `Primary`, since that is exactly what they got.
+pub fn old_host_notice(saw_monitor_list: bool, choice: MonitorChoice) -> Option<String> {
+    (!saw_monitor_list && choice != MonitorChoice::Primary).then(|| OLD_HOST_NOTICE.to_string())
+}
+
+/// Title for the second monitor's OS window.
+///
+/// `name` comes off the wire, so it is treated the way every other displayed
+/// wire string is: control characters stripped (they can forge line breaks in a
+/// title bar) and the length capped, rather than trusted because the host's own
+/// docs say it caps at 64 bytes.
+pub fn second_window_title(name: Option<&str>, dims: Option<(u32, u32)>) -> String {
+    let clean: Option<String> =
+        name.map(|n| n.chars().filter(|c| !c.is_control()).take(64).collect());
+    let clean = clean.filter(|n| !n.trim().is_empty());
+    match (clean, dims) {
+        (Some(name), Some((w, h))) => format!("DirectDesk — {name} {w}x{h}"),
+        (Some(name), None) => format!("DirectDesk — {name}"),
+        (None, Some((w, h))) => format!("DirectDesk — second monitor {w}x{h}"),
+        (None, None) => "DirectDesk — second monitor".to_string(),
+    }
 }
 
 /// Kept free of egui so it's unit-testable without a context.
@@ -1884,6 +2532,289 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2.0 KiB");
         assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
+    }
+
+    fn monitor(id: u8, name: &str) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            width: 1920,
+            height: 1080,
+            origin_x: 0,
+            origin_y: 0,
+            is_primary: id == 0,
+            name: name.into(),
+        }
+    }
+
+    /// The persisted choice governs until the operator says otherwise.
+    const UNTOUCHED: SecondWindowIntent = SecondWindowIntent::FromChoice;
+
+    #[test]
+    fn primary_never_wants_a_second_window_and_never_complains() {
+        // The default choice got exactly what it asked for on every topology,
+        // so it must never produce a notice — including against a host with two
+        // screens, where a note would be pure noise.
+        for list in [
+            vec![],
+            vec![monitor(0, "A")],
+            vec![monitor(0, "A"), monitor(1, "B")],
+        ] {
+            let plan = plan_monitor_list(UNTOUCHED, MonitorChoice::Primary, &list);
+            assert!(!plan.want_second_window, "{list:?}");
+            assert_eq!(plan.notice, None, "{list:?}");
+        }
+    }
+
+    #[test]
+    fn both_opens_the_second_window_on_a_two_monitor_host() {
+        let list = [monitor(0, "A"), monitor(1, "B")];
+        let plan = plan_monitor_list(UNTOUCHED, MonitorChoice::Both, &list);
+        assert!(plan.want_second_window);
+        assert_eq!(plan.notice, None, "nothing was degraded");
+    }
+
+    #[test]
+    fn second_alone_is_one_stream_and_therefore_no_second_window() {
+        // `Second` puts the secondary output on stream 0 — one stream, one
+        // window. The second window exists only for `Both`.
+        let list = [monitor(0, "A"), monitor(1, "B")];
+        let plan = plan_monitor_list(UNTOUCHED, MonitorChoice::Second, &list);
+        assert!(!plan.want_second_window);
+        assert_eq!(plan.notice, None);
+    }
+
+    #[test]
+    fn a_one_monitor_host_degrades_with_a_visible_note() {
+        // The graceful-degradation promise the connect screen makes in writing.
+        let list = [monitor(0, "A")];
+        for choice in [MonitorChoice::Second, MonitorChoice::Both] {
+            let plan = plan_monitor_list(UNTOUCHED, choice, &list);
+            assert!(!plan.want_second_window, "{choice:?}");
+            assert_eq!(
+                plan.notice.as_deref(),
+                Some(ONE_MONITOR_NOTICE),
+                "{choice:?} must say why it could not be honoured"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_monitor_list_degrades_but_still_never_nags_primary() {
+        assert_eq!(
+            plan_monitor_list(UNTOUCHED, MonitorChoice::Primary, &[]).notice,
+            None
+        );
+        assert_eq!(
+            plan_monitor_list(UNTOUCHED, MonitorChoice::Both, &[])
+                .notice
+                .as_deref(),
+            Some(ONE_MONITOR_NOTICE)
+        );
+    }
+
+    #[test]
+    fn a_toolbar_opened_window_survives_a_topology_re_send() {
+        // The regression the intent model exists for. The host re-sends its
+        // whole `MonitorList` on ANY display change — a resolution change or a
+        // re-arrange, not only a plug/unplug. Deriving the window's existence
+        // from the persisted choice alone would slam a toolbar-opened window
+        // shut on the next such re-send, with the host never told to stop, and
+        // the next `StreamConfig` would then re-open it: a window that flaps by
+        // itself.
+        let list = [monitor(0, "A"), monitor(1, "B")];
+        for choice in [
+            MonitorChoice::Primary,
+            MonitorChoice::Second,
+            MonitorChoice::Both,
+        ] {
+            assert!(
+                wants_second_window(SecondWindowIntent::Requested, choice, &list),
+                "{choice:?}: an explicit request outranks the persisted choice"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dismissed_window_stays_shut_however_the_list_is_re_sent() {
+        // The operator's close is a decision; no amount of re-sending, and no
+        // persisted choice, may overturn it for the rest of the session.
+        let list = [monitor(0, "A"), monitor(1, "B")];
+        for choice in [
+            MonitorChoice::Primary,
+            MonitorChoice::Second,
+            MonitorChoice::Both,
+        ] {
+            assert!(
+                !wants_second_window(SecondWindowIntent::Dismissed, choice, &list),
+                "{choice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn losing_the_second_monitor_closes_the_window_whatever_the_intent() {
+        // The one veto that outranks intent: there is nothing to put in the
+        // window. Asked for explicitly or implied by the choice, a host that
+        // reports one output gets one window.
+        for intent in [
+            SecondWindowIntent::FromChoice,
+            SecondWindowIntent::Requested,
+            SecondWindowIntent::Dismissed,
+        ] {
+            assert!(
+                !wants_second_window(intent, MonitorChoice::Both, &[monitor(0, "A")]),
+                "{intent:?}"
+            );
+            assert!(
+                !wants_second_window(intent, MonitorChoice::Both, &[]),
+                "{intent:?} on an empty list"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_intent_defers_to_the_persisted_choice() {
+        assert_eq!(
+            SecondWindowIntent::default(),
+            SecondWindowIntent::FromChoice
+        );
+        let list = [monitor(0, "A"), monitor(1, "B")];
+        assert!(wants_second_window(
+            SecondWindowIntent::default(),
+            MonitorChoice::Both,
+            &list
+        ));
+        assert!(!wants_second_window(
+            SecondWindowIntent::default(),
+            MonitorChoice::Primary,
+            &list
+        ));
+    }
+
+    #[test]
+    fn stream1_reconfig_only_counts_as_a_change_when_the_dimensions_move() {
+        // `StreamConfig { id: 1 }` also answers every `StartStream`, which this
+        // client sends on every fps re-assert and every quality change. If
+        // those counted as discontinuities the second window would flash to
+        // black several times a minute — the exact bug
+        // `tiles_invalidated_by_config` documents on the stream-0 path.
+        let base = Some((2560u32, 1440u32, 60u32, 8_000u32));
+        assert!(!stream1_format_changed(base, 2560, 1440));
+        // Same dims, different fps / bitrate: the fps-re-assert case.
+        assert!(!stream1_format_changed(
+            Some((2560, 1440, 30, 8_000)),
+            2560,
+            1440
+        ));
+        assert!(!stream1_format_changed(
+            Some((2560, 1440, 60, 2_500)),
+            2560,
+            1440
+        ));
+        // A genuine resolution change on the second monitor.
+        assert!(stream1_format_changed(base, 1920, 1440));
+        assert!(stream1_format_changed(base, 2560, 1080));
+        // The first config of a stream is not a change: nothing to contradict.
+        assert!(!stream1_format_changed(None, 2560, 1440));
+    }
+
+    /// Feeds `ClientApp::diagnostics_window`'s `stream1: Option<Stream1Diag>`
+    /// and `log_metrics`'s "stream 1 metrics" line, so this is the
+    /// end-to-end proof of the panel's own claim: "no second stream this
+    /// session" (never opened, or the session is not live) must mean
+    /// `None`, never a section of zeros.
+    #[test]
+    fn stream1_diagnostics_are_none_with_no_second_stream_this_session() {
+        assert!(
+            !stream1_should_be_visible(false, true),
+            "never opened this session"
+        );
+        assert!(
+            !stream1_should_be_visible(true, false),
+            "window flag set but the session is not live (e.g. disconnected)"
+        );
+        assert!(!stream1_should_be_visible(false, false));
+    }
+
+    #[test]
+    fn stream1_diagnostics_appear_once_the_window_is_actually_live() {
+        assert!(stream1_should_be_visible(true, true));
+    }
+
+    #[test]
+    fn an_old_host_is_reported_only_when_the_choice_asked_for_more() {
+        // No `MonitorList` ever arrived: the feature bit was not mutual.
+        assert_eq!(
+            old_host_notice(false, MonitorChoice::Both).as_deref(),
+            Some(OLD_HOST_NOTICE)
+        );
+        assert_eq!(
+            old_host_notice(false, MonitorChoice::Second).as_deref(),
+            Some(OLD_HOST_NOTICE)
+        );
+        // `Primary` got what it asked for, so there is nothing to report.
+        assert_eq!(old_host_notice(false, MonitorChoice::Primary), None);
+        // A list arrived, so this host is not the old one — whatever else may
+        // have degraded is `plan_monitor_list`'s to say, and saying both would
+        // give the operator two different explanations of one fact.
+        for choice in [
+            MonitorChoice::Primary,
+            MonitorChoice::Second,
+            MonitorChoice::Both,
+        ] {
+            assert_eq!(old_host_notice(true, choice), None, "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_degrade_notices_are_different_sentences() {
+        // "your host cannot do this" and "your host has one screen" call for
+        // different actions from the operator, so they must never collapse.
+        assert_ne!(ONE_MONITOR_NOTICE, OLD_HOST_NOTICE);
+    }
+
+    #[test]
+    fn the_second_window_title_uses_whatever_has_been_learned() {
+        assert_eq!(
+            second_window_title(Some("\\\\.\\DISPLAY2"), Some((2560, 1440))),
+            "DirectDesk — \\\\.\\DISPLAY2 2560x1440"
+        );
+        assert_eq!(
+            second_window_title(Some("\\\\.\\DISPLAY2"), None),
+            "DirectDesk — \\\\.\\DISPLAY2"
+        );
+        assert_eq!(
+            second_window_title(None, Some((1920, 1080))),
+            "DirectDesk — second monitor 1920x1080"
+        );
+        assert_eq!(
+            second_window_title(None, None),
+            "DirectDesk — second monitor"
+        );
+    }
+
+    #[test]
+    fn the_second_window_title_never_trusts_the_hosts_name() {
+        // `MonitorInfo::name` is display-only wire text. Control characters
+        // could forge extra lines in a title bar, and the length cap is ours to
+        // enforce rather than the host's to promise.
+        let forged = "DISPLAY2\r\nDirectDesk — Administrator";
+        let title = second_window_title(Some(forged), None);
+        assert!(!title.contains('\n') && !title.contains('\r'), "{title}");
+
+        let long = "M".repeat(500);
+        let title = second_window_title(Some(&long), Some((640, 480)));
+        assert!(
+            title.chars().filter(|c| *c == 'M').count() <= 64,
+            "the name must be capped: {title}"
+        );
+
+        // A name that is nothing but control characters is no name at all, and
+        // must not leave a dangling separator.
+        assert_eq!(
+            second_window_title(Some("\u{0}\u{7}"), Some((640, 480))),
+            "DirectDesk — second monitor 640x480"
+        );
     }
 
     #[test]

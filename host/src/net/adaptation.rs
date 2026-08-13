@@ -524,11 +524,246 @@ pub fn clamp_to_cap(kbps: u32, cap: Option<u32>) -> u32 {
     }
 }
 
+/// Floor on any one video stream's share of the budget.
+///
+/// Below roughly this an H.264 encoder stops producing a picture and starts
+/// producing blocks, and a second monitor rendered as blocks is worse than a
+/// second monitor the user chose not to open. Deliberately the same number as
+/// [`TILE_CEILING_MIN_KBPS`] — both answer the same question ("what is the
+/// least this producer can be given and still be worth sending?") — but they
+/// are separate constants because they are separate policies.
+pub const MIN_STREAM_KBPS: u32 = 500;
+
+/// Divide **one** adaptive budget between the video streams that are running.
+///
+/// # Why one adaptor and not one per stream
+///
+/// There is a single [`BitrateAdaptor`] for the session and there must be: the
+/// two streams share one congestion window, one link and one send buffer, so
+/// two controllers observing the same loss would each cut for congestion the
+/// other also caused, and the pair would ratchet toward the floor together.
+/// The adaptor decides *how much the connection may spend*; this decides *who
+/// spends it*.
+///
+/// # The split
+///
+/// Pixel-area weighted, because that is what the encoders' bit demand actually
+/// scales with — a 3840x2160 monitor beside a 1280x1024 one needs about six
+/// times the rate for the same quantiser, and an even split would leave one
+/// soft while the other wasted bits.
+///
+/// Two properties the callers depend on, in priority order:
+///
+/// 1. **The shares sum to exactly `total_kbps`.** The adaptor's number is a
+///    ceiling on what the *connection* may produce, and it is also the number
+///    fed back into the overrun signal; shares that summed to more would ask
+///    the link for bandwidth the controller had already decided was not there,
+///    and the congestion that followed would be read as a reason to cut again.
+///    The last share absorbs the division remainder so this is exact and not
+///    merely close.
+/// 2. **No share is below [`MIN_STREAM_KBPS`]** — unless honouring that would
+///    break property 1, which happens when `total_kbps < n * MIN_STREAM_KBPS`.
+///    A budget that small is a link in real trouble, and the right answer there
+///    is an honest even split of what there is rather than a promise to two
+///    encoders that the connection cannot keep. The floor is restored the
+///    moment the adaptor recovers.
+///
+/// A single stream is a pure pass-through: `split_bitrate(x, &[area]) == [x]`
+/// for every area, which is what keeps a one-monitor session's encoder target
+/// bit-identical to what it was before this function existed.
+pub fn split_bitrate(total_kbps: u32, areas: &[u64]) -> Vec<u32> {
+    let n = areas.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Pass-through, and not by accident: with one stream there is nothing to
+    // weight and nothing to round, so the encoder is asked for exactly what the
+    // adaptor decided.
+    if n == 1 {
+        return vec![total_kbps];
+    }
+
+    let sum: u64 = areas.iter().copied().sum();
+    let mut shares: Vec<u32> = if sum == 0 {
+        // No geometry to weight by (a pipeline that has not published its
+        // dimensions yet). Even is the only defensible answer.
+        vec![total_kbps / n as u32; n]
+    } else {
+        // `u128` for the product and nothing else: a pixel area is a `u64` and
+        // `total * area` overflows `u64` for any area above ~4 billion. Real
+        // desktops are nowhere near that, but this runs on the status tick with
+        // numbers that came (indirectly) off a display driver, and a panic here
+        // takes the session's whole adaptive loop down.
+        areas
+            .iter()
+            .map(|a| ((total_kbps as u128 * *a as u128) / sum as u128) as u32)
+            .collect()
+    };
+
+    if total_kbps >= MIN_STREAM_KBPS.saturating_mul(n as u32) {
+        for s in shares.iter_mut() {
+            *s = (*s).max(MIN_STREAM_KBPS);
+        }
+        // Raising the small shares to the floor can overshoot the total. Take
+        // the excess back off the largest share first — it has the most to
+        // spare and loses the least quality per kbps — never letting any share
+        // fall back under the floor. Terminates in at most `n` passes: each one
+        // either clears the excess or pins one more share at the floor.
+        let mut over = shares
+            .iter()
+            .map(|s| *s as u64)
+            .sum::<u64>()
+            .saturating_sub(total_kbps as u64);
+        while over > 0 {
+            let Some(i) = (0..n).max_by_key(|i| shares[*i]) else {
+                break;
+            };
+            let headroom = shares[i].saturating_sub(MIN_STREAM_KBPS) as u64;
+            let take = headroom.min(over);
+            if take == 0 {
+                break;
+            }
+            shares[i] -= take as u32;
+            over -= take;
+        }
+    } else {
+        // Property 1 beats property 2. See the doc comment.
+        let even = total_kbps / n as u32;
+        for s in shares.iter_mut() {
+            *s = even;
+        }
+    }
+
+    // Exactness. Whatever the weighting and flooring above left on the table
+    // (or, in the too-small-budget case, the division remainder) goes to the
+    // last share, so the shares sum to `total_kbps` and not to `total_kbps - 3`.
+    let assigned: u64 = shares[..n - 1].iter().map(|s| *s as u64).sum();
+    shares[n - 1] = (total_kbps as u64).saturating_sub(assigned) as u32;
+    shares
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use directdesk_shared::adapt::{AdaptConfig, BitrateAdaptor};
     use directdesk_shared::protocol::QualityMode;
+
+    // -- splitting one budget between streams ------------------------------
+
+    const HD: u64 = 1_920 * 1_080;
+    const UHD: u64 = 3_840 * 2_160;
+    const SXGA: u64 = 1_280 * 1_024;
+
+    #[test]
+    fn a_single_stream_is_handed_the_whole_budget_unchanged() {
+        // The property that keeps a one-monitor session bit-identical: no
+        // weighting, no rounding, no floor — the encoder is asked for exactly
+        // what the adaptor decided, for every geometry and every budget.
+        for total in [0u32, 1, 499, 500, 6_000, 28_000, u32::MAX] {
+            for area in [0u64, 1, SXGA, HD, UHD] {
+                assert_eq!(split_bitrate(total, &[area]), vec![total]);
+            }
+        }
+        assert!(split_bitrate(6_000, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_shares_always_sum_to_exactly_the_budget() {
+        // Property 1, and the one the adaptor's own feedback loop rests on: if
+        // the shares summed to more than the budget, the encoders would produce
+        // congestion the controller had already decided to avoid and would then
+        // read that congestion as a reason to cut again.
+        for total in [0u32, 1, 999, 1_000, 1_001, 6_000, 12_345, 28_000] {
+            for areas in [
+                vec![HD, HD],
+                vec![UHD, SXGA],
+                vec![SXGA, UHD],
+                vec![1, 1_000_000],
+                vec![0, 0],
+                vec![HD, HD, HD],
+            ] {
+                let shares = split_bitrate(total, &areas);
+                assert_eq!(shares.len(), areas.len());
+                assert_eq!(
+                    shares.iter().map(|s| *s as u64).sum::<u64>(),
+                    total as u64,
+                    "total {total} areas {areas:?} split {shares:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_split_follows_pixel_area() {
+        // A 4K monitor beside a 1280x1024 one needs about six times the rate
+        // for the same quantiser; an even split would leave one soft while the
+        // other wasted bits.
+        let shares = split_bitrate(14_000, &[UHD, SXGA]);
+        assert!(
+            shares[0] > shares[1] * 5,
+            "4K should get several times SXGA's share, got {shares:?}"
+        );
+        // Equal monitors get equal shares.
+        assert_eq!(split_bitrate(12_000, &[HD, HD]), vec![6_000, 6_000]);
+        // And the weighting is by area, not by order. Not bit-identical under
+        // reversal, and deliberately so: the *last* share absorbs the division
+        // remainder (that is what makes the sum exact), so reversing the inputs
+        // moves at most one kbps between them.
+        let a = split_bitrate(14_000, &[UHD, SXGA]);
+        let mut b = split_bitrate(14_000, &[SXGA, UHD]);
+        b.reverse();
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!(
+                x.abs_diff(*y) <= 1,
+                "the split should not depend on the order beyond the rounding \
+                 remainder: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_stream_is_starved_below_the_floor_while_the_budget_allows_it() {
+        // Property 2. A 1x1 "monitor" beside a 4K one weights to almost
+        // nothing, and an encoder given almost nothing produces blocks rather
+        // than a picture — worse than not opening the second monitor at all.
+        let shares = split_bitrate(6_000, &[UHD, 1]);
+        assert!(
+            shares.iter().all(|s| *s >= MIN_STREAM_KBPS),
+            "{shares:?} has a share under the {MIN_STREAM_KBPS} kbps floor"
+        );
+        assert_eq!(shares.iter().sum::<u32>(), 6_000);
+
+        // The floor holds right down to the budget that can just afford it...
+        let exact = split_bitrate(MIN_STREAM_KBPS * 2, &[UHD, 1]);
+        assert_eq!(exact, vec![MIN_STREAM_KBPS, MIN_STREAM_KBPS]);
+
+        // ...and one kbps below that, summing to the budget wins: a link this
+        // starved cannot keep a promise to two encoders, and an honest even
+        // split is better than a total the adaptor never authorised. The area
+        // weighting goes with it — there is nothing left to weight.
+        let starved = split_bitrate(MIN_STREAM_KBPS * 2 - 1, &[UHD, 1]);
+        assert_eq!(starved.iter().map(|s| *s as u64).sum::<u64>(), 999);
+        assert!(
+            starved[0].abs_diff(starved[1]) <= 1,
+            "a budget too small for the floor splits evenly, got {starved:?}"
+        );
+    }
+
+    #[test]
+    fn splitting_never_panics_or_wraps_at_the_edges() {
+        // A zero budget, a zero area (a pipeline that has not published its
+        // geometry yet) and an absurd one all have to produce *some* answer:
+        // this runs on the status tick and a panic there takes the session's
+        // whole adaptive loop with it.
+        assert_eq!(split_bitrate(0, &[HD, HD]), vec![0, 0]);
+        assert_eq!(
+            split_bitrate(1_000, &[0, 0]),
+            vec![MIN_STREAM_KBPS, MIN_STREAM_KBPS],
+            "no geometry to weight by means an even split"
+        );
+        let huge = split_bitrate(u32::MAX, &[u64::MAX / 2, u64::MAX / 2]);
+        assert_eq!(huge.iter().map(|s| *s as u64).sum::<u64>(), u32::MAX as u64);
+    }
 
     // -- rate limiter ------------------------------------------------------
 

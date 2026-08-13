@@ -29,6 +29,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use directdesk_client::monitors::MonitorChoice;
 use directdesk_client::net::{run_client, ConnectParams};
 use directdesk_client::session::{ClientSession, ConnectionState};
 use directdesk_shared::crypto::auth::{TrustedPeer, TrustedPeers, TRUSTED_HOSTS_KEY};
@@ -174,6 +175,7 @@ fn pair_params(addr: SocketAddr, code: Option<&str>) -> ConnectParams {
         // here exercises the "asked and refused" path — the client must connect
         // and stream normally with no audio bridge spawned.
         system_audio: true,
+        monitor_choice: MonitorChoice::default(),
     }
 }
 

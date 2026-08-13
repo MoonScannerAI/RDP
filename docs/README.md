@@ -101,6 +101,26 @@ sounds and music, noticeable on lip movement. See
 the codec tradeoff, loss handling, and why the lag is a scope decision
 rather than a bug.
 
+## Multi-monitor
+
+A client can stream the host's primary display, a second display, or both
+at once — two H.264 streams over the one QUIC connection, tagged by a flag
+bit on the existing video datagram path rather than a second QUIC stream.
+It's negotiated as a `Hello` feature bit and is **off by default** on the
+host (an operator has to enable `multi_monitor_enabled` in `host.json`) —
+a build with this feature behaves exactly like one without it until then.
+The choice (Primary / Second monitor / Both) is made on the client's
+connect screen and persists per host. Pointer input is per-window; keyboard
+follows window focus but always injects through the host's one keyboard
+injector, and the release chord (**Ctrl+Alt+Shift+F12**) works from either
+window. Quality/fps controls, lossless tiles, and system audio all stay
+tied to the primary stream/session as a whole, not per-monitor. See
+[LIMITATIONS.md](LIMITATIONS.md) for the full breakdown: the two-stream
+cap, the secondary window's missing toolbar/fullscreen handling, encoder
+session limits, topology-change behavior, and current verification status
+(so far verified on one dev machine only, not yet on the real WAN link or
+through the real client UI end-to-end).
+
 ## What's real in this build vs. what's a stub
 
 This is an honest project. Read [LIMITATIONS.md](LIMITATIONS.md) before
@@ -113,7 +133,11 @@ relying on this for anything important. In short, as of this MVP:
   It does not silently degrade to a working-but-unlabeled path.
 - System audio (host → client) exists but is off by default and not
   synchronized to video — see Audio above. No microphone / audio return
-  path, no file transfer, clipboard is text-only, single monitor only.
+  path, no file transfer, clipboard is text-only.
+- Multi-monitor exists (up to two displays) but is off by default, capped
+  at two streams with session-wide quality/fps, and verified on one dev
+  machine only so far — see Multi-monitor above and
+  [LIMITATIONS.md](LIMITATIONS.md).
 - The executables are **not code-signed**. Windows SmartScreen will warn on
   first run. This is expected; see [SECURITY.md](SECURITY.md).
 - Built and exercised on a LAN/dev machine; the primary real-world WAN path

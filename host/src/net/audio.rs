@@ -42,7 +42,7 @@
 //! paths — `CaptureFormat` and `WireFormat` — and [`wire_format`] is the one
 //! place the two are converted.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -337,6 +337,9 @@ struct Tx<'a> {
     muted: &'a AtomicBool,
     stop: &'a AtomicBool,
     redundancy: bool,
+    /// How many video pumps are alive on this connection right now. Audio
+    /// yields a whole worst-case frame to *each* of them; see [`has_room`].
+    active_video_streams: &'a AtomicU8,
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +372,7 @@ pub(super) fn audio_pump(
     muted: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     counters: Arc<AudioCounters>,
+    active_video_streams: Arc<AtomicU8>,
 ) {
     // Declaration order is drop order in reverse: `_mf` shuts the MF platform
     // down before `_com` leaves the apartment, and every `Stream` built below
@@ -397,6 +401,7 @@ pub(super) fn audio_pump(
         muted: &muted,
         stop: &stop,
         redundancy: cfg.redundancy,
+        active_video_streams: &active_video_streams,
     };
 
     // Sequence numbers and the access-unit clock both span rebuilds. A gap the
@@ -616,11 +621,28 @@ fn pump(tx: &Tx<'_>, stream: &mut Stream, seq: &mut u32, units_emitted: &mut u64
                 return Ok(());
             };
             // The reserve: one worst-case frame's wire size at this
-            // connection's current MTU. A local and not a constant, because
-            // path-MTU discovery can move the answer mid-session; recomputed
-            // per packet because it is a handful of integer operations. At the
-            // 1200-byte initial MTU it is 676,800 bytes.
-            let audio_reserve = max_frame_wire_size(mtu);
+            // connection's current MTU, **per live video stream**. A local and
+            // not a constant, because path-MTU discovery can move the answer
+            // mid-session and the client can select or drop a second monitor
+            // mid-session; recomputed per packet because it is a handful of
+            // integer operations. At the 1200-byte initial MTU one stream is
+            // 676,800 bytes and two are 1,353,600.
+            //
+            // Scaling by the stream count rather than reserving one frame flat
+            // is not conservatism: with two monitors selected there are two
+            // `dd-video-tx` threads, each part-way through pacing a frame out,
+            // and a flat one-frame reserve would leave audio free to spend the
+            // headroom the *second* one had already counted. The eviction that
+            // followed would shred whichever frame was older — silently, with
+            // `Ok(())` returned from every send. `max(1)` because a session
+            // with no video pump at all still owes nothing to anybody, and
+            // reserving zero would let audio fill the buffer just as the first
+            // pump starts.
+            // Saturating, like every other arithmetic step on this path: an
+            // overflow here would wrap to a *small* reserve, which is the one
+            // failure direction that silently lets audio shred a video frame.
+            let audio_reserve = max_frame_wire_size(mtu)
+                .saturating_mul(tx.active_video_streams.load(Ordering::Relaxed).max(1) as usize);
 
             if !has_room(
                 tx.conn.datagram_send_buffer_space(),
@@ -877,6 +899,41 @@ mod tests {
              packet would fit — that is the eviction that shreds a keyframe"
         );
         assert!(!has_room(0, packet, reserve));
+    }
+
+    #[test]
+    fn audio_yields_a_whole_frame_to_every_video_stream_not_just_one() {
+        // With a second monitor selected there are two `dd-video-tx` threads,
+        // each part-way through pacing a frame out. A flat one-frame reserve
+        // would let audio spend the headroom the second one had already counted
+        // — and quinn's eviction would then shred whichever frame was older,
+        // with `Ok(())` returned from every send and nothing logged to say why.
+        let one = max_frame_wire_size(1_200);
+        let two = 2 * one;
+        let packet = 350usize;
+
+        // A buffer sized for one stream's reserve is *not* enough once there
+        // are two. This is the assertion the scaling exists for.
+        assert!(has_room(packet + one, packet, one));
+        assert!(!has_room(packet + one, packet, two));
+        assert!(has_room(packet + two, packet, two));
+
+        // And the widened send buffer the host asks for when multi-monitor is
+        // enabled leaves audio somewhere to stand at both MTUs — a reserve at
+        // or above the whole buffer would look exactly like a broken feature.
+        for mtu in [1_200usize, 1_500] {
+            let reserve = 2 * max_frame_wire_size(mtu);
+            assert!(
+                has_room(
+                    super::super::MULTI_MONITOR_DATAGRAM_SEND_BUFFER,
+                    packet,
+                    reserve
+                ),
+                "mtu {mtu}: a two-stream reserve of {reserve} starves audio out \
+                 of a {} byte buffer",
+                super::super::MULTI_MONITOR_DATAGRAM_SEND_BUFFER
+            );
+        }
     }
 
     #[test]

@@ -245,6 +245,9 @@ fn offered_features(cfg: &NetConfig) -> u64 {
     if cfg.system_audio_enabled {
         bits |= directdesk_shared::protocol::features::SYSTEM_AUDIO;
     }
+    if cfg.multi_monitor_enabled {
+        bits |= directdesk_shared::protocol::features::MULTI_MONITOR;
+    }
     bits
 }
 
@@ -517,7 +520,7 @@ mod tests {
 
     #[test]
     fn offered_features_follow_config() {
-        use directdesk_shared::protocol::features::{LOSSLESS_TILES, SYSTEM_AUDIO};
+        use directdesk_shared::protocol::features::{LOSSLESS_TILES, MULTI_MONITOR, SYSTEM_AUDIO};
 
         let mut cfg =
             NetConfig::from_host_config(&crate::config::HostConfig::default().sanitized());
@@ -531,11 +534,13 @@ mod tests {
         );
         assert_eq!(offered_features(&cfg) & LOSSLESS_TILES, 0);
         assert_eq!(offered_features(&cfg) & SYSTEM_AUDIO, 0);
+        assert_eq!(offered_features(&cfg) & MULTI_MONITOR, 0);
 
         // Each flag lights its own bit and only its own bit.
         cfg.pipeline.lossless_tiles_enabled = true;
         assert_eq!(offered_features(&cfg) & LOSSLESS_TILES, LOSSLESS_TILES);
         assert_eq!(offered_features(&cfg) & SYSTEM_AUDIO, 0);
+        assert_eq!(offered_features(&cfg) & MULTI_MONITOR, 0);
 
         cfg.system_audio_enabled = true;
         assert_eq!(offered_features(&cfg) & SYSTEM_AUDIO, SYSTEM_AUDIO);
@@ -547,6 +552,55 @@ mod tests {
 
         cfg.pipeline.lossless_tiles_enabled = false;
         assert_eq!(offered_features(&cfg), SYSTEM_AUDIO, "audio alone");
+
+        // The multi-monitor knob, on its own and beside the others. This is the
+        // gate every new message in the feature hangs off: MonitorList,
+        // StreamConfig, StreamStopped and the stream-tagged datagrams are all
+        // written only when this bit came back mutual, so an unset bit here is
+        // what makes the feature invisible to a legacy client.
+        cfg.system_audio_enabled = false;
+        cfg.multi_monitor_enabled = true;
+        assert_eq!(offered_features(&cfg), MULTI_MONITOR, "monitors alone");
+
+        cfg.pipeline.lossless_tiles_enabled = true;
+        cfg.system_audio_enabled = true;
+        assert_eq!(
+            offered_features(&cfg),
+            LOSSLESS_TILES | SYSTEM_AUDIO | MULTI_MONITOR,
+            "three independent knobs, three independent bits"
+        );
+
+        cfg.multi_monitor_enabled = false;
+        assert_eq!(offered_features(&cfg) & MULTI_MONITOR, 0);
+    }
+
+    #[test]
+    fn multi_monitor_negotiates_like_every_other_feature() {
+        use directdesk_shared::protocol::features::{MULTI_MONITOR, SYSTEM_AUDIO};
+
+        // Both sides want it → on.
+        assert_eq!(
+            host_hello(MULTI_MONITOR, MULTI_MONITOR).features,
+            MULTI_MONITOR
+        );
+        // Client asks, host is not configured for it → off.
+        assert_eq!(host_hello(MULTI_MONITOR, 0).features, 0);
+        // Host offers, an older client never asked → off. Load-bearing beyond
+        // "a feature stays off": the second monitor's frames share the media
+        // datagram path with the first and are told apart only by FLAG_STREAM1,
+        // so a host that sent one to a client which never asked would be
+        // handing that client's single reassembler a tagged fragment.
+        assert_eq!(host_hello(0, MULTI_MONITOR).features, 0);
+        assert_eq!(host_hello(u64::MAX, MULTI_MONITOR).features, MULTI_MONITOR);
+        // And it is independent of its neighbours.
+        assert_eq!(
+            host_hello(MULTI_MONITOR, MULTI_MONITOR | SYSTEM_AUDIO).features,
+            MULTI_MONITOR
+        );
+        assert_eq!(
+            host_hello(MULTI_MONITOR | SYSTEM_AUDIO, SYSTEM_AUDIO).features,
+            SYSTEM_AUDIO
+        );
     }
 
     // -- auth messages -----------------------------------------------------

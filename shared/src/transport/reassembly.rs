@@ -124,6 +124,23 @@ pub struct ReassemblyConfig {
     /// How many consecutive out-of-window datagrams must agree before the
     /// reassembler adopts a new numbering. Default 8. `0` is treated as 1.
     pub resync_after: u32,
+    /// Which video stream this reassembler owns: `0` (the primary output) or
+    /// `1` (the second monitor). Default `0`.
+    ///
+    /// Zero is the only value a single-monitor session has ever needed, and it
+    /// is what every existing caller gets without saying anything — a
+    /// pre-multi-monitor fragment carries no [`crate::video::FLAG_STREAM1`] and
+    /// so decodes with `stream == 0`.
+    ///
+    /// A fragment whose `stream` disagrees is refused by
+    /// [`Reassembler::push`]; see the rejection itself for why that check is
+    /// not redundant with the session's demux.
+    ///
+    /// The session driver sets this per reassembler and ignores whatever a
+    /// caller put here, so a `SessionConfig::reassembly` carrying
+    /// `expected_stream: 1` cannot make the stream-0 reassembler refuse the
+    /// primary monitor.
+    pub expected_stream: u8,
 }
 
 impl Default for ReassemblyConfig {
@@ -136,6 +153,9 @@ impl Default for ReassemblyConfig {
             latest_wins: true,
             max_forward_jump: 64,
             resync_after: 8,
+            // The primary output. Every reassembler that existed before the
+            // second monitor did is this one, and stays byte-for-byte this one.
+            expected_stream: 0,
         }
     }
 }
@@ -146,8 +166,16 @@ impl ReassemblyConfig {
     /// `max_slots == 0` and `resync_after == 0` are tolerated (both are clamped
     /// to 1), but a `max_forward_jump` of zero would refuse every frame after
     /// the first, and `stale_frame_distance` at half the id space would make
-    /// staleness meaningless.
+    /// staleness meaningless. An `expected_stream` no sender can tag is the
+    /// same category of mistake: [`crate::video::datagram_stream_id`] answers
+    /// only `0` or `1`, so anything higher refuses 100% of traffic in silence.
     pub fn validate(&self) -> Result<()> {
+        if self.expected_stream > 1 {
+            return Err(Error::Invalid(format!(
+                "expected_stream must be 0 or 1, got {}",
+                self.expected_stream
+            )));
+        }
         if self.max_forward_jump == 0 {
             return Err(Error::Invalid("max_forward_jump must be non-zero".into()));
         }
@@ -202,6 +230,59 @@ pub struct ReassemblyStats {
     pub fec_recovered: u64,
     /// Number of times [`Reassembler::take_keyframe_request`] returned true.
     pub keyframe_requests: u64,
+}
+
+impl ReassemblyStats {
+    /// Field-by-field sum of two snapshots.
+    ///
+    /// A multi-monitor receiver runs one [`Reassembler`] per video stream but
+    /// publishes a single figure, because everything downstream — the stats
+    /// sampler, `video_loss`, the bitrate adaptor — reasons about *the link*,
+    /// and the link is what both streams share. Summing keeps that consumer
+    /// shape unchanged while the sender count grows.
+    ///
+    /// Sound because every counter here is a cumulative count of independent
+    /// events: two reassemblers never observe the same datagram (the demux
+    /// routes each to exactly one), so no event is double-counted, and the
+    /// documented push partition survives addition term by term.
+    ///
+    /// Written as an exhaustive literal on purpose. Adding a field to
+    /// [`ReassemblyStats`] and forgetting it here would silently under-report
+    /// on multi-stream sessions only; spelled this way it is a compile error.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            frames_completed: self.frames_completed.saturating_add(other.frames_completed),
+            frames_dropped_incomplete: self
+                .frames_dropped_incomplete
+                .saturating_add(other.frames_dropped_incomplete),
+            frames_dropped_stale: self
+                .frames_dropped_stale
+                .saturating_add(other.frames_dropped_stale),
+            frames_skipped_latest_wins: self
+                .frames_skipped_latest_wins
+                .saturating_add(other.frames_skipped_latest_wins),
+            frames_dropped_reorder: self
+                .frames_dropped_reorder
+                .saturating_add(other.frames_dropped_reorder),
+            fragments_received: self
+                .fragments_received
+                .saturating_add(other.fragments_received),
+            fragments_duplicate: self
+                .fragments_duplicate
+                .saturating_add(other.fragments_duplicate),
+            fragments_rejected: self
+                .fragments_rejected
+                .saturating_add(other.fragments_rejected),
+            fec_parity_received: self
+                .fec_parity_received
+                .saturating_add(other.fec_parity_received),
+            fec_recovered: self.fec_recovered.saturating_add(other.fec_recovered),
+            keyframe_requests: self
+                .keyframe_requests
+                .saturating_add(other.keyframe_requests),
+        }
+    }
 }
 
 /// One partially received frame.
@@ -355,6 +436,8 @@ impl Reassembler {
     ///   fragments.
     /// - [`Error::Oversized`] if the frame's payload bytes would exceed
     ///   [`MAX_FRAME_BYTES`]; the slot is dropped and a keyframe is requested.
+    /// - [`Error::Invalid`] if the fragment belongs to a different video stream
+    ///   than [`ReassemblyConfig::expected_stream`]; no state is disturbed.
     /// - [`Error::Invalid`] if the frame id lies outside the accepted window
     ///   (see the module docs); no state is disturbed.
     ///
@@ -370,6 +453,37 @@ impl Reassembler {
                 return Err(e);
             }
         };
+
+        // Wrong monitor. Refused here, before `accept_frame_id`, for exactly
+        // the reason `FragHeader::decode` refuses `FLAG_AUDIO` — see
+        // [`crate::video::FLAG_AUDIO`] for the long version. This is that same
+        // backstop applied per stream.
+        //
+        // Two monitors are two independent encoders, so stream 1's `frame_id`
+        // is its own number line with no relationship to stream 0's: they start
+        // together, then drift apart by every frame either one drops, and
+        // either can restart at 0 on its own. A run of stream-1 fragments
+        // reaching this reassembler's `accept_frame_id` therefore looks like
+        // what audio looks like — consecutive out-of-window ids that agree with
+        // each other — which is the signature `adopt_numbering` reads as a
+        // legitimate encoder renumbering. Past `resync_after` of them it would
+        // clear every live slot and every ready frame of the *primary* monitor
+        // and demand a keyframe: monitor 1 stalling monitor 0, with no error
+        // logged anywhere.
+        //
+        // The session's demux (`datagram_stream_id`, peeked at the flags byte
+        // before any parse) is the routing decision and keeps this path cold.
+        // This is the safety net for the day some future caller forgets to
+        // consult it, or builds both reassemblers and wires them up crossed.
+        // Keep both. `a_foreign_stream_never_reaches_adopt_numbering` in the
+        // tests below pins it.
+        if header.stream != self.config.expected_stream {
+            self.stats.fragments_rejected += 1;
+            return Err(Error::Invalid(format!(
+                "fragment of frame {} belongs to video stream {}, not {}",
+                header.frame_id, header.stream, self.config.expected_stream
+            )));
+        }
 
         // Window check FIRST: nothing may touch `newest_seen` or evict a slot
         // until we have decided the id is plausible. An earlier version bumped
@@ -906,7 +1020,10 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video::{fragment_frame, fragment_frame_fec, FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME};
+    use crate::video::{
+        fragment_frame, fragment_frame_fec, fragment_frame_fec_on, FLAG_STREAM1, FRAG_FLAGS_OFFSET,
+        FRAG_HEADER_LEN, MAX_FRAGS_PER_FRAME,
+    };
 
     /// Deterministic payload of `len` bytes.
     fn payload(len: usize) -> Vec<u8> {
@@ -940,6 +1057,7 @@ mod tests {
             frag_count,
             keyframe,
             parity: false,
+            stream: 0,
             block_size: 0,
             last_frag_len: 0,
             timestamp_ms: ts,
@@ -1620,6 +1738,315 @@ mod tests {
         }
         .validate()
         .is_err());
+        // Both real stream tags are configurable; nothing above them is, since
+        // no sender can produce one and the reassembler would refuse every
+        // datagram forever without saying so.
+        for stream in [0u8, 1] {
+            assert!(ReassemblyConfig {
+                expected_stream: stream,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok());
+        }
+        assert!(ReassemblyConfig {
+            expected_stream: 2,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    /// The default must be the primary output, so every constructor call site
+    /// that predates multi-monitor keeps behaving exactly as it did.
+    #[test]
+    fn expected_stream_defaults_to_the_primary_output() {
+        assert_eq!(ReassemblyConfig::default().expected_stream, 0);
+    }
+
+    /// Deterministic single-fragment frame on `stream`, at `id`.
+    fn frag_on(id: u32, stream: u8, len: usize) -> Vec<u8> {
+        let frame = EncodedFrame {
+            frame_id: id,
+            keyframe: false,
+            timestamp_ms: id,
+            data: payload(len),
+        };
+        let mut f = fragment_frame_fec_on(&frame, 1200, 0, stream).expect("fragment");
+        assert_eq!(f.len(), 1, "fixture must fit one datagram");
+        f.remove(0)
+    }
+
+    /// A fragment tagged for the other monitor is refused, and refused into the
+    /// same counter every other rejection lands in.
+    #[test]
+    fn a_mismatched_stream_fragment_is_rejected() {
+        let mut r = Reassembler::new(cfg());
+        let before = r.stats();
+
+        // In window, well formed, correct geometry — wrong monitor.
+        let err = r.push(&frag_on(1, 1, 400), 0).expect_err("stream 1");
+        assert!(
+            matches!(err, Error::Invalid(_)),
+            "wrong-stream fragments are Invalid, not Oversized: {err:?}"
+        );
+        assert_eq!(
+            r.stats(),
+            ReassemblyStats {
+                fragments_rejected: before.fragments_rejected + 1,
+                ..before
+            },
+            "a wrong-stream fragment moved something other than the rejection count"
+        );
+        // The documented partition still holds: one push, one rejection.
+        assert_eq!(r.stats().fragments_received, 0);
+        assert_eq!(r.stats().fragments_duplicate, 0);
+    }
+
+    /// The proof that `adopt_numbering` is unreachable from the second monitor.
+    ///
+    /// This is the per-stream twin of
+    /// `session::tests::an_audio_datagram_never_disturbs_a_reassembler`, and it
+    /// exists for the same reason. Two monitors are two independent encoders,
+    /// so stream 1's `frame_id` is a number line of its own: a run of stream-1
+    /// fragments reaching `accept_frame_id` looks like consecutive,
+    /// mutually-agreeing out-of-window ids, which is exactly the signature of a
+    /// legitimate encoder renumbering. Past `resync_after` (8) of them the
+    /// stream-0 reassembler would clear every live slot and every ready frame
+    /// and demand a keyframe — the second monitor stalling the first, silently.
+    ///
+    /// So: two real stream-0 frames with twenty real stream-1 fragments pushed
+    /// between them, at ids far outside the window and within `max_forward_jump`
+    /// of each other, which is what it takes to accumulate a run at all. Both
+    /// stream-0 frames must still reassemble byte for byte and no keyframe may
+    /// be demanded. The control group at the end clears the one bit that
+    /// carried the whole rejection and shows the same datagrams wrecking a
+    /// reassembler, so this tests a mechanism rather than an accident.
+    #[test]
+    fn a_foreign_stream_never_reaches_adopt_numbering() {
+        // More than twice `resync_after`, so the run is reached with room over.
+        const FOREIGN: u32 = 20;
+        // Far outside the stream-0 window, and consecutive, so successive ids
+        // stay within `max_forward_jump` (64) of the run's base. Scattered ids
+        // would never accumulate a run and the test would prove nothing.
+        const FOREIGN_BASE: u32 = 0x4000_0000;
+
+        fn foreign() -> Vec<Vec<u8>> {
+            (0..FOREIGN)
+                .map(|i| frag_on(FOREIGN_BASE.wrapping_add(i), 1, 400))
+                .collect()
+        }
+
+        let frame_a = EncodedFrame {
+            frame_id: 100,
+            keyframe: true,
+            timestamp_ms: 1_100,
+            data: payload(4000),
+        };
+        let frame_b = EncodedFrame {
+            frame_id: 101,
+            keyframe: false,
+            timestamp_ms: 1_101,
+            data: payload(4000),
+        };
+        let frags_a = fragment_frame_fec(&frame_a, 1200, 0).expect("fragment");
+        let frags_b = fragment_frame_fec(&frame_b, 1200, 0).expect("fragment");
+        assert!(frags_a.len() > 1, "the fixture must need reassembly");
+
+        let mut r = Reassembler::new(ReassemblyConfig::default());
+        for f in &frags_a {
+            r.push(f, 0).expect("stream 0 fragment");
+        }
+        assert_eq!(r.pop_frame().expect("frame A").data, frame_a.data);
+        let before = r.stats();
+
+        for d in &foreign() {
+            assert_eq!(
+                crate::video::datagram_stream_id(d),
+                1,
+                "the real demux would have routed this away before it got here"
+            );
+            assert!(
+                r.push(d, 0).is_err(),
+                "a stream-1 fragment must never be accepted by the stream-0 reassembler"
+            );
+        }
+
+        // The whole claim, in one comparison: twenty foreign fragments may move
+        // the rejection count and may move nothing else. Not the window, not
+        // the slots, not the ready queue, not a single frame counter.
+        assert_eq!(
+            r.stats(),
+            ReassemblyStats {
+                fragments_rejected: before.fragments_rejected + u64::from(FOREIGN),
+                ..before
+            },
+            "the second monitor disturbed stream 0 beyond the rejection count"
+        );
+
+        // In-window traffic still reassembles normally afterwards.
+        for f in &frags_b {
+            r.push(f, 0).expect("stream 0 fragment");
+        }
+        assert_eq!(r.pop_frame().expect("frame B").data, frame_b.data);
+        let after = r.stats();
+        assert_eq!(after.frames_completed, before.frames_completed + 1);
+        assert_eq!(after.frames_dropped_incomplete, 0);
+        assert_eq!(after.frames_dropped_stale, 0);
+        // `adopt_numbering` raises `need_keyframe`. Frame A was a keyframe and
+        // frame B followed it with no gap, so a demand here could only have
+        // come from the foreign stream.
+        assert!(
+            !r.take_keyframe_request(0),
+            "stream 1 raised a keyframe demand, which means it reached adopt_numbering"
+        );
+
+        // --- Control group: prove the premise instead of asserting it ---
+        //
+        // The same datagrams with `FLAG_STREAM1` cleared — the only thing wrong
+        // with them as far as this reassembler is concerned — do exactly the
+        // damage described above.
+        let mut r2 = Reassembler::new(ReassemblyConfig::default());
+        for f in &frags_a {
+            r2.push(f, 0).expect("stream 0 fragment");
+        }
+        assert_eq!(r2.pop_frame().expect("frame A").data, frame_a.data);
+        assert!(
+            !r2.take_keyframe_request(0),
+            "clean before the disguised run"
+        );
+
+        for d in &foreign() {
+            let mut disguised = d.clone();
+            disguised[FRAG_FLAGS_OFFSET] &= !FLAG_STREAM1;
+            let _ = r2.push(&disguised, 0);
+        }
+        assert!(
+            r2.take_keyframe_request(0),
+            "the fixture must be able to trip the resync once the stream bit is gone, \
+             or this test proves nothing about that bit"
+        );
+
+        let wrecked = r2.stats();
+        for f in &frags_b {
+            let _ = r2.push(f, 0);
+        }
+        assert_eq!(
+            r2.stats().fragments_rejected,
+            wrecked.fragments_rejected + frags_b.len() as u64,
+            "with the window moved onto the second monitor's number line, every \
+             fragment of frame B is refused — the primary monitor stalled for the \
+             life of the session, with no error logged anywhere"
+        );
+        while let Some(frame) = r2.pop_frame() {
+            assert_ne!(
+                frame.data, frame_b.data,
+                "frame B must not have survived the forged renumbering"
+            );
+        }
+    }
+
+    /// The check is symmetric: a stream-1 reassembler is exactly as deaf to the
+    /// primary monitor as the primary is to it. Without this the field could be
+    /// implemented as "reject FLAG_STREAM1" and still pass everything above.
+    #[test]
+    fn expected_stream_one_accepts_stream_one_and_rejects_stream_zero() {
+        let frame = EncodedFrame {
+            frame_id: 5,
+            keyframe: true,
+            timestamp_ms: 500,
+            data: payload(4000),
+        };
+        let mut r = Reassembler::new(ReassemblyConfig {
+            expected_stream: 1,
+            ..ReassemblyConfig::default()
+        });
+
+        let on_1 = fragment_frame_fec_on(&frame, 1200, 0, 1).expect("fragment");
+        assert!(on_1.len() > 1, "the fixture must need reassembly");
+        for f in &on_1 {
+            r.push(f, 0).expect("stream 1 fragment");
+        }
+        let got = r.pop_frame().expect("stream 1 frame");
+        assert_eq!(got.frame_id, frame.frame_id);
+        assert_eq!(got.data, frame.data);
+
+        let before = r.stats();
+        // Same frame, same geometry, same ids — only the tag differs.
+        let on_0 = fragment_frame_fec_on(&frame, 1200, 0, 0).expect("fragment");
+        for f in &on_0 {
+            assert!(
+                r.push(f, 0).is_err(),
+                "the stream-1 reassembler accepted a primary-monitor fragment"
+            );
+        }
+        assert_eq!(
+            r.stats(),
+            ReassemblyStats {
+                fragments_rejected: before.fragments_rejected + on_0.len() as u64,
+                ..before
+            },
+            "primary-monitor fragments disturbed the stream-1 reassembler"
+        );
+    }
+
+    /// The published multi-stream figure is a true sum, field by field.
+    #[test]
+    fn reassembly_stats_merge_sums_every_field() {
+        // Distinct values per field, so a merge that crossed two of them shows
+        // up rather than cancelling out.
+        let a = ReassemblyStats {
+            frames_completed: 1,
+            frames_dropped_incomplete: 2,
+            frames_dropped_stale: 3,
+            frames_skipped_latest_wins: 4,
+            frames_dropped_reorder: 5,
+            fragments_received: 6,
+            fragments_duplicate: 7,
+            fragments_rejected: 8,
+            fec_parity_received: 9,
+            fec_recovered: 10,
+            keyframe_requests: 11,
+        };
+        let b = ReassemblyStats {
+            frames_completed: 100,
+            frames_dropped_incomplete: 200,
+            frames_dropped_stale: 300,
+            frames_skipped_latest_wins: 400,
+            frames_dropped_reorder: 500,
+            fragments_received: 600,
+            fragments_duplicate: 700,
+            fragments_rejected: 800,
+            fec_parity_received: 900,
+            fec_recovered: 1_000,
+            keyframe_requests: 1_100,
+        };
+        assert_eq!(
+            a.merge(b),
+            ReassemblyStats {
+                frames_completed: 101,
+                frames_dropped_incomplete: 202,
+                frames_dropped_stale: 303,
+                frames_skipped_latest_wins: 404,
+                frames_dropped_reorder: 505,
+                fragments_received: 606,
+                fragments_duplicate: 707,
+                fragments_rejected: 808,
+                fec_parity_received: 909,
+                fec_recovered: 1_010,
+                keyframe_requests: 1_111,
+            }
+        );
+        // Identity and commutativity, since the caller folds in either order.
+        assert_eq!(a.merge(ReassemblyStats::default()), a);
+        assert_eq!(a.merge(b), b.merge(a));
+        // Saturating, not wrapping: a counter at the ceiling must not roll a
+        // real figure back to zero.
+        let max = ReassemblyStats {
+            frames_completed: u64::MAX,
+            ..ReassemblyStats::default()
+        };
+        assert_eq!(max.merge(max).frames_completed, u64::MAX);
     }
 
     /// The counter partition must hold even when a newly created slot is itself

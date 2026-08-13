@@ -17,6 +17,7 @@
 //! * [`tiles`]        — lossless static-region tile store + compositor.
 //! * [`ui`]           — the eframe application shell.
 //! * [`config`]       — `%APPDATA%\DirectDesk\client.json` (no secrets).
+//! * [`monitors`]     — monitor-choice vocabulary + selection resolution.
 
 pub mod audio_decoder;
 pub mod audio_render;
@@ -24,6 +25,7 @@ pub mod config;
 pub mod connect;
 pub mod decoder;
 pub mod input_capture;
+pub mod monitors;
 pub mod net;
 pub mod pipeline;
 pub mod renderer;

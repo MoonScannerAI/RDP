@@ -232,6 +232,48 @@ impl AudioStatus {
     }
 }
 
+/// What the **second** video stream is doing, when a client has selected a
+/// second monitor.
+///
+/// Deliberately **not** in [`ConnStats`], for exactly the reason [`AudioStatus`]
+/// is not: that struct's encoding is pinned byte-for-byte by the anti-brick
+/// suite and is decoded positionally by already-deployed peers, so a field added
+/// there would fail every session on its first stats tick. The client learns a
+/// secondary stream's format from `ControlMsg::StreamConfig` and its health from
+/// the frames arriving; this is the *host* operator's view, and it never crosses
+/// the wire.
+///
+/// It exists because "the second monitor is black" has the same shape as the
+/// audio problem: a pipeline that would not build, a monitor that was
+/// unplugged, an encoder that fell back to software and cannot keep up, and a
+/// stream whose every frame is being dropped for want of send-buffer room all
+/// look identical from the client's chair, and have completely different fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondaryStreamStatus {
+    /// Which monitor this stream carries, as an id in the session's
+    /// `MonitorList`. Session-scoped, not stable across reconnects.
+    pub monitor_id: u8,
+    pub resolution: (u32, u32),
+    pub encoder: String,
+    /// `false` means this stream fell back to a software encoder — the single
+    /// most likely reason a second monitor is smooth on its own and stuttering
+    /// beside the first.
+    pub hardware_encoder: bool,
+    /// The pipeline's own `SessionState`, formatted.
+    pub state: String,
+    /// This stream's share of the session's one adaptive budget. See
+    /// `adaptation::split_bitrate`.
+    pub target_kbps: u32,
+    /// Observed, not requested.
+    pub fps: u32,
+    pub frames_sent: u64,
+    pub bytes_sent: u64,
+    /// Frames this stream skipped because the connection had no room for a
+    /// whole one. Climbing here while the primary's stays flat is the two
+    /// streams' reserves fighting over a link that cannot carry both.
+    pub backpressured: u64,
+}
+
 /// Who is connected, for the UI and the tray tooltip.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
@@ -315,6 +357,15 @@ pub struct StatusSnapshot {
     /// because the desktop was silent or the host was on the secure desktop. A
     /// silent desktop costs zero bandwidth, and this is the evidence of it.
     pub audio_silent_suppressed: u64,
+    /// The second video stream, when there is one. See
+    /// [`SecondaryStreamStatus`] — host-local diagnostics, never on the wire.
+    pub secondary: Option<SecondaryStreamStatus>,
+    /// Every output this host can capture, as last enumerated for the session's
+    /// `MonitorList`. Empty when multi-monitor is off or no client is
+    /// connected. Host-local: the *client* gets this as `ControlMsg::
+    /// MonitorList`, and this copy is what the host's own UI labels its
+    /// outputs with.
+    pub monitors: Vec<directdesk_shared::protocol::MonitorInfo>,
     pub last_error: Option<String>,
 }
 
@@ -420,18 +471,51 @@ pub struct NetConfig {
     pub system_audio_redundancy: bool,
     /// Loopback capture or the diagnostic tone.
     pub system_audio_source: crate::config::AudioSource,
+    // ---- multiple monitors ----------------------------------------------
+    //
+    // On `NetConfig` and not inside `NetConfig::pipeline` for the same reason
+    // the audio knobs above are: `pipeline` is the *persistent primary*
+    // pipeline's configuration, and this flag decides what the session's
+    // control plane offers and which extra pipelines it may build. Handing it
+    // to `HostSession::start` would tie a wire-negotiation decision to a
+    // D3D11/MF rebuild.
+    /// Operator opt-in for multiple monitors. When `false` the host never
+    /// offers [`features::MULTI_MONITOR`], so the bit is never mutual, no
+    /// `MonitorList` is written, no second stream is ever built, and the wire
+    /// is byte-identical to a host that predates the feature.
+    ///
+    /// [`features::MULTI_MONITOR`]: directdesk_shared::protocol::features::MULTI_MONITOR
+    pub multi_monitor_enabled: bool,
 }
+
+/// Datagram send buffer used when a session may carry **two** video streams.
+///
+/// The single-stream default ([`DEFAULT_DATAGRAM_SEND_BUFFER`], 2 MiB) is sized
+/// against one worst-case frame's reserve plus room to pace it out. With a
+/// second video producer on the same datagram path both pumps hold a reserve
+/// (see [`egress::video_pump`]'s precheck and [`audio`]'s `has_room`), and at a
+/// 1200-byte MTU one worst-case frame is already 676,800 bytes — two of those
+/// plus a frame in flight does not fit 2 MiB with anything left over for audio.
+/// Doubling it is host-local: the datagram send buffer is one endpoint's own
+/// queue and is never negotiated, so raising it changes no byte on the wire.
+///
+/// [`DEFAULT_DATAGRAM_SEND_BUFFER`]: directdesk_shared::transport::quic::DEFAULT_DATAGRAM_SEND_BUFFER
+pub const MULTI_MONITOR_DATAGRAM_SEND_BUFFER: usize = 4 * 1024 * 1024;
 
 impl NetConfig {
     /// Build from the persisted host config.
     pub fn from_host_config(cfg: &crate::config::HostConfig) -> Self {
+        let mut quic = QuicParams::default();
+        if cfg.multi_monitor_enabled {
+            quic.datagram_send_buffer = MULTI_MONITOR_DATAGRAM_SEND_BUFFER;
+        }
         Self {
             bind: SocketAddr::from(([0, 0, 0, 0], cfg.udp_port)),
             host_name: cfg.display_name.clone(),
             quality_mode: cfg.quality_mode,
             bitrate_cap_kbps: cfg.bitrate_cap_kbps,
             pipeline: cfg.pipeline(),
-            quic: QuicParams::default(),
+            quic,
             uac_clickthrough: cfg.uac_clickthrough,
             uac_arm_ttl_secs: cfg.uac_arm_ttl_secs,
             blank_wallpaper_during_session: cfg.blank_wallpaper_during_session,
@@ -440,6 +524,7 @@ impl NetConfig {
             system_audio_kbps: cfg.system_audio_kbps,
             system_audio_redundancy: cfg.system_audio_redundancy,
             system_audio_source: cfg.system_audio_source,
+            multi_monitor_enabled: cfg.multi_monitor_enabled,
         }
     }
 }
@@ -855,6 +940,46 @@ mod tests {
     }
 
     #[test]
+    fn multi_monitor_reaches_net_config_and_widens_only_the_send_buffer() {
+        use directdesk_shared::transport::quic::DEFAULT_DATAGRAM_SEND_BUFFER;
+
+        // Shipped default: off, and the transport parameters are the ones every
+        // already-deployed peer sees today.
+        let off = NetConfig::from_host_config(&crate::config::HostConfig::default().sanitized());
+        assert!(!off.multi_monitor_enabled);
+        assert_eq!(off.quic, QuicParams::default());
+
+        let on = NetConfig::from_host_config(
+            &crate::config::HostConfig {
+                multi_monitor_enabled: true,
+                ..Default::default()
+            }
+            .sanitized(),
+        );
+        assert!(on.multi_monitor_enabled);
+        // Two video producers each hold a worst-case-frame reserve, so the
+        // single-stream buffer is not big enough for both plus audio.
+        assert_eq!(
+            on.quic.datagram_send_buffer,
+            MULTI_MONITOR_DATAGRAM_SEND_BUFFER
+        );
+        assert!(on.quic.datagram_send_buffer > DEFAULT_DATAGRAM_SEND_BUFFER);
+        assert!(on.quic.validate().is_ok());
+        // ...and nothing else about the transport moved. The send buffer is a
+        // local queue and is never negotiated; every parameter the peer can
+        // observe must stay exactly as it was.
+        assert_eq!(
+            QuicParams {
+                datagram_send_buffer: DEFAULT_DATAGRAM_SEND_BUFFER,
+                ..on.quic.clone()
+            },
+            QuicParams::default(),
+            "enabling multi-monitor changed a transport parameter other than \
+             the host-local datagram send buffer"
+        );
+    }
+
+    #[test]
     fn audio_status_survives_the_atomic_round_trip() {
         for s in [
             AudioStatus::Disabled,
@@ -917,6 +1042,58 @@ mod tests {
             "an audio counter reached the wire stats struct"
         );
         assert_eq!(s.pipeline, ConnStats::default());
+    }
+
+    #[test]
+    fn multi_monitor_diagnostics_are_host_local_and_never_touch_conn_stats() {
+        // Same guard as `audio_diagnostics_are_host_local_...` above, and for
+        // the same reason: `ConnStats` rides inside `ControlMsg::Stats`, is
+        // decoded positionally by already-deployed peers, and is pinned
+        // byte-for-byte by the anti-brick suite. A second monitor's numbers
+        // therefore live on `StatusSnapshot`, which never crosses the wire —
+        // what the *client* is told about a secondary stream is
+        // `ControlMsg::StreamConfig`, a message of its own that only a peer
+        // which negotiated MULTI_MONITOR ever receives.
+        //
+        // The merge that does reach the wire is `serve::merge_media_stats`,
+        // which folds both pipelines into the existing fields and adds none.
+        let s = StatusSnapshot {
+            secondary: Some(SecondaryStreamStatus {
+                monitor_id: 1,
+                resolution: (2_560, 1_440),
+                encoder: "NVIDIA H.264".into(),
+                hardware_encoder: true,
+                state: "Running".into(),
+                target_kbps: 4_000,
+                fps: 60,
+                frames_sent: 9_001,
+                bytes_sent: 123_456_789,
+                backpressured: 12,
+            }),
+            monitors: vec![directdesk_shared::protocol::MonitorInfo {
+                id: 0,
+                width: 2_560,
+                height: 1_600,
+                origin_x: 0,
+                origin_y: 0,
+                is_primary: true,
+                name: r"\\.\DISPLAY1".into(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            s.transport,
+            ConnStats::default(),
+            "a multi-monitor field reached the wire stats struct"
+        );
+        assert_eq!(s.pipeline, ConnStats::default());
+
+        // And the shipped default carries neither, so an idle host reports
+        // exactly what it always did.
+        let idle = StatusSnapshot::default();
+        assert!(idle.secondary.is_none());
+        assert!(idle.monitors.is_empty());
     }
 
     // -- route -------------------------------------------------------------
