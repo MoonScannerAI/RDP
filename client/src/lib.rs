@@ -18,12 +18,18 @@
 //! * [`ui`]           — the eframe application shell.
 //! * [`config`]       — `%APPDATA%\DirectDesk\client.json` (no secrets).
 //! * [`monitors`]     — monitor-choice vocabulary + selection resolution.
+//! * [`app`]          — platform-neutral entry point ([`app::run`]).
+//! * [`touch`]        — touch gesture → pointer state machine (touch profile).
+//! * [`yuv`]          — stride/crop-aware YUV 4:2:0 → RGBA8 (MediaCodec output).
+//! * [`h264`]         — Annex-B NAL split + SPS parse (MediaCodec setup).
 
+pub mod app;
 pub mod audio_decoder;
 pub mod audio_render;
 pub mod config;
 pub mod connect;
 pub mod decoder;
+pub mod h264;
 pub mod input_capture;
 pub mod monitors;
 pub mod net;
@@ -31,4 +37,6 @@ pub mod pipeline;
 pub mod renderer;
 pub mod session;
 pub mod tiles;
+pub mod touch;
 pub mod ui;
+pub mod yuv;

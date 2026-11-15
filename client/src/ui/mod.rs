@@ -10,7 +10,9 @@
 
 pub mod connect_form;
 pub mod diagnostics;
+pub mod keyboard;
 pub mod second_window;
+pub mod touch_view;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

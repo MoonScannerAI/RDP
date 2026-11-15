@@ -433,7 +433,7 @@ pub fn spawn_decode_thread(
 /// allocation — and it gives the tests a seam to count constructions with,
 /// which is the only way "no decoder is built until the first frame" is
 /// observable at all.
-type NewDecoder = fn() -> Result<Box<dyn Decoder>>;
+pub type NewDecoder = fn() -> Result<Box<dyn Decoder>>;
 
 /// A [`DecodeLoop`]'s decoder, which does not exist until the first frame.
 enum DecoderState {

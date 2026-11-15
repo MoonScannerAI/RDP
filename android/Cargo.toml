@@ -1,0 +1,23 @@
+[package]
+name = "directdesk-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The Android app: a NativeActivity cdylib whose `android_main` builds a
+# `directdesk_client::app::PlatformConfig` and calls `app::run`. On every other
+# target the crate compiles to an empty library (see `src/lib.rs`), so
+# workspace-wide clippy/test runs on Windows stay unaffected.
+#
+# Android-only dependencies MUST live under
+# `[target.'cfg(target_os = "android")'.dependencies]`: with resolver 2 their
+# features (eframe's `android-native-activity`, ...) then never unify into the
+# Windows client build.
+[lib]
+name = "directdesk_android"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+directdesk-client = { path = "../client" }
+directdesk-shared = { workspace = true }

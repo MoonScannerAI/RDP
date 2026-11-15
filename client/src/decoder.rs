@@ -20,10 +20,14 @@
 //! threads still hold references is a well-known crash source, and the process
 //! is exiting anyway.
 
+#[cfg(windows)]
 use std::collections::VecDeque;
 
 use directdesk_shared::error::{Error, Result};
-use directdesk_shared::traits::{Decoder, PixelFormat, RawFrame};
+use directdesk_shared::traits::Decoder;
+#[cfg(windows)]
+use directdesk_shared::traits::{PixelFormat, RawFrame};
+#[cfg(windows)]
 use directdesk_shared::video::EncodedFrame;
 
 // ---------------------------------------------------------------------------

@@ -629,6 +629,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "directdesk-android"
+version = "0.1.0"
+dependencies = [
+ "directdesk-client",
+ "directdesk-shared",
+]
+
+[[package]]
 name = "directdesk-client"
 version = "0.1.0"
 dependencies = [

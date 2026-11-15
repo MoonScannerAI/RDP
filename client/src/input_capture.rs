@@ -362,6 +362,7 @@ static HOOK_STATE: Mutex<HookState> = Mutex::new(HookState {
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 static RELEASE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static KEYS_FORWARDED: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
 static KEYS_SWALLOWED: AtomicU64 = AtomicU64::new(0);
 /// Every HC_ACTION the hook saw. Distinguishes "hook never fired" from
 /// "hook fired but the event was filtered" when diagnosing capture.
@@ -396,6 +397,7 @@ static SESSION_LIVE: AtomicBool = AtomicBool::new(false);
 ///
 /// Exactly one combination swallows: capture on, window in the background,
 /// background capture opted in, and a live session to send the key to.
+#[cfg(any(windows, test))]
 fn swallow_decision(
     capturing: bool,
     foreground: bool,
@@ -406,6 +408,7 @@ fn swallow_decision(
 }
 
 /// [`swallow_decision`] applied to the live statics.
+#[cfg(windows)]
 fn swallow_active() -> bool {
     swallow_decision(
         CAPTURING.load(Ordering::Relaxed),
@@ -1223,6 +1226,10 @@ pub struct InputCapture {
     /// is legacy `Event` too, and so is the second window's.
     keys: EguiKeyForwarder,
     last_error: Option<String>,
+    /// False on platforms with no low-level keyboard hook (Android): capture
+    /// is then purely the focused-window egui path plus explicit
+    /// [`Self::send_key`] calls, and `start_capture` never tries to start one.
+    use_hook: bool,
 }
 
 impl InputCapture {
@@ -1235,7 +1242,42 @@ impl InputCapture {
             hook: None,
             capture_requested: false,
             last_error: None,
+            use_hook: true,
         }
+    }
+
+    /// Capture without the low-level keyboard hook. Everything else — the
+    /// capture toggle, the egui key path, release-on-focus-loss, `ReleaseAll`
+    /// — behaves exactly as with [`Self::new`].
+    pub fn without_hook(tx: mpsc::Sender<InputMsg>) -> Self {
+        let mut capture = Self::new(tx);
+        capture.use_hook = false;
+        capture
+    }
+
+    /// The main window's pointer forwarder, for input sources that are not
+    /// egui pointer events (the touch layer drives it directly so it keeps the
+    /// drag latch, clamped release and move-flush-before-click guarantees).
+    pub fn pointer_mut(&mut self) -> &mut PointerForwarder {
+        &mut self.pointer
+    }
+
+    /// Send one key transition that did not come from egui (the on-screen
+    /// keyboard). Gated on capture exactly like [`Self::forward_key_events`].
+    /// Returns false if capture is off or the input channel is closed.
+    pub fn send_key(&mut self, scan_code: u16, extended: bool, down: bool) -> bool {
+        if !self.capture_requested {
+            return false;
+        }
+        let action = if down { KeyAction::Down } else { KeyAction::Up };
+        send_input(
+            &self.tx,
+            InputMsg::Event(InputEvent::Key {
+                scan_code,
+                extended,
+                action,
+            }),
+        )
     }
 
     /// Mirror "**any** DirectDesk window is the foreground window" into the
@@ -1302,7 +1344,7 @@ impl InputCapture {
         if self.capture_requested {
             return;
         }
-        if self.hook.is_none() {
+        if self.use_hook && self.hook.is_none() {
             match hook::HookThread::start() {
                 Ok(thread) => self.hook = Some(thread),
                 Err(e) => {
