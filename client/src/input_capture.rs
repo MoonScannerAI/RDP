@@ -1265,19 +1265,25 @@ impl InputCapture {
     /// Send one key transition that did not come from egui (the on-screen
     /// keyboard). Gated on capture exactly like [`Self::forward_key_events`].
     /// Returns false if capture is off or the input channel is closed.
+    /// Counted in [`Self::keys_forwarded`] like every other forwarded key, so
+    /// the diagnostics and metrics see on-screen typing too.
     pub fn send_key(&mut self, scan_code: u16, extended: bool, down: bool) -> bool {
         if !self.capture_requested {
             return false;
         }
         let action = if down { KeyAction::Down } else { KeyAction::Up };
-        send_input(
+        let ok = send_input(
             &self.tx,
             InputMsg::Event(InputEvent::Key {
                 scan_code,
                 extended,
                 action,
             }),
-        )
+        );
+        if ok {
+            KEYS_FORWARDED.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
     }
 
     /// Mirror "**any** DirectDesk window is the foreground window" into the
@@ -2248,5 +2254,46 @@ mod tests {
             map_button(egui::PointerButton::Extra2),
             Some(MouseButton::X2)
         );
+    }
+
+    /// The touch profile's guarantee: no key — on-screen or hardware — reaches
+    /// the host before capture starts, or after it stops.
+    #[test]
+    fn hookless_capture_sends_no_key_outside_capture() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut cap = InputCapture::without_hook(tx);
+        let a_down = egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert!(!cap.send_key(0x1E, false, true), "OSK key before capture");
+        cap.forward_key_events(std::slice::from_ref(&a_down));
+        assert!(drain(&mut rx).is_empty(), "nothing before capture");
+
+        cap.start_capture();
+        assert!(cap.is_capturing());
+        assert!(!cap.hook_active(), "no hook on the touch path");
+        assert!(cap.send_key(0x1E, false, true));
+        cap.forward_key_events(std::slice::from_ref(&a_down));
+        let keys = drain(&mut rx)
+            .into_iter()
+            .filter(|m| matches!(m, InputMsg::Event(InputEvent::Key { .. })))
+            .count();
+        assert_eq!(keys, 2, "one on-screen, one hardware");
+
+        cap.stop_capture();
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, InputMsg::ReleaseAll)),
+            "stopping releases everything"
+        );
+        assert!(!cap.send_key(0x1E, false, false));
+        cap.forward_key_events(&[a_down]);
+        assert!(drain(&mut rx).is_empty(), "nothing after capture");
     }
 }

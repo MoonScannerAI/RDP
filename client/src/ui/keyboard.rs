@@ -768,6 +768,12 @@ impl Keyboard {
         self.core.page
     }
 
+    /// A key is held (and may repeat). Phase 2: lets the app keep frames
+    /// coming for [`Self::tick`] on screens that do not repaint continuously.
+    pub fn is_holding(&self) -> bool {
+        self.core.is_holding()
+    }
+
     pub fn mod_state(&self, m: Mod) -> ModState {
         self.core.mod_state(m)
     }

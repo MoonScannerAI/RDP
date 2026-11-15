@@ -250,6 +250,13 @@ impl ConnectSupervisor {
         self.caps.preferred_fps = fps;
     }
 
+    /// Whether connects offer `MULTI_MONITOR` at all. When they do not (the
+    /// touch preset), no `MonitorList` can ever arrive, so the UI hides the
+    /// monitor picker rather than offer a choice that can only degrade.
+    pub fn offers_multi_monitor(&self) -> bool {
+        self.caps.multi_monitor
+    }
+
     /// Update the monitor choice the *next* `connect()` carries, for the same
     /// reason and with the same scope as [`set_preferred_fps`](Self::set_preferred_fps):
     /// it does not touch a currently-live connection. Calling it is what makes
