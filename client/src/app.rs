@@ -83,9 +83,12 @@ pub struct PlatformConfig {
 
 /// Run the client until its window closes.
 ///
-/// Safe to call more than once per process (Android can re-enter
-/// `android_main`): each call builds and tears down its own runtime, session
-/// and threads, and the config-directory override tolerates being set again.
+/// Call at most **once per process**. winit allows a single event loop per
+/// process (a process-wide flag that is never reset), so a second call fails
+/// with eframe's `RecreationAttempt`. Android can re-enter `android_main` in a
+/// live process when the activity is recreated; the Android entry therefore
+/// exits the process after `run` returns and refuses a second entry. (The
+/// config-directory override does tolerate being set again.)
 pub fn run(cfg: PlatformConfig) -> anyhow::Result<()> {
     let PlatformConfig {
         profile,
