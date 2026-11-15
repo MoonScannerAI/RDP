@@ -160,6 +160,57 @@ struct Active {
     join: JoinHandle<()>,
 }
 
+/// A cloneable, thread-safe way to stop the connection the supervisor has
+/// installed, for a thread that cannot borrow the supervisor: the touch
+/// profile's background watchdog, which runs exactly when the UI thread does
+/// not (Android has dropped the window, so no `disconnect` can happen there).
+///
+/// [`shut_down`](Self::shut_down) raises the same per-connection shutdown
+/// watch [`ConnectSupervisor::disconnect`] raises, so the driver closes
+/// gracefully (`Bye` to the host) and does not reconnect. It leaves the
+/// supervisor's own bookkeeping to the UI thread: the next
+/// [`ConnectSupervisor::connect`] or `disconnect` replaces it as usual.
+#[derive(Clone, Default)]
+pub struct DisconnectHandle {
+    installed: Arc<parking_lot::Mutex<Option<watch::Sender<bool>>>>,
+}
+
+impl DisconnectHandle {
+    /// A driver is installed, has not returned, and nobody has asked it to
+    /// stop. `run_client` holds the only receiver, so a closed watch means
+    /// it has exited.
+    pub fn is_running(&self) -> bool {
+        self.installed
+            .lock()
+            .as_ref()
+            .is_some_and(|tx| !tx.is_closed() && !*tx.borrow())
+    }
+
+    /// Ask the installed driver to stop. `None` when nothing was running.
+    pub fn shut_down(&self) -> Option<StoppingDriver> {
+        let installed = self.installed.lock();
+        let tx = installed
+            .as_ref()
+            .filter(|tx| !tx.is_closed() && !*tx.borrow())?;
+        tx.send_replace(true);
+        Some(StoppingDriver(tx.clone()))
+    }
+
+    fn install(&self, shutdown: Option<watch::Sender<bool>>) {
+        *self.installed.lock() = shutdown;
+    }
+}
+
+/// A driver [`DisconnectHandle::shut_down`] stopped, to wait out its graceful
+/// close independently of whatever the supervisor installs next.
+pub struct StoppingDriver(watch::Sender<bool>);
+
+impl StoppingDriver {
+    pub fn has_exited(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
 /// Drives `net::run_client` on a shared runtime in response to UI intent.
 pub struct ConnectSupervisor {
     rt: tokio::runtime::Handle,
@@ -187,6 +238,8 @@ pub struct ConnectSupervisor {
     control_target: watch::Sender<Option<mpsc::Sender<ControlMsg>>>,
 
     current: Option<Active>,
+    /// Mirrors `current`'s shutdown switch for other threads.
+    handle: DisconnectHandle,
 }
 
 impl ConnectSupervisor {
@@ -233,6 +286,7 @@ impl ConnectSupervisor {
             input_target,
             control_target,
             current: None,
+            handle: DisconnectHandle::default(),
         }
     }
 
@@ -240,6 +294,12 @@ impl ConnectSupervisor {
     /// reconnecting). Cleared by [`disconnect`](Self::disconnect).
     pub fn is_connected(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// A handle that can stop whichever connection is installed, from any
+    /// thread. See [`DisconnectHandle`].
+    pub fn disconnect_handle(&self) -> DisconnectHandle {
+        self.handle.clone()
     }
 
     /// Update the fps the *next* `connect()` carries (a fresh connect, or a
@@ -311,6 +371,7 @@ impl ConnectSupervisor {
         let params = request.into_params(self.caps);
         let store = self.store.clone();
         let (shutdown, shutdown_rx) = watch::channel(false);
+        self.handle.install(Some(shutdown.clone()));
         let join = self
             .rt
             .spawn(net::run_client(endpoints, params, store, shutdown_rx));
@@ -324,6 +385,7 @@ impl ConnectSupervisor {
     /// [`ConnectionState::Disconnected`] on the (supervisor-owned) state channel
     /// so the UI leaves the streaming view immediately.
     pub fn disconnect(&mut self) {
+        self.handle.install(None);
         if let Some(active) = self.current.take() {
             let _ = active.shutdown.send(true);
             let _ = self.input_target.send(None);
@@ -339,6 +401,7 @@ impl ConnectSupervisor {
     /// Hard-cancel any in-flight attempt without emitting UI state. Used on
     /// reconnect (a new attempt is about to install fresh state) and on drop.
     fn cancel_current(&mut self) {
+        self.handle.install(None);
         if let Some(active) = self.current.take() {
             let _ = active.shutdown.send(true);
             active.join.abort();
@@ -503,6 +566,54 @@ mod tests {
             last_route = r;
         }
         assert_eq!(last_route, None);
+    }
+
+    /// The handle stops the installed driver from another thread through the
+    /// driver's own shutdown watch, once, and reports when it has exited.
+    #[test]
+    fn the_disconnect_handle_stops_the_installed_driver_from_another_thread() {
+        let handle = DisconnectHandle::default();
+        assert!(!handle.is_running(), "nothing installed");
+        assert!(handle.shut_down().is_none());
+
+        // Stand-in for `run_client`: it owns the only receiver.
+        let (tx, mut rx) = watch::channel(false);
+        handle.install(Some(tx));
+        assert!(handle.is_running());
+
+        let remote = handle.clone();
+        let stopping = std::thread::spawn(move || remote.shut_down())
+            .join()
+            .unwrap()
+            .expect("a running driver was stopped");
+        assert!(*rx.borrow_and_update(), "the driver sees the shutdown");
+        assert!(!handle.is_running(), "asked to stop: no longer running");
+        assert!(handle.shut_down().is_none(), "never asked twice");
+        assert!(!stopping.has_exited());
+        drop(rx); // `run_client` returns
+        assert!(stopping.has_exited());
+    }
+
+    /// The supervisor keeps the handle pointing at exactly the driver it has
+    /// installed: a new one on connect, none after disconnect.
+    #[test]
+    fn the_disconnect_handle_follows_connect_and_disconnect() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_session, mut sup) = supervisor(&rt);
+        let handle = sup.disconnect_handle();
+        sup.connect(request());
+        let first = handle.installed.lock().clone().expect("installed");
+        sup.connect(request());
+        let second = handle.installed.lock().clone().expect("installed");
+        assert!(
+            !first.same_channel(&second),
+            "a reconnect installs a new driver"
+        );
+        assert!(*first.borrow(), "the replaced driver was told to stop");
+        sup.disconnect();
+        assert!(handle.installed.lock().is_none());
+        assert!(!handle.is_running());
+        assert!(handle.shut_down().is_none());
     }
 
     #[test]

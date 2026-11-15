@@ -1,18 +1,24 @@
 //! The touch profile's app-shell glue that is pure enough to unit test: the
 //! focus-flicker debounce, Back-key handling, the keyboard/video split, the
 //! filter that keeps overlay touches away from the video, the compact
-//! toolbar's auto-hide, and (Windows test aid) mouse-to-touch synthesis.
+//! toolbar's auto-hide, the background watchdog and its reconnect-on-resume,
+//! and (Windows test aid) mouse-to-touch synthesis.
 //!
 //! Owned by the Phase-2 integrator. Everything here is inert in
 //! `UiProfile::Desktop`: `ClientApp` only calls into it when the profile is
 //! `Touch`.
 
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use egui::{Event, Pos2, Rect, TouchPhase};
 
 /// Minimum touch target, in points, for anything the touch profile draws.
 pub const TOUCH_TARGET_PTS: f32 = 36.0;
+
+/// Height of the connect screen's sticky action row (the Connect button and
+/// the form error), which stays above the on-screen keyboard.
+pub const ACTION_ROW_PTS: f32 = TOUCH_TARGET_PTS + 8.0;
 
 /// How long the expanded toolbar stays up without being touched.
 pub const TOOLBAR_AUTO_HIDE: Duration = Duration::from_secs(5);
@@ -143,6 +149,19 @@ pub fn split_for_keyboard(area: Rect, keyboard_h: f32) -> (Rect, Option<Rect>) {
     )
 }
 
+/// Split the connect screen's form area into (scrolling form, sticky action
+/// row at its bottom). The row keeps its height even when that leaves the
+/// form nothing: the Connect button is the one thing that must stay
+/// reachable with the keyboard up.
+pub fn split_action_row(area: Rect, row_h: f32) -> (Rect, Rect) {
+    let h = row_h.min(area.height()).max(0.0);
+    let y = area.max.y - h;
+    (
+        Rect::from_min_max(area.min, egui::pos2(area.max.x, y)),
+        Rect::from_min_max(egui::pos2(area.min.x, y), area.max),
+    )
+}
+
 /// On the connect screen, does a click at `click` drop text focus? Not when it
 /// lands on the keyboard (that is how you type) or on a text field (egui moves
 /// focus there itself).
@@ -261,6 +280,261 @@ impl ToolbarState {
         self.shown_until
             .filter(|t| now < *t)
             .map(|t| t.duration_since(now))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background watchdog
+// ---------------------------------------------------------------------------
+//
+// On Android, Home or screen-off makes winit drop the window, and eframe stops
+// calling `logic`/`ui` altogether — but the transport driver, MediaCodec and
+// the YUV conversion keep running, and the host keeps a session open. The UI
+// cannot notice (it is not running), so a watchdog thread does: every frame
+// the UI stamps a heartbeat, and a session whose heartbeat has gone stale is
+// ended from the watchdog. On the first frame after resume the UI reconnects
+// once to the same host.
+//
+// Threshold, not an event: a stale heartbeat with a session up really means
+// "no window" — a live session repaints at >= 4 Hz (the host repeats a frame
+// at least every 250 ms) and the touch UI asks for a frame every
+// `HEARTBEAT_REPAINT` whenever a driver is running — and 20 s leaves a wide
+// margin over any frame hitch. No driver, no action: an idle connect screen
+// never triggers anything however long it sits unpainted.
+
+/// A session whose UI has not drawn for this long is ended.
+pub const BACKGROUND_DISCONNECT_AFTER: Duration = Duration::from_secs(20);
+
+/// How often the watchdog thread looks.
+pub const BACKGROUND_WATCHDOG_POLL: Duration = Duration::from_secs(1);
+
+/// The longest the watchdog waits for an ended driver to finish its graceful
+/// close (`Bye` + a 2 s drain) before reporting it ended anyway. A driver
+/// stuck in a handshake only notices the shutdown when the handshake ends;
+/// the reconnect then aborts whatever is left of it.
+pub const DRIVER_WIND_DOWN_MAX: Duration = Duration::from_secs(5);
+
+/// While a transport driver is running, the touch UI asks for a frame at
+/// least this often, so the heartbeat stays fresh on screens that do not
+/// repaint by themselves (a failed-and-retrying session).
+pub const HEARTBEAT_REPAINT: Duration = Duration::from_secs(2);
+
+/// The status shown from resume until the reconnect resolves.
+pub const RECONNECTING_AFTER_BACKGROUND: &str = "Reconnecting after background…";
+
+/// What the watchdog has done, as the UI learns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogReport {
+    /// Nothing to report.
+    Idle,
+    /// It ended the session for being in the background; the driver is still
+    /// winding down.
+    Ending,
+    /// It ended the session for being in the background and the driver has
+    /// gone (or [`DRIVER_WIND_DOWN_MAX`] passed). Consumed by the UI.
+    Ended,
+}
+
+const REPORT_IDLE: u8 = 0;
+const REPORT_ENDING: u8 = 1;
+const REPORT_ENDED: u8 = 2;
+
+/// The state the UI thread and the watchdog thread share: the heartbeat and
+/// the watchdog's report. Lock-free; clocks are injected (`now`) so the logic
+/// is testable without sleeping.
+#[derive(Debug)]
+pub struct BackgroundShared {
+    epoch: Instant,
+    /// Milliseconds after `epoch` of the UI's last frame.
+    heartbeat_ms: AtomicU64,
+    report: AtomicU8,
+}
+
+impl BackgroundShared {
+    /// Counts as a heartbeat at `epoch`.
+    pub fn new(epoch: Instant) -> Self {
+        Self {
+            epoch,
+            heartbeat_ms: AtomicU64::new(0),
+            report: AtomicU8::new(REPORT_IDLE),
+        }
+    }
+
+    fn ms(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The UI drew a frame at `now`.
+    pub fn beat(&self, now: Instant) {
+        self.heartbeat_ms.fetch_max(self.ms(now), Ordering::Relaxed);
+    }
+
+    /// Time since the UI's last frame.
+    pub fn heartbeat_age(&self, now: Instant) -> Duration {
+        let last = self.heartbeat_ms.load(Ordering::Relaxed);
+        Duration::from_millis(self.ms(now).saturating_sub(last))
+    }
+
+    fn set_report(&self, report: WatchdogReport) {
+        let v = match report {
+            WatchdogReport::Idle => REPORT_IDLE,
+            WatchdogReport::Ending => REPORT_ENDING,
+            WatchdogReport::Ended => REPORT_ENDED,
+        };
+        self.report.store(v, Ordering::Release);
+    }
+
+    /// The watchdog's report, consuming an `Ended` (it is acted on once);
+    /// `Ending` stays until the watchdog moves it on.
+    pub fn take_report(&self) -> WatchdogReport {
+        match self.report.compare_exchange(
+            REPORT_ENDED,
+            REPORT_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => WatchdogReport::Ended,
+            Err(REPORT_ENDING) => WatchdogReport::Ending,
+            Err(_) => WatchdogReport::Idle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogAction {
+    Nothing,
+    /// End the running session now (release input, graceful close, no
+    /// reconnect).
+    Disconnect,
+    /// The session ended by `Disconnect` is gone.
+    Settled,
+}
+
+/// The watchdog thread's decisions. `driver_alive` is, before a disconnect,
+/// "a transport driver is running and nobody asked it to stop yet"; after
+/// one, "the driver that was stopped has not exited yet".
+#[derive(Debug, Default)]
+pub struct BackgroundWatchdog {
+    ending_since: Option<Instant>,
+}
+
+impl BackgroundWatchdog {
+    /// Pure decision for one poll.
+    pub fn poll(
+        &mut self,
+        now: Instant,
+        heartbeat_age: Duration,
+        driver_alive: bool,
+    ) -> WatchdogAction {
+        if let Some(since) = self.ending_since {
+            if !driver_alive || now.saturating_duration_since(since) >= DRIVER_WIND_DOWN_MAX {
+                self.ending_since = None;
+                return WatchdogAction::Settled;
+            }
+            return WatchdogAction::Nothing;
+        }
+        if driver_alive && heartbeat_age >= BACKGROUND_DISCONNECT_AFTER {
+            self.ending_since = Some(now);
+            return WatchdogAction::Disconnect;
+        }
+        WatchdogAction::Nothing
+    }
+
+    /// [`poll`](Self::poll) against the shared state, publishing the report
+    /// before the caller acts: `Ending` is visible before the driver is told
+    /// to stop, so a UI resuming mid-way never mistakes it for a plain drop.
+    pub fn step(
+        &mut self,
+        shared: &BackgroundShared,
+        now: Instant,
+        driver_alive: bool,
+    ) -> WatchdogAction {
+        let action = self.poll(now, shared.heartbeat_age(now), driver_alive);
+        match action {
+            WatchdogAction::Disconnect => shared.set_report(WatchdogReport::Ending),
+            WatchdogAction::Settled => shared.set_report(WatchdogReport::Ended),
+            WatchdogAction::Nothing => {}
+        }
+        action
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResumePhase {
+    /// Nothing owed.
+    #[default]
+    Idle,
+    /// Back in the foreground while the watchdog is still winding the old
+    /// driver down; the reconnect follows its `Ended`.
+    Waiting,
+    /// The one reconnect was issued; shown until it resolves.
+    Reconnecting,
+    /// Cancelled while `Waiting`: the coming `Ended` is swallowed.
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeAction {
+    None,
+    /// Reconnect once, to the same host, with the saved pairing (no code).
+    Reconnect,
+}
+
+/// The UI side: background-disconnected -> resumed -> reconnect once.
+#[derive(Debug, Default)]
+pub struct ResumeAfterBackground {
+    phase: ResumePhase,
+}
+
+impl ResumeAfterBackground {
+    pub fn phase(&self) -> ResumePhase {
+        self.phase
+    }
+
+    /// Once per UI frame, after the inbound channels are drained. `report`
+    /// comes from [`BackgroundShared::take_report`]; `connecting` is "an
+    /// attempt is in flight" (Connecting / Authenticating).
+    pub fn on_frame(&mut self, report: WatchdogReport, connecting: bool) -> ResumeAction {
+        match report {
+            WatchdogReport::Ending => {
+                if self.phase != ResumePhase::Cancelled {
+                    self.phase = ResumePhase::Waiting;
+                }
+                ResumeAction::None
+            }
+            WatchdogReport::Ended => {
+                if self.phase == ResumePhase::Cancelled {
+                    self.phase = ResumePhase::Idle;
+                    ResumeAction::None
+                } else {
+                    self.phase = ResumePhase::Reconnecting;
+                    ResumeAction::Reconnect
+                }
+            }
+            WatchdogReport::Idle => {
+                // Live, failed, or back on the form: the reconnect resolved.
+                if self.phase == ResumePhase::Reconnecting && !connecting {
+                    self.phase = ResumePhase::Idle;
+                }
+                ResumeAction::None
+            }
+        }
+    }
+
+    /// The operator backed out (Cancel on the waiting screen, or the
+    /// reconnect could not even be started).
+    pub fn cancel(&mut self) {
+        self.phase = match self.phase {
+            ResumePhase::Waiting => ResumePhase::Cancelled,
+            ResumePhase::Reconnecting => ResumePhase::Idle,
+            other => other,
+        };
+    }
+
+    /// The status line to show, if any.
+    pub fn status(&self) -> Option<&'static str> {
+        matches!(self.phase, ResumePhase::Waiting | ResumePhase::Reconnecting)
+            .then_some(RECONNECTING_AFTER_BACKGROUND)
     }
 }
 
@@ -621,6 +895,273 @@ mod tests {
         t.show(t0);
         t.hide();
         assert!(!t.is_expanded(t0));
+    }
+
+    // -- connect screen action row --------------------------------------------
+
+    #[test]
+    fn the_action_row_sits_at_the_bottom_of_the_form_area_above_the_keyboard() {
+        // A 865x411 phone in landscape with the keyboard up.
+        let screen = Rect::from_min_max(pos2(0.0, 0.0), pos2(865.0, 411.0));
+        let kb_h = crate::ui::keyboard::total_height(screen);
+        let (form, kb) = split_for_keyboard(screen, kb_h);
+        let kb = kb.expect("keyboard strip");
+        let (scroll, row) = split_action_row(form, ACTION_ROW_PTS);
+        assert_eq!(row.max.y, kb.min.y, "the row sits right on the keyboard");
+        assert!(!row.intersects(kb.shrink(0.5)), "and never under it");
+        assert_eq!(row.height(), ACTION_ROW_PTS);
+        assert!(
+            row.height() >= TOUCH_TARGET_PTS,
+            "a finger-sized button fits"
+        );
+        assert_eq!(scroll.max.y, row.min.y);
+        // Room left for a focused finger-height field to be scrolled into.
+        assert!(scroll.height() >= 2.0 * TOUCH_TARGET_PTS, "{scroll:?}");
+    }
+
+    #[test]
+    fn a_tiny_form_area_still_keeps_the_whole_action_row() {
+        let area = Rect::from_min_max(pos2(0.0, 0.0), pos2(300.0, 20.0));
+        let (scroll, row) = split_action_row(area, ACTION_ROW_PTS);
+        assert_eq!(scroll.height(), 0.0);
+        assert_eq!(row, area);
+    }
+
+    // -- background watchdog --------------------------------------------------
+
+    fn secs(s: f32) -> Duration {
+        Duration::from_secs_f32(s)
+    }
+
+    #[test]
+    fn the_heartbeat_age_follows_the_last_beat() {
+        let t0 = Instant::now();
+        let hb = BackgroundShared::new(t0);
+        assert_eq!(hb.heartbeat_age(t0), Duration::ZERO, "construction counts");
+        assert_eq!(hb.heartbeat_age(t0 + secs(3.0)), secs(3.0));
+        hb.beat(t0 + secs(10.0));
+        assert_eq!(hb.heartbeat_age(t0 + secs(10.0)), Duration::ZERO);
+        assert_eq!(hb.heartbeat_age(t0 + secs(12.5)), secs(2.5));
+        // A beat from a thread with an older `now` never moves it back.
+        hb.beat(t0 + secs(4.0));
+        assert_eq!(hb.heartbeat_age(t0 + secs(12.5)), secs(2.5));
+        // A `now` before the beat (clock read before the store) is age 0.
+        assert_eq!(hb.heartbeat_age(t0 + secs(9.0)), Duration::ZERO);
+    }
+
+    #[test]
+    fn an_idle_connect_screen_never_triggers_anything() {
+        let t0 = Instant::now();
+        let shared = BackgroundShared::new(t0);
+        let mut dog = BackgroundWatchdog::default();
+        // No driver: hours without a frame are fine.
+        for s in [1.0, 20.0, 21.0, 600.0, 36_000.0] {
+            assert_eq!(
+                dog.step(&shared, t0 + secs(s), false),
+                WatchdogAction::Nothing
+            );
+        }
+        assert_eq!(shared.take_report(), WatchdogReport::Idle);
+    }
+
+    #[test]
+    fn a_foreground_session_is_never_ended() {
+        let t0 = Instant::now();
+        let shared = BackgroundShared::new(t0);
+        let mut dog = BackgroundWatchdog::default();
+        // Frames every 250 ms (or every HEARTBEAT_REPAINT) for a minute.
+        let mut t = t0;
+        while t < t0 + secs(60.0) {
+            shared.beat(t);
+            t += HEARTBEAT_REPAINT;
+            assert_eq!(dog.step(&shared, t, true), WatchdogAction::Nothing);
+        }
+    }
+
+    #[test]
+    fn a_stale_heartbeat_ends_a_running_session_once_at_the_threshold() {
+        let t0 = Instant::now();
+        let shared = BackgroundShared::new(t0);
+        shared.beat(t0 + secs(5.0)); // last frame, then Home
+        let mut dog = BackgroundWatchdog::default();
+        assert_eq!(
+            dog.step(&shared, t0 + secs(24.9), true),
+            WatchdogAction::Nothing,
+            "19.9 s is not enough"
+        );
+        assert_eq!(
+            dog.step(&shared, t0 + secs(25.0), true),
+            WatchdogAction::Disconnect
+        );
+        assert_eq!(shared.take_report(), WatchdogReport::Ending);
+        assert_eq!(
+            shared.take_report(),
+            WatchdogReport::Ending,
+            "Ending is not consumed"
+        );
+        // Winding down: never a second disconnect.
+        assert_eq!(
+            dog.step(&shared, t0 + secs(26.0), true),
+            WatchdogAction::Nothing
+        );
+        assert_eq!(
+            dog.step(&shared, t0 + secs(27.0), false),
+            WatchdogAction::Settled
+        );
+        assert_eq!(shared.take_report(), WatchdogReport::Ended);
+        assert_eq!(shared.take_report(), WatchdogReport::Idle, "consumed once");
+        // Still no window, but nothing is running any more.
+        assert_eq!(
+            dog.step(&shared, t0 + secs(90.0), false),
+            WatchdogAction::Nothing
+        );
+    }
+
+    #[test]
+    fn a_driver_that_will_not_exit_is_reported_ended_after_the_cap() {
+        let t0 = Instant::now();
+        let shared = BackgroundShared::new(t0);
+        let mut dog = BackgroundWatchdog::default();
+        let fire = t0 + BACKGROUND_DISCONNECT_AFTER;
+        assert_eq!(dog.step(&shared, fire, true), WatchdogAction::Disconnect);
+        assert_eq!(
+            dog.step(&shared, fire + DRIVER_WIND_DOWN_MAX - secs(0.1), true),
+            WatchdogAction::Nothing
+        );
+        assert_eq!(
+            dog.step(&shared, fire + DRIVER_WIND_DOWN_MAX, true),
+            WatchdogAction::Settled
+        );
+        assert_eq!(shared.take_report(), WatchdogReport::Ended);
+    }
+
+    #[test]
+    fn resuming_after_a_background_disconnect_reconnects_exactly_once() {
+        let mut r = ResumeAfterBackground::default();
+        assert_eq!(r.status(), None);
+        // The first frame after resume sees the watchdog's report.
+        assert_eq!(
+            r.on_frame(WatchdogReport::Ended, false),
+            ResumeAction::Reconnect
+        );
+        assert_eq!(r.status(), Some(RECONNECTING_AFTER_BACKGROUND));
+        // The attempt is in flight: status stays, no second reconnect.
+        for _ in 0..5 {
+            assert_eq!(r.on_frame(WatchdogReport::Idle, true), ResumeAction::None);
+            assert_eq!(r.status(), Some(RECONNECTING_AFTER_BACKGROUND));
+        }
+        // Live (or failed, or cancelled): done.
+        assert_eq!(r.on_frame(WatchdogReport::Idle, false), ResumeAction::None);
+        assert_eq!(r.phase(), ResumePhase::Idle);
+        assert_eq!(r.status(), None);
+        assert_eq!(r.on_frame(WatchdogReport::Idle, false), ResumeAction::None);
+    }
+
+    #[test]
+    fn resuming_mid_wind_down_waits_then_reconnects_once() {
+        let mut r = ResumeAfterBackground::default();
+        for _ in 0..3 {
+            assert_eq!(
+                r.on_frame(WatchdogReport::Ending, false),
+                ResumeAction::None
+            );
+            assert_eq!(r.phase(), ResumePhase::Waiting);
+            assert_eq!(r.status(), Some(RECONNECTING_AFTER_BACKGROUND));
+        }
+        assert_eq!(
+            r.on_frame(WatchdogReport::Ended, false),
+            ResumeAction::Reconnect
+        );
+        assert_eq!(r.phase(), ResumePhase::Reconnecting);
+    }
+
+    #[test]
+    fn cancelling_while_waiting_swallows_the_reconnect() {
+        let mut r = ResumeAfterBackground::default();
+        r.on_frame(WatchdogReport::Ending, false);
+        r.cancel();
+        assert_eq!(r.status(), None, "the form is back");
+        assert_eq!(
+            r.on_frame(WatchdogReport::Ending, false),
+            ResumeAction::None
+        );
+        assert_eq!(r.on_frame(WatchdogReport::Ended, false), ResumeAction::None);
+        assert_eq!(r.phase(), ResumePhase::Idle);
+        // A later background disconnect is acted on again.
+        assert_eq!(
+            r.on_frame(WatchdogReport::Ended, false),
+            ResumeAction::Reconnect
+        );
+        r.cancel();
+        assert_eq!(r.phase(), ResumePhase::Idle);
+    }
+
+    /// The whole loop on injected clocks, through the shared state exactly as
+    /// the two threads use it: live -> background-disconnected -> resumed ->
+    /// reconnect once -> live -> background again -> reconnect once more.
+    #[test]
+    fn live_background_resume_reconnect_cycle() {
+        let t0 = Instant::now();
+        let shared = BackgroundShared::new(t0);
+        let mut dog = BackgroundWatchdog::default();
+        let mut ui = ResumeAfterBackground::default();
+        let mut reconnects = 0;
+        let mut driver_alive = true;
+
+        // Live, foreground, for 30 s: the UI beats and sees nothing.
+        let mut t = t0;
+        while t < t0 + secs(30.0) {
+            shared.beat(t);
+            assert_eq!(ui.on_frame(shared.take_report(), false), ResumeAction::None);
+            t += secs(0.25);
+            assert_eq!(dog.step(&shared, t, driver_alive), WatchdogAction::Nothing);
+        }
+        // Home: no more frames. The watchdog polls every second.
+        let home = t;
+        let mut fired_at = None;
+        while t < home + secs(60.0) {
+            t += BACKGROUND_WATCHDOG_POLL;
+            match dog.step(&shared, t, driver_alive) {
+                WatchdogAction::Disconnect => fired_at = Some(t),
+                // The driver's graceful close takes a second or two.
+                WatchdogAction::Nothing if fired_at.is_some() => driver_alive = false,
+                _ => {}
+            }
+        }
+        let fired_at = fired_at.expect("ended while backgrounded");
+        assert!(fired_at - home >= BACKGROUND_DISCONNECT_AFTER);
+        assert!(fired_at - home < BACKGROUND_DISCONNECT_AFTER + secs(1.5));
+
+        // Resume: the first frame reconnects, the next ones do not.
+        shared.beat(t);
+        if ui.on_frame(shared.take_report(), false) == ResumeAction::Reconnect {
+            reconnects += 1;
+            driver_alive = true;
+        }
+        for _ in 0..20 {
+            t += secs(0.25);
+            shared.beat(t);
+            if ui.on_frame(shared.take_report(), true) == ResumeAction::Reconnect {
+                reconnects += 1;
+            }
+            assert_eq!(dog.step(&shared, t, driver_alive), WatchdogAction::Nothing);
+        }
+        assert_eq!(reconnects, 1);
+        ui.on_frame(shared.take_report(), false); // went live
+        assert_eq!(ui.status(), None);
+
+        // And the cycle repeats on the next trip to the background.
+        let home = t;
+        while t < home + secs(30.0) {
+            t += BACKGROUND_WATCHDOG_POLL;
+            if dog.step(&shared, t, driver_alive) == WatchdogAction::Disconnect {
+                driver_alive = false;
+            }
+        }
+        assert_eq!(
+            ui.on_frame(shared.take_report(), false),
+            ResumeAction::Reconnect
+        );
     }
 
     // -- mouse -> touch ---------------------------------------------------------

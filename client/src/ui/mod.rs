@@ -38,16 +38,16 @@ pub mod second_window;
 pub mod touch_shell;
 pub mod touch_view;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use directdesk_shared::protocol::{ControlMsg, MonitorInfo, QualityMode};
+use directdesk_shared::protocol::{ControlMsg, InputMsg, MonitorInfo, QualityMode};
 use directdesk_shared::stats::{validate_stats, ConnStats, TransportRoute};
 use parking_lot::Mutex;
 
 use crate::app::UiProfile;
 use crate::config::ClientConfig;
-use crate::connect::ConnectSupervisor;
+use crate::connect::{ConnectSupervisor, DisconnectHandle, StoppingDriver};
 use crate::input_capture::{chord_pressed, CaptureLoss, InputCapture, RELEASE_CHORD};
 use crate::monitors::{self, MonitorChoice};
 use crate::pipeline::{Pipeline, SourceStatus};
@@ -59,9 +59,11 @@ use crate::ui::second_window::SecondaryShared;
 #[cfg(not(target_os = "android"))]
 use crate::ui::touch_shell::MouseTouchSynth;
 use crate::ui::touch_shell::{
-    back_action, click_dismisses_text_focus, split_for_keyboard, strip_back_key,
-    touch_wants_capture, without_injected, BackAction, FocusDebounce, FocusEdge,
-    OverlayTouchFilter, ToolbarState, TOUCH_TARGET_PTS,
+    back_action, click_dismisses_text_focus, split_action_row, split_for_keyboard, strip_back_key,
+    touch_wants_capture, without_injected, BackAction, BackgroundShared, BackgroundWatchdog,
+    FocusDebounce, FocusEdge, OverlayTouchFilter, ResumeAction, ResumeAfterBackground,
+    ToolbarState, WatchdogAction, ACTION_ROW_PTS, BACKGROUND_WATCHDOG_POLL, HEARTBEAT_REPAINT,
+    TOUCH_TARGET_PTS,
 };
 use crate::ui::touch_view::TouchView;
 
@@ -99,6 +101,87 @@ pub enum SourceMode {
     Live,
     /// `--loopback-demo`: synthetic frames, no decode, no network.
     LoopbackDemo,
+}
+
+/// How long the watchdog lets a `ReleaseAll` reach the wire before it raises
+/// the shutdown that ends the session (the two travel different paths into
+/// the driver, and the driver's `select!` has no order between them).
+const RELEASE_BEFORE_BYE: Duration = Duration::from_millis(150);
+
+/// Touch: the UI's half of the background watchdog (see
+/// `touch_shell::BackgroundWatchdog`). The thread holds only a `Weak` to the
+/// shared state, so dropping this (with the app) ends it within a poll.
+struct BackgroundGuard {
+    shared: Arc<BackgroundShared>,
+    driver: DisconnectHandle,
+}
+
+impl BackgroundGuard {
+    /// Start the watchdog thread. `None` (logged) if it cannot be spawned:
+    /// the app then simply behaves as before.
+    fn start(
+        driver: DisconnectHandle,
+        input_tx: tokio::sync::mpsc::Sender<InputMsg>,
+    ) -> Option<Self> {
+        let shared = Arc::new(BackgroundShared::new(Instant::now()));
+        let weak = Arc::downgrade(&shared);
+        let thread_driver = driver.clone();
+        let spawned = std::thread::Builder::new()
+            .name("directdesk-bg-watchdog".into())
+            .spawn(move || background_watchdog(weak, thread_driver, input_tx));
+        match spawned {
+            Ok(_) => Some(Self { shared, driver }),
+            Err(e) => {
+                tracing::error!("could not start the background watchdog: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// The watchdog thread: ends a session whose UI has stopped drawing (the app
+/// is in the background) the way the UI's own Disconnect would — input
+/// released on the host, a graceful close with `Bye`, no reconnect — then
+/// reports it once the driver has gone, for the reconnect on resume.
+fn background_watchdog(
+    shared: Weak<BackgroundShared>,
+    driver: DisconnectHandle,
+    input_tx: tokio::sync::mpsc::Sender<InputMsg>,
+) {
+    let mut dog = BackgroundWatchdog::default();
+    let mut stopping: Option<StoppingDriver> = None;
+    loop {
+        std::thread::sleep(BACKGROUND_WATCHDOG_POLL);
+        let Some(shared) = shared.upgrade() else {
+            return; // the app is gone
+        };
+        let now = Instant::now();
+        let alive = match &stopping {
+            Some(s) => !s.has_exited(),
+            None => driver.is_running(),
+        };
+        match dog.step(&shared, now, alive) {
+            WatchdogAction::Nothing => {}
+            WatchdogAction::Disconnect => {
+                tracing::info!(
+                    no_frame_for = ?shared.heartbeat_age(now),
+                    "touch: the app is in the background — ending the session \
+                     (disconnected because backgrounded)"
+                );
+                // Lift anything the host holds for us before the session goes.
+                let _ = input_tx.try_send(InputMsg::ReleaseAll);
+                std::thread::sleep(RELEASE_BEFORE_BYE);
+                stopping = driver.shut_down();
+            }
+            WatchdogAction::Settled => {
+                tracing::info!(
+                    exited = stopping.as_ref().is_none_or(StoppingDriver::has_exited),
+                    "touch: background disconnect complete; reconnecting on resume"
+                );
+                stopping = None;
+            }
+        }
+    }
 }
 
 pub struct AppInit {
@@ -307,6 +390,13 @@ pub struct ClientApp {
     /// Scroll the focused field into view on its next draw (the keyboard just
     /// took the bottom of the screen, or focus moved).
     connect_scroll_pending: bool,
+    /// The connect form's "Advanced" section (UDP port) is expanded.
+    touch_advanced_open: bool,
+    /// The heartbeat + watchdog that end a session left running in the
+    /// background. `None` without a transport (nothing to end).
+    background: Option<BackgroundGuard>,
+    /// Reconnect-once-on-resume after the watchdog ended a session.
+    bg_resume: ResumeAfterBackground,
     /// `--touch-ui` on Windows: the mouse plays a single finger.
     #[cfg(not(target_os = "android"))]
     mouse_touch: MouseTouchSynth,
@@ -372,6 +462,14 @@ impl ClientApp {
                 sup.set_monitor_choice(init.config.monitor_choice);
             }
         }
+        // Touch: end sessions left running in the background (Android drops
+        // the window and stops calling us; the transport would not notice).
+        let background = match (profile, supervisor.as_ref()) {
+            (UiProfile::Touch, Some(sup)) => {
+                BackgroundGuard::start(sup.disconnect_handle(), input_tx.clone())
+            }
+            _ => None,
+        };
 
         // Lossless refinement tiles. The store belongs to the pipeline (the
         // decode thread paints from it and is spawned before this app exists);
@@ -460,6 +558,9 @@ impl ClientApp {
             connect_text_edits: Vec::new(),
             connect_focus: None,
             connect_scroll_pending: false,
+            touch_advanced_open: false,
+            background,
+            bg_resume: ResumeAfterBackground::default(),
             #[cfg(not(target_os = "android"))]
             mouse_touch: MouseTouchSynth::default(),
         }
@@ -1537,26 +1638,7 @@ impl ClientApp {
                     ui.end_row();
 
                     ui.label("Quality");
-                    let current = self.config.quality_mode;
-                    let mut chosen = current;
-                    egui::ComboBox::from_id_salt("quality")
-                        .selected_text(current.label())
-                        .show_ui(ui, |ui| {
-                            for mode in [
-                                QualityMode::TextDesktop,
-                                QualityMode::Balanced,
-                                QualityMode::Motion,
-                                QualityMode::LowBandwidth,
-                            ] {
-                                if ui.selectable_label(current == mode, mode.label()).clicked() {
-                                    chosen = mode;
-                                }
-                            }
-                        });
-                    if chosen != current {
-                        self.config.quality_mode = chosen;
-                        self.session.send_control(ControlMsg::QualityChange(chosen));
-                    }
+                    self.quality_combo(ui);
                     ui.end_row();
 
                     // Hidden where connects never offer multi-monitor (the
@@ -1648,6 +1730,30 @@ impl ClientApp {
         });
     }
 
+    /// The connect form's quality picker (both profiles).
+    fn quality_combo(&mut self, ui: &mut egui::Ui) {
+        let current = self.config.quality_mode;
+        let mut chosen = current;
+        egui::ComboBox::from_id_salt("quality")
+            .selected_text(current.label())
+            .show_ui(ui, |ui| {
+                for mode in [
+                    QualityMode::TextDesktop,
+                    QualityMode::Balanced,
+                    QualityMode::Motion,
+                    QualityMode::LowBandwidth,
+                ] {
+                    if ui.selectable_label(current == mode, mode.label()).clicked() {
+                        chosen = mode;
+                    }
+                }
+            });
+        if chosen != current {
+            self.config.quality_mode = chosen;
+            self.session.send_control(ControlMsg::QualityChange(chosen));
+        }
+    }
+
     /// Shown while the transport driver is racing routes and running the
     /// handshake: a spinner and the live lifecycle label, plus a way out.
     fn connecting_view(&mut self, ui: &mut egui::Ui) {
@@ -1657,6 +1763,10 @@ impl ClientApp {
             ui.add_space(16.0);
             ui.heading(self.state.label());
             ui.weak(format!("Host {}", self.config.host_address));
+            // Touch: the attempt is the automatic one after a resume.
+            if let Some(status) = self.bg_resume.status().filter(|_| self.is_touch()) {
+                ui.weak(status);
+            }
             ui.add_space(20.0);
             if ui.button("Cancel").clicked() {
                 self.disconnect();
@@ -1747,6 +1857,14 @@ impl ClientApp {
         if let Some(supervisor) = self.supervisor.as_mut() {
             supervisor.disconnect();
         }
+        self.reset_after_disconnect();
+    }
+
+    /// The UI half of [`disconnect`](Self::disconnect): everything but telling
+    /// the supervisor. The touch reconnect-after-background uses it alone, so
+    /// the `connect` that follows *aborts* whatever is left of the old driver
+    /// rather than detaching it.
+    fn reset_after_disconnect(&mut self) {
         // Touch: lift fingers and keys before capture (and with it the
         // ability to send their releases) goes.
         self.touch_session_end();
@@ -1914,8 +2032,11 @@ impl ClientApp {
         self.input.pump();
     }
 
-    /// The touch connect screen: the usual form in a scroll area, with the
-    /// on-screen keyboard (target Local) below it whenever a field has focus.
+    /// The touch connect screen, laid out for a phone with the on-screen
+    /// keyboard (target Local) up whenever a field has focus: a compact form
+    /// in a scroll area that ends at the keyboard (the focused field is
+    /// scrolled into it), and a sticky action row between the two that keeps
+    /// Pair & Connect reachable.
     fn touch_connect_screen(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let now = Instant::now();
@@ -1931,12 +2052,20 @@ impl ClientApp {
         let full = ui.available_rect_before_wrap();
         let (form_area, keyboard_area) =
             split_for_keyboard(full, self.keyboard.desired_height(ctx.content_rect()));
+        let (scroll_area, action_area) = split_action_row(form_area, ACTION_ROW_PTS);
         self.connect_text_edits.clear();
-        ui.scope_builder(egui::UiBuilder::new().max_rect(form_area), |ui| {
+        let mut submit = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_area), |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| self.connect_screen(ui));
+                .show(ui, |ui| submit |= self.touch_connect_form(ui));
         });
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(action_area)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| submit |= self.touch_connect_actions(ui),
+        );
         if let Some(area) = keyboard_area {
             let out = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
@@ -1960,6 +2089,193 @@ impl ClientApp {
             if click.is_some_and(|p| click_dismisses_text_focus(p, keyboard_area, &fields)) {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
+        }
+
+        if submit {
+            self.begin_connect();
+        }
+    }
+
+    /// The touch connect form (inside the scroll area): tight rows, the
+    /// pairing code right under the host, the UDP port behind "Advanced".
+    /// Returns true when Enter in the host or code field asked to connect.
+    fn touch_connect_form(&mut self, ui: &mut egui::Ui) -> bool {
+        const FIELD_W: f32 = 300.0;
+        let mut submit = false;
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.vertical_centered(|ui| {
+            ui.add_space(4.0);
+            ui.heading("DirectDesk");
+            ui.add_space(2.0);
+            egui::Grid::new("touch_connect_form")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Host");
+                    let r = ui.add(
+                        fit_text_edit(true, egui::TextEdit::singleline(&mut self.address_input))
+                            .hint_text("hostname or IP")
+                            .desired_width(FIELD_W),
+                    );
+                    submit |= self.touch_field(&r, connect_form::FormField::Host);
+                    ui.end_row();
+
+                    // Digits, spaces and dashes, as on desktop: the code is
+                    // normalised by `connect_form` at connect time.
+                    ui.label("Pairing code");
+                    let r = ui.add(
+                        fit_text_edit(true, egui::TextEdit::singleline(&mut self.code_input))
+                            .hint_text("8 digits — first time only")
+                            .desired_width(FIELD_W),
+                    );
+                    submit |= self.touch_field(&r, connect_form::FormField::PairingCode);
+                    ui.end_row();
+
+                    ui.label("Display name");
+                    let r = ui.add(
+                        fit_text_edit(true, egui::TextEdit::singleline(&mut self.name_input))
+                            .hint_text("shown on the host")
+                            .desired_width(FIELD_W),
+                    );
+                    submit |= self.touch_field(&r, connect_form::FormField::DisplayName);
+                    ui.end_row();
+
+                    ui.label("Quality");
+                    self.quality_combo(ui);
+                    ui.end_row();
+
+                    ui.toggle_value(&mut self.touch_advanced_open, "Advanced");
+                    ui.end_row();
+                    if self.touch_advanced_open {
+                        ui.label("UDP port");
+                        let r = ui.add(
+                            fit_text_edit(
+                                true,
+                                egui::TextEdit::singleline(&mut self.udp_port_input),
+                            )
+                            .desired_width(90.0),
+                        );
+                        submit |= self.touch_field(&r, connect_form::FormField::UdpPort);
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(2.0);
+            ui.weak("Pairing code: from the host's 'Pair new device' window. Blank = reconnect.");
+            if self.supervisor.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 170, 60),
+                    "No transport in this build (secret store unavailable) — Connect is disabled.",
+                );
+            }
+            ui.add_space(4.0);
+        });
+        submit
+    }
+
+    /// One touch form field's bookkeeping; true when Enter in it submits.
+    fn touch_field(&mut self, r: &egui::Response, field: connect_form::FormField) -> bool {
+        self.note_text_edit(r);
+        // A singleline `TextEdit` gives up focus on Enter (hardware or
+        // on-screen keyboard), which is how egui reports "done".
+        connect_form::enter_submits(field)
+            && r.lost_focus()
+            && r.ctx.input(|i| i.key_pressed(egui::Key::Enter))
+    }
+
+    /// The sticky action row (right-to-left): Pair & Connect, then the form
+    /// error in whatever room is left. Returns true when the button was hit.
+    fn touch_connect_actions(&mut self, ui: &mut egui::Ui) -> bool {
+        let rect = ui.max_rect();
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+        ui.add_space(12.0);
+        let label = if connect_form::is_pairing_mode(&self.code_input) {
+            "Pair & Connect"
+        } else {
+            "Connect"
+        };
+        let can_connect = !self.address_input.trim().is_empty();
+        let clicked = ui
+            .add_enabled(
+                can_connect,
+                egui::Button::new(egui::RichText::new(label).strong())
+                    .min_size(egui::vec2(TOUCH_TARGET_PTS * 4.0, TOUCH_TARGET_PTS)),
+            )
+            .clicked();
+        ui.add_space(8.0);
+        if let Some(err) = &self.form_error {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(err.as_str()).color(egui::Color32::from_rgb(220, 90, 90)),
+                )
+                .truncate(),
+            );
+        }
+        clicked
+    }
+
+    /// Touch, back from the background while the watchdog is still winding
+    /// the old session down: the reconnect follows on its own.
+    fn touch_resuming_view(&mut self, ui: &mut egui::Ui, status: &str) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.add(egui::Spinner::new().size(36.0));
+            ui.add_space(12.0);
+            ui.heading(status);
+            ui.weak(format!("Host {}", self.config.host_address));
+            ui.add_space(16.0);
+            if ui
+                .add(
+                    egui::Button::new("Cancel")
+                        .min_size(egui::vec2(TOUCH_TARGET_PTS * 2.5, TOUCH_TARGET_PTS)),
+                )
+                .clicked()
+            {
+                self.bg_resume.cancel();
+            }
+        });
+    }
+
+    /// Touch, once per frame (in `logic`, after the drain): stamp the
+    /// heartbeat, act on the watchdog's report, and keep frames coming
+    /// while a driver runs so a stale heartbeat really means "no window".
+    fn touch_background(&mut self, ctx: &egui::Context, now: Instant) {
+        let Some(bg) = &self.background else {
+            return;
+        };
+        bg.shared.beat(now);
+        let report = bg.shared.take_report();
+        let driver_running = bg.driver.is_running();
+        let connecting = matches!(
+            self.state,
+            ConnectionState::Connecting | ConnectionState::Authenticating
+        );
+        if self.bg_resume.on_frame(report, connecting) == ResumeAction::Reconnect {
+            tracing::info!(
+                host = %self.address_input.trim(),
+                "touch: back from the background after the watchdog ended the session \
+                 — reconnecting once with the saved pairing"
+            );
+            // The supervisor still holds the stopped driver: `begin_connect`
+            // aborts what is left of it. A code is single-use and was
+            // consumed by the original connect; reconnect authenticates.
+            self.reset_after_disconnect();
+            self.code_input.clear();
+            self.begin_connect();
+            if self.state != ConnectionState::Connecting {
+                // Could not even start (no transport, form invalid): the
+                // form shows why.
+                self.bg_resume.cancel();
+            }
+        }
+        if self.bg_resume.status().is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if driver_running {
+            ctx.request_repaint_after(HEARTBEAT_REPAINT);
         }
     }
 
@@ -2032,6 +2348,8 @@ impl ClientApp {
     /// toolbar on go-live, key repeat. `focused` is the debounced focus.
     fn touch_logic(&mut self, ctx: &egui::Context, focused: bool) {
         let now = Instant::now();
+        // First: a resume after a background disconnect may start a connect.
+        self.touch_background(ctx, now);
         let streaming = self.state == ConnectionState::Connected;
 
         for _ in 0..std::mem::take(&mut self.back_presses) {
@@ -2215,7 +2533,15 @@ impl ClientApp {
                     self.set_keyboard_visible(false);
                     self.failed_view(ui, reason)
                 }
-                ConnectionState::Disconnected => self.touch_connect_screen(ui),
+                ConnectionState::Disconnected => match self.bg_resume.status() {
+                    // Back from the background, old session still closing:
+                    // no form to type into until the reconnect starts.
+                    Some(status) => {
+                        self.set_keyboard_visible(false);
+                        self.touch_resuming_view(ui, status)
+                    }
+                    None => self.touch_connect_screen(ui),
+                },
             });
 
         // Same lifetime rule as the desktop path (see `ui`).
