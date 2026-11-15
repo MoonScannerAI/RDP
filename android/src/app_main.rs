@@ -11,6 +11,8 @@ use android_activity::{AndroidApp, MainEvent, PollEvent, WindowManagerFlags};
 use directdesk_client::app::{self, LaunchArgs, PlatformConfig, UiProfile};
 use directdesk_client::connect::StreamCaps;
 use directdesk_shared::crypto::storage::{PlainFileStore, SecretStore};
+use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
+use eframe::wgpu;
 use jni::objects::JObject;
 use jni::{jni_sig, jni_str};
 
@@ -317,12 +319,74 @@ fn run(app: AndroidApp) -> anyhow::Result<()> {
             demo_fps: DEMO_FPS,
             ..LaunchArgs::default()
         },
-        native_options: eframe::NativeOptions {
-            android_app: Some(app.clone()),
-            ..Default::default()
-        },
+        native_options: native_options(&app),
     };
     app::run(cfg)
+}
+
+/// Widest video texture a typical host needs (a 2560x1600 desktop). An
+/// adapter below this cannot show such a host at all.
+const MIN_VIDEO_TEXTURE_SIDE: u32 = 2560;
+/// What the largest stream needs (the host caps at 4K).
+const FULL_VIDEO_TEXTURE_SIDE: u32 = 4096;
+
+/// eframe's defaults (LOW_LATENCY surface included) except for how the wgpu
+/// device is requested: see [`device_descriptor`].
+fn native_options(app: &AndroidApp) -> eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
+        android_app: Some(app.clone()),
+        ..Default::default()
+    };
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    setup.instance_descriptor.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+    setup.device_descriptor = Arc::new(device_descriptor);
+    options.wgpu_options.wgpu_setup = WgpuSetup::CreateNew(setup);
+    options
+}
+
+/// Request exactly the adapter's own limits.
+///
+/// egui-wgpu's default asks for `wgpu::Limits::default()` (the WebGPU
+/// baseline) plus 8192-texel textures, and a device request asking for more
+/// than the adapter offers fails outright: under the emulator's SwiftShader
+/// Vulkan (`max_uniform_buffer_binding_size` 16384 < 65536) the app never got
+/// past startup, and a real GPU reporting the Vulkan minimums would fail the
+/// same way. The adapter's own limits always satisfy the request, and they
+/// are the most it can do anyway. What the video needs is checked and
+/// reported: a stream wider or taller than `max_texture_dimension_2d` cannot
+/// be uploaded as one texture.
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    let info = adapter.get_info();
+    let limits = adapter.limits();
+    let side = limits.max_texture_dimension_2d;
+    if side < MIN_VIDEO_TEXTURE_SIDE {
+        tracing::error!(
+            backend = ?info.backend,
+            adapter = %info.name,
+            "GPU max texture size {side} < {MIN_VIDEO_TEXTURE_SIDE}: a host desktop wider or \
+             taller than {side} pixels cannot be displayed on this device"
+        );
+    } else if side < FULL_VIDEO_TEXTURE_SIDE {
+        tracing::warn!(
+            backend = ?info.backend,
+            adapter = %info.name,
+            "GPU max texture size {side} < {FULL_VIDEO_TEXTURE_SIDE}: a 4K host desktop cannot \
+             be displayed on this device"
+        );
+    }
+    tracing::info!(
+        backend = ?info.backend,
+        adapter = %info.name,
+        driver = %info.driver,
+        max_texture_dimension_2d = side,
+        max_uniform_buffer_binding_size = limits.max_uniform_buffer_binding_size,
+        "requesting the wgpu device with the adapter's own limits"
+    );
+    wgpu::DeviceDescriptor {
+        label: Some("directdesk wgpu device"),
+        required_limits: limits,
+        ..Default::default()
+    }
 }
 
 /// Client identity and trusted hosts: plaintext files in `<app data>/no_backup`

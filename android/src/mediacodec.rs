@@ -8,7 +8,15 @@
 //!    once, then fail);
 //! 3. wait up to 12 ms for a picture, then drain the rest with 0 timeout.
 //!
-//! Output that arrives later is returned by the next call. The codec is built
+//! Output that arrives later is returned by the next call. Only the newest
+//! picture of a call is converted and returned: the pipeline publishes a
+//! call's frames back to back into a latest-wins slot, so an older one could
+//! never be shown. Older ones are released unconverted (`superseded` in the
+//! summary line). The RGBA buffer comes from the client's `FramePool`, which
+//! this decoder enables: a recycled 16 MB buffer instead of a fresh, page-
+//! faulted, zero-filled one per frame.
+//!
+//! The codec is built
 //! lazily from the first keyframe's SPS (size) and SPS/PPS (`csd-0/1`),
 //! rebuilt when a keyframe's SPS changes the size, and dropped after
 //! [`ERROR_LIMIT`] consecutive failed calls (the next keyframe rebuilds it).
@@ -47,12 +55,14 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use directdesk_client::h264;
+use directdesk_client::renderer::FramePool;
 use directdesk_client::yuv::{self, PlaneLayout};
 use directdesk_shared::error::{Error, Result};
 use directdesk_shared::traits::{Decoder, PixelFormat, RawFrame};
 use directdesk_shared::video::EncodedFrame;
 use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
+    OutputBuffer,
 };
 use ndk::media::media_format::MediaFormat;
 
@@ -72,6 +82,10 @@ const OUTPUT_WAIT: Duration = Duration::from_millis(12);
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
 /// Largest picture we will configure a codec for (the host caps at 4K).
 const MAX_DIMENSION: u32 = 8192;
+/// Idle RGBA buffers the [`FramePool`] keeps. In flight at once: one being
+/// converted, one waiting in the frame slot, one being copied out by the
+/// presenter.
+const FRAME_POOL_CAPACITY: usize = 3;
 
 /// `BUFFER_FLAG_CODEC_CONFIG` / `BUFFER_FLAG_END_OF_STREAM`: output buffers
 /// carrying no picture.
@@ -96,6 +110,9 @@ pub struct MediaCodecDecoder {
 
 impl MediaCodecDecoder {
     pub fn new() -> Self {
+        // Converted frames come from, and return to, the shared pool (the
+        // slot and presenter hand buffers back; see `FramePool`).
+        FramePool::global().enable(FRAME_POOL_CAPACITY);
         Self {
             active: None,
             errors: ErrorStreak::default(),
@@ -387,7 +404,9 @@ impl ActiveCodec {
         idr: &mut IdrGate,
     ) -> Result<Vec<RawFrame>> {
         let codec = &self.codec.0;
-        let mut out = Vec::new();
+        // The newest picture so far, still in its output buffer: converted
+        // only at the end, once no newer one can follow in this call.
+        let mut newest = None;
 
         // (1) Whatever finished since the last call.
         drain(
@@ -396,7 +415,7 @@ impl ActiveCodec {
             &mut self.pts,
             stats,
             Duration::ZERO,
-            &mut out,
+            &mut newest,
         )?;
 
         // (2) Queue this frame.
@@ -450,7 +469,7 @@ impl ActiveCodec {
                         &mut self.pts,
                         stats,
                         Duration::ZERO,
-                        &mut out,
+                        &mut newest,
                     )?;
                 }
             }
@@ -463,9 +482,97 @@ impl ActiveCodec {
             &mut self.pts,
             stats,
             OUTPUT_WAIT,
-            &mut out,
+            &mut newest,
         )?;
-        Ok(out)
+        match newest {
+            Some(picture) => Ok(vec![picture.convert(FramePool::global())?]),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// A decoded picture still in its codec output buffer, not yet converted.
+///
+/// Holding it (rather than converting at once) is what lets a `decode()` call
+/// convert only its newest picture. The buffer goes back to the codec exactly
+/// once: through [`Picture::release`] (superseded), [`Picture::convert`], or —
+/// when an error or a caught panic leaves `decode()` early — `Drop`, so the
+/// codec never loses an output buffer.
+struct Picture<'c> {
+    codec: &'c MediaCodec,
+    /// `Some` until handed back.
+    buffer: Option<OutputBuffer<'c>>,
+    /// The layout in force when it was dequeued: a later format change
+    /// applies only to later buffers.
+    layout: PlaneLayout,
+    timestamp_ms: u32,
+}
+
+impl Picture<'_> {
+    /// Hand the buffer back unconverted.
+    fn release(mut self) -> Result<()> {
+        match self.buffer.take() {
+            Some(buffer) => self
+                .codec
+                .release_output_buffer(buffer, false)
+                .map_err(|e| media_error("release_output_buffer", e)),
+            None => Ok(()),
+        }
+    }
+
+    /// Convert to RGBA (into a pooled buffer), then hand the buffer back
+    /// whether or not that worked, then report.
+    fn convert(mut self, pool: &FramePool) -> Result<RawFrame> {
+        let Some(buffer) = self.buffer.take() else {
+            return Err(Error::Decoder("output buffer already released".into()));
+        };
+        let converted = self.convert_from(&buffer, pool);
+        self.codec
+            .release_output_buffer(buffer, false)
+            .map_err(|e| media_error("release_output_buffer", e))?;
+        converted
+    }
+
+    fn convert_from(&self, buffer: &OutputBuffer<'_>, pool: &FramePool) -> Result<RawFrame> {
+        let layout = self.layout;
+        let offset = buffer.info().offset();
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        // From the offset to the end of the buffer rather than
+        // `offset + size`: some vendors report a size that omits the padding
+        // after the last chroma row, which the layout's plane offsets may
+        // still span.
+        let src = buffer
+            .buffer()
+            .get(start..)
+            .ok_or_else(|| Error::Decoder(format!("output offset {offset} out of range")))?;
+        // Exact size of the result, so a recycled buffer is overwritten in
+        // place (no allocation, no memset). Saturating: a nonsense crop
+        // matches no pooled buffer and is then rejected by `yuv`.
+        let len = (layout.crop_w as usize)
+            .saturating_mul(layout.crop_h as usize)
+            .saturating_mul(4);
+        let mut rgba = pool.take(len);
+        if let Err(e) = yuv::yuv420_to_rgba(src, &layout, &mut rgba) {
+            pool.recycle(rgba);
+            return Err(e);
+        }
+        Ok(RawFrame {
+            width: layout.crop_w,
+            height: layout.crop_h,
+            format: PixelFormat::Rgba8,
+            data: rgba,
+            timestamp_ms: self.timestamp_ms,
+        })
+    }
+}
+
+impl Drop for Picture<'_> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            // Only reached while leaving decode() early: the error that
+            // caused that is already on its way out, so this one is not.
+            let _ = self.codec.release_output_buffer(buffer, false);
+        }
     }
 }
 
@@ -563,16 +670,17 @@ impl OutputState {
     }
 }
 
-/// Collect decoded pictures. With a non-zero `wait`, blocks up to `wait` for
-/// the first picture (only while something is in flight), then takes
-/// whatever else is ready without blocking.
-fn drain(
-    codec: &MediaCodec,
+/// Collect decoded pictures into `newest`, releasing whichever picture it held
+/// before unconverted (counted as superseded). With a non-zero `wait`, blocks
+/// up to `wait` for the first picture (only while something is in flight),
+/// then takes whatever else is ready without blocking.
+fn drain<'c>(
+    codec: &'c MediaCodec,
     output: &mut OutputState,
     pts: &mut PtsMap,
     stats: &mut DecodeStats,
     wait: Duration,
-    out: &mut Vec<RawFrame>,
+    newest: &mut Option<Picture<'c>>,
 ) -> Result<()> {
     let deadline = Instant::now() + wait;
     let mut got_picture = false;
@@ -602,39 +710,33 @@ fn drain(
                 let timestamp_ms =
                     pending.map_or_else(|| pts.fallback_timestamp_ms(), |p| p.timestamp_ms);
 
-                // Convert, then release the buffer whether or not that
-                // worked, then report.
                 let layout = match output.layout {
                     Some(l) => Ok(l),
                     // No FORMAT_CHANGED seen yet (some codecs skip it):
                     // the codec's current output format is authoritative.
                     None => output.update(&codec.output_format()),
                 };
-                let converted = layout.and_then(|layout| {
-                    let start = usize::try_from(info.offset()).unwrap_or(usize::MAX);
-                    // From the offset to the end of the buffer rather than
-                    // `offset + size`: some vendors report a size that omits
-                    // the padding after the last chroma row, which the
-                    // layout's plane offsets may still span.
-                    let src = buffer.buffer().get(start..).ok_or_else(|| {
-                        Error::Decoder(format!("output offset {} out of range", info.offset()))
-                    })?;
-                    let mut rgba = Vec::new();
-                    yuv::yuv420_to_rgba(src, &layout, &mut rgba)?;
-                    Ok(RawFrame {
-                        width: layout.crop_w,
-                        height: layout.crop_h,
-                        format: PixelFormat::Rgba8,
-                        data: rgba,
-                        timestamp_ms,
-                    })
-                });
-                codec
-                    .release_output_buffer(buffer, false)
-                    .map_err(|e| media_error("release_output_buffer", e))?;
-                out.push(converted?);
+                let layout = match layout {
+                    Ok(l) => l,
+                    Err(e) => {
+                        codec
+                            .release_output_buffer(buffer, false)
+                            .map_err(|e| media_error("release_output_buffer", e))?;
+                        return Err(e);
+                    }
+                };
                 stats.on_output(pending.map(|p| now.saturating_duration_since(p.queued_at)));
                 got_picture = true;
+                let picture = Picture {
+                    codec,
+                    buffer: Some(buffer),
+                    layout,
+                    timestamp_ms,
+                };
+                if let Some(older) = newest.replace(picture) {
+                    stats.on_superseded();
+                    older.release()?;
+                }
             }
             DequeuedOutputBufferInfoResult::OutputFormatChanged => {
                 output.update(&codec.output_format())?;

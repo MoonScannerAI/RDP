@@ -685,6 +685,9 @@ pub struct DecodeStats {
     window_start: Instant,
     pub frames_in: u64,
     pub frames_out: u64,
+    /// Pictures released unconverted because a newer one came out of the
+    /// same `decode()` call (only the newest is converted and returned).
+    pub superseded: u64,
     window_out: u64,
     window_max_in_flight: usize,
     window_max_latency: Option<Duration>,
@@ -700,6 +703,7 @@ impl DecodeStats {
             window_start: now,
             frames_in: 0,
             frames_out: 0,
+            superseded: 0,
             window_out: 0,
             window_max_in_flight: 0,
             window_max_latency: None,
@@ -723,6 +727,10 @@ impl DecodeStats {
         }
     }
 
+    pub fn on_superseded(&mut self) {
+        self.superseded += 1;
+    }
+
     /// The summary line if a full interval has passed since the last one;
     /// starts a new window when it returns `Some`.
     pub fn summary_due(&mut self, now: Instant, in_flight: usize, dropped: u64) -> Option<String> {
@@ -736,11 +744,12 @@ impl DecodeStats {
             None => "-".to_string(),
         };
         let line = format!(
-            "mediacodec: in={} out={} out_fps={:.1} in_flight={} max_in_flight={} \
-             latency_ms last={} max={} dropped={} errors={} codecs={}",
+            "mediacodec: in={} out={} out_fps={:.1} superseded={} in_flight={} \
+             max_in_flight={} latency_ms last={} max={} dropped={} errors={} codecs={}",
             self.frames_in,
             self.frames_out,
             fps,
+            self.superseded,
             in_flight,
             self.window_max_in_flight,
             ms(self.last_latency),
@@ -1456,9 +1465,11 @@ mod tests {
         s.on_input(3);
         s.on_output(Some(ms(12)));
         s.on_output(Some(ms(9)));
+        s.on_superseded();
         assert!(s.summary_due(t0 + ms(4_999), 1, 0).is_none());
         let line = s.summary_due(t0 + ms(5_000), 1, 2).unwrap();
         assert!(line.contains("in=2 out=2"), "{line}");
+        assert!(line.contains("superseded=1"), "{line}");
         assert!(line.contains("max_in_flight=3"), "{line}");
         assert!(line.contains("last=9.0 max=12.0"), "{line}");
         assert!(line.contains("dropped=2"), "{line}");

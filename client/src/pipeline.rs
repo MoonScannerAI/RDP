@@ -583,8 +583,9 @@ impl<R: Fn() + Send + 'static> DecodeLoop<R> {
                 let produced = frames.len();
                 for mut raw in frames {
                     // The tile overlay is *persistent* state while a
-                    // decoded frame is transient — the decoder hands back a
-                    // fresh buffer every time — so the live tile set has to
+                    // decoded frame is transient — the decoder hands back
+                    // freshly decoded pixels every time (in a recycled
+                    // buffer on Android) — so the live tile set has to
                     // be re-blitted onto every frame, right here, before
                     // the frame is published. Doing it downstream (in the
                     // presenter) would mean repainting on every *repaint*

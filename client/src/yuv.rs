@@ -234,8 +234,14 @@ fn validate(src_len: usize, l: &PlaneLayout) -> Result<Geometry> {
 /// Convert the visible rectangle of `src` (laid out per `layout`) to tightly
 /// packed RGBA8, limited-range BT.709, alpha 255. `out` is resized to
 /// `crop_w * crop_h * 4`. Errors if `src` is too short for `layout`.
+///
+/// Every output byte is written, so `out` may be a reused buffer with stale
+/// contents: when its length is already `crop_w * crop_h * 4` it is neither
+/// reallocated nor cleared first (only a length change zero-fills, and only
+/// the added tail). The result never depends on what `out` held.
 pub fn yuv420_to_rgba(src: &[u8], layout: &PlaneLayout, out: &mut Vec<u8>) -> Result<()> {
     let g = validate(src.len(), layout)?;
+    // A no-op at the right length: no memset on a recycled buffer.
     out.resize(g.w * g.h * 4, 0);
 
     convert_rows(src, layout, &g, 0, g.h, out);
@@ -583,6 +589,32 @@ mod tests {
             let mut out2 = Vec::new();
             yuv420_to_rgba(&full[..exact], &l, &mut out2).unwrap();
             assert_eq!(out, out2);
+        }
+    }
+
+    #[test]
+    fn a_reused_buffer_converts_identically_without_reallocating() {
+        let mut rng = Rng(0xbeef);
+        for (w, h) in SIZES {
+            let stride = w.next_multiple_of(2);
+            let buf = rng.fill(stride * h + stride * h.div_ceil(2));
+            let l = nv12_layout(w, h, stride, h);
+            let mut fresh = Vec::new();
+            yuv420_to_rgba(&buf, &l, &mut fresh).unwrap();
+
+            // Right length, garbage contents: overwritten in place.
+            let mut reused = rng.fill(w * h * 4);
+            let ptr = reused.as_ptr();
+            yuv420_to_rgba(&buf, &l, &mut reused).unwrap();
+            assert_eq!(reused, fresh, "{w}x{h}");
+            assert_eq!(reused.as_ptr(), ptr, "{w}x{h}: must not reallocate");
+
+            // Wrong lengths (a size change) still come out exact.
+            for len in [w * h * 4 + 7, (w * h * 4) / 2] {
+                let mut other = rng.fill(len);
+                yuv420_to_rgba(&buf, &l, &mut other).unwrap();
+                assert_eq!(other, fresh, "{w}x{h} from len {len}");
+            }
         }
     }
 

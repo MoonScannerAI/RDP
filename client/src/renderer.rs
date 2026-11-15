@@ -7,7 +7,8 @@
 //! show it honestly.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use directdesk_shared::geometry::fit_rect;
@@ -115,6 +116,103 @@ fn snap_to_physical_pixel(points: f32, ppp: f32) -> f32 {
     (points * ppp).round() / ppp
 }
 
+/// Recycled frame buffers for decoders that convert pictures on the CPU.
+///
+/// A 2560x1600 RGBA frame is 16 MB. Allocating one per decoded frame costs a
+/// page fault plus kernel page zeroing for every 4 KB of it, then a memset —
+/// measured on Android at roughly half of the decode thread. A buffer that is
+/// done with (copied out by the [`Presenter`], or superseded unshown in the
+/// [`FrameSlot`]) comes back here instead, and the decoder takes it again for
+/// the next frame of the same size.
+///
+/// **Off unless a decoder enables it** ([`FramePool::enable`]): at capacity 0
+/// a returned buffer is simply dropped, as it always was. Only the Android
+/// MediaCodec decoder enables the [global](FramePool::global) pool; the
+/// Windows Media Foundation decoder allocates its own frames and never does.
+///
+/// Bounded: past `capacity` the oldest buffer is dropped, so after a size
+/// change the old-sized buffers (never taken again) age out on their own.
+pub struct FramePool {
+    capacity: AtomicUsize,
+    free: Mutex<VecDeque<Vec<u8>>>,
+}
+
+static FRAME_POOL: FramePool = FramePool::new();
+
+impl FramePool {
+    /// A disabled pool (capacity 0).
+    pub const fn new() -> Self {
+        Self {
+            capacity: AtomicUsize::new(0),
+            free: parking_lot::const_mutex(VecDeque::new()),
+        }
+    }
+
+    /// The process-wide pool every [`FrameSlot`] returns its buffers to.
+    pub fn global() -> &'static FramePool {
+        &FRAME_POOL
+    }
+
+    /// Keep up to `capacity` idle buffers from now on (0 disables the pool and
+    /// frees what it holds).
+    pub fn enable(&self, capacity: usize) {
+        self.capacity.store(capacity, Ordering::Relaxed);
+        let evicted: Vec<Vec<u8>> = {
+            let mut free = self.free.lock();
+            let excess = free.len().saturating_sub(capacity);
+            free.drain(..excess).collect()
+        };
+        drop(evicted);
+    }
+
+    /// A buffer for one `len`-byte frame: a recycled one whose length is
+    /// already exactly `len` (stale contents — the caller overwrites every
+    /// byte), or an empty `Vec` when none is idle.
+    pub fn take(&self, len: usize) -> Vec<u8> {
+        if self.capacity.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut free = self.free.lock();
+        // Newest first: the most recently used buffer is the warmest.
+        match free.iter().rposition(|b| b.len() == len) {
+            Some(i) => free.remove(i).unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Return a buffer that is no longer needed. Dropped when the pool is
+    /// disabled; when it is full, the oldest idle buffer is dropped instead.
+    pub fn recycle(&self, buf: Vec<u8>) {
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        if capacity == 0 || buf.is_empty() {
+            return;
+        }
+        // The (large) drop of an evicted buffer happens after the lock is
+        // released, not under it.
+        let evicted = {
+            let mut free = self.free.lock();
+            free.push_back(buf);
+            if free.len() > capacity {
+                free.pop_front()
+            } else {
+                None
+            }
+        };
+        drop(evicted);
+    }
+
+    /// Idle buffers currently held.
+    pub fn idle(&self) -> usize {
+        self.free.lock().len()
+    }
+}
+
+impl Default for FramePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One decoded frame waiting to be shown.
 struct Slotted {
     frame: RawFrame,
@@ -136,6 +234,9 @@ pub struct FrameSlot {
     dropped_at_present: AtomicU64,
     width: AtomicU32,
     height: AtomicU32,
+    /// Where buffers go once no one needs them: a superseded frame here, a
+    /// presented one via [`FrameSlot::recycle`]. See [`FramePool`].
+    pool: &'static FramePool,
 }
 
 impl Default for FrameSlot {
@@ -146,6 +247,10 @@ impl Default for FrameSlot {
 
 impl FrameSlot {
     pub fn new() -> Self {
+        Self::with_pool(FramePool::global())
+    }
+
+    fn with_pool(pool: &'static FramePool) -> Self {
         Self {
             inner: Mutex::new(None),
             generation: AtomicU64::new(0),
@@ -154,6 +259,7 @@ impl FrameSlot {
             dropped_at_present: AtomicU64::new(0),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
+            pool,
         }
     }
 
@@ -174,11 +280,15 @@ impl FrameSlot {
             // decoded frame is discarded.
             self.dropped_at_present.fetch_add(1, Ordering::Relaxed);
         }
-        *guard = Some(Slotted {
+        let superseded = guard.replace(Slotted {
             frame,
             generation,
             arrived: now,
         });
+        drop(guard);
+        if let Some(old) = superseded {
+            self.pool.recycle(old.frame.data);
+        }
     }
 
     /// Consume the pending frame if it is newer than `last_generation`.
@@ -214,9 +324,18 @@ impl FrameSlot {
         self.dropped_at_present.load(Ordering::Relaxed)
     }
 
+    /// Hand back a frame taken with [`FrameSlot::take_newer_than`] once its
+    /// pixels have been copied out, so its buffer can be reused.
+    pub fn recycle(&self, frame: RawFrame) {
+        self.pool.recycle(frame.data);
+    }
+
     /// Forget any pending frame (used on stream restart / disconnect).
     pub fn clear(&self) {
-        *self.inner.lock() = None;
+        let pending = self.inner.lock().take();
+        if let Some(s) = pending {
+            self.pool.recycle(s.frame.data);
+        }
     }
 }
 
@@ -381,7 +500,11 @@ impl Presenter {
     /// Pull the newest frame (if any) and upload it. Cheap when idle.
     pub fn update(&mut self, ctx: &egui::Context, slot: &FrameSlot) {
         if let Some((frame, generation, arrived)) = slot.take_newer_than(self.last_generation) {
-            match self.build_color_image(&frame) {
+            let image = self.build_color_image(&frame);
+            // The pixels now live in `image`; the buffer can be decoded into
+            // again (a no-op unless a decoder enabled the FramePool).
+            slot.recycle(frame);
+            match image {
                 Some(image) => {
                     self.tex_size = image.size;
                     let opts = video_texture_options(self.last_scale.get());
@@ -690,6 +813,68 @@ mod tests {
         // A resolution change must be visible immediately for input mapping.
         slot.publish(frame(1280, 720, 2));
         assert_eq!(slot.remote_dims(), Some((1280, 720)));
+    }
+
+    #[test]
+    fn a_disabled_pool_keeps_nothing() {
+        static POOL: FramePool = FramePool::new();
+        POOL.recycle(vec![1; 16]);
+        assert_eq!(POOL.idle(), 0);
+        assert!(POOL.take(16).is_empty());
+        // The global pool is off unless a decoder turns it on, so the Windows
+        // client keeps dropping its frames exactly as before.
+        assert_eq!(
+            FramePool::global().capacity.load(Ordering::Relaxed),
+            0,
+            "nothing in the client may enable the global pool"
+        );
+    }
+
+    #[test]
+    fn pool_hands_back_only_exact_sizes_and_stays_bounded() {
+        static POOL: FramePool = FramePool::new();
+        POOL.enable(2);
+        POOL.recycle(vec![1; 16]);
+        POOL.recycle(vec![2; 32]);
+        POOL.recycle(vec![3; 16]);
+        // Bounded: the oldest (the first 16-byte buffer) was evicted.
+        assert_eq!(POOL.idle(), 2);
+        assert!(POOL.take(8).is_empty(), "no size match: a fresh Vec");
+        let b = POOL.take(16);
+        assert_eq!(b, vec![3; 16], "the matching buffer, contents untouched");
+        assert!(POOL.take(16).is_empty());
+        assert_eq!(POOL.take(32).len(), 32);
+        assert_eq!(POOL.idle(), 0);
+        // Shrinking frees the excess at once; 0 disables.
+        POOL.recycle(vec![4; 16]);
+        POOL.recycle(vec![5; 16]);
+        POOL.enable(1);
+        assert_eq!(POOL.idle(), 1);
+        assert_eq!(POOL.take(16), vec![5; 16], "the newest survives");
+        POOL.enable(0);
+        POOL.recycle(vec![6; 16]);
+        assert_eq!(POOL.idle(), 0);
+    }
+
+    #[test]
+    fn superseded_and_presented_frames_return_to_the_pool() {
+        static POOL: FramePool = FramePool::new();
+        POOL.enable(3);
+        let slot = FrameSlot::with_pool(&POOL);
+        slot.publish(frame(2, 2, 1));
+        slot.publish(frame(2, 2, 2));
+        assert_eq!(POOL.idle(), 1, "the superseded frame's buffer");
+        let (shown, _, _) = slot.take_newer_than(0).unwrap();
+        assert_eq!(shown.data[0], 2);
+        slot.recycle(shown);
+        assert_eq!(POOL.idle(), 2);
+        slot.publish(frame(2, 2, 3));
+        slot.clear();
+        assert_eq!(POOL.idle(), 3);
+        // Counters are unchanged by recycling.
+        assert_eq!(slot.dropped_at_present(), 1);
+        assert_eq!(slot.presented_count(), 1);
+        assert_eq!(POOL.take(16).len(), 16);
     }
 
     #[test]
