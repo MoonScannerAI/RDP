@@ -17,11 +17,23 @@
 //! nothing; the pipeline's keyframe gate and `RequestKeyframe` handle
 //! recovery.
 //!
-//! An output color format `yuv` cannot convert is reported as an error once
-//! and then disables that codec instance (every later frame decodes to
-//! nothing, without errors that would make the pipeline flush and request a
-//! keyframe per frame); a keyframe with a new SPS size builds a fresh codec
-//! that tries again.
+//! No `color-format` is requested at configure: the codec picks its native
+//! default (the emulator's goldfish decoder then reports I420 with a stride
+//! and slice-height; asked for YUV420Flexible it echoes that back instead).
+//! The output layout comes from the `color-format` / `stride` /
+//! `slice-height` / crop keys when the color format is one `yuv` knows, and
+//! otherwise (YUV420Flexible, vendor values) from the `image-data`
+//! `MediaImage2` description — the one `MediaCodec.getOutputImage` uses. The
+//! `debug.directdesk.color_format` system property requests a color format
+//! anyway (a test hook for the `image-data` path).
+//!
+//! An output format neither can convert drops the codec at once and is
+//! reported as an error at most once per [`UNSUPPORTED_RETRY`]; meanwhile
+//! frames decode to nothing (no error, so the pipeline does not flush and
+//! request a keyframe per frame). The next keyframe builds a fresh codec
+//! after a flush (a reconnect, or the pipeline's answer to the reported
+//! error), after [`UNSUPPORTED_RETRY`], or when the SPS size changes — see
+//! [`UnsupportedBackoff`].
 //!
 //! A panic anywhere inside [`Decoder::decode`] / [`Decoder::flush`] (the ndk
 //! crate unwraps on NULL from a few NDK calls) is caught, the codec dropped,
@@ -45,11 +57,16 @@ use ndk::media::media_codec::{
 use ndk::media::media_format::MediaFormat;
 
 use crate::codec_state::{
-    color_format_supported, max_input_size, normalize_color_format, DecodeStats, ErrorStreak,
-    IdrGate, LatencyTier, OutputFormatKeys, PtsMap, COLOR_FORMAT_YUV420_FLEXIBLE, ERROR_LIMIT,
+    color_format_supported, layout_from_image_data, max_input_size, normalize_color_format,
+    parse_color_format_override, DecodeStats, ErrorStreak, IdrGate, LatencyTier, OutputFormatKeys,
+    PtsMap, UnsupportedBackoff, COLOR_FORMAT_YUV420_FLEXIBLE, ERROR_LIMIT, UNSUPPORTED_RETRY,
 };
+use crate::sys;
 
 const MIME_AVC: &str = "video/avc";
+/// System property: a color format to request at configure (decimal or
+/// `0x` hex; unset = none). See [`parse_color_format_override`].
+const COLOR_FORMAT_PROPERTY: &str = "debug.directdesk.color_format";
 const INPUT_TIMEOUT: Duration = Duration::from_millis(10);
 const OUTPUT_WAIT: Duration = Duration::from_millis(12);
 const SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
@@ -72,6 +89,9 @@ pub struct MediaCodecDecoder {
     errors: ErrorStreak,
     stats: DecodeStats,
     idr: IdrGate,
+    /// Outlives codecs: holds keyframes back from rebuilding one right after
+    /// an unconvertible output format.
+    backoff: UnsupportedBackoff,
 }
 
 impl MediaCodecDecoder {
@@ -81,6 +101,7 @@ impl MediaCodecDecoder {
             errors: ErrorStreak::default(),
             stats: DecodeStats::new(Instant::now(), SUMMARY_INTERVAL),
             idr: IdrGate::new(),
+            backoff: UnsupportedBackoff::default(),
         }
     }
 
@@ -115,14 +136,32 @@ impl MediaCodecDecoder {
         let Some(active) = self.active.as_mut() else {
             return Ok(Vec::new());
         };
-        if active.output.unsupported.is_some() {
-            // Reported (once) when it was found; see OutputState.
-            return Ok(Vec::new());
-        }
         if !self.idr.admit(frame.keyframe) {
             return Ok(Vec::new());
         }
-        active.decode(frame, &mut self.stats, &mut self.idr)
+        let result = active.decode(frame, &mut self.stats, &mut self.idr);
+        let Some(color_format) = active.output.unsupported else {
+            return result;
+        };
+        // Unconvertible output: this codec instance is of no further use.
+        let size = active.sps_size;
+        let why = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => format!("MediaCodec output color format {color_format:#x} is not convertible"),
+        };
+        self.drop_codec("unconvertible output format");
+        if self.backoff.on_failure(Instant::now(), size) {
+            tracing::error!(
+                "{why}; next try on a keyframe after a flush, a size change or {}s",
+                UNSUPPORTED_RETRY.as_secs()
+            );
+            Err(Error::Decoder(why))
+        } else {
+            // Reported less than UNSUPPORTED_RETRY ago: no second error, so
+            // no second flush + keyframe request.
+            tracing::warn!("{why} (retry failed; not reported again yet)");
+            Ok(Vec::new())
+        }
     }
 
     /// The whole of [`Decoder::decode`], run under `catch_unwind`.
@@ -143,7 +182,11 @@ impl MediaCodecDecoder {
             .as_ref()
             .map_or((0, 0), |a| (a.pts.in_flight(), a.pts.dropped()));
         if let Some(line) = self.stats.summary_due(Instant::now(), in_flight, dropped) {
-            tracing::info!("{line} skipped_awaiting_idr={}", self.idr.skipped());
+            tracing::info!(
+                "{line} skipped_awaiting_idr={} output_blocked={}",
+                self.idr.skipped(),
+                self.backoff.is_blocked()
+            );
         }
         result
     }
@@ -153,6 +196,9 @@ impl MediaCodecDecoder {
         // Whatever happens below, the next frame the codec may take is a
         // keyframe.
         self.idr.reset();
+        // A flush (reconnect, gap, or the answer to a reported unconvertible
+        // format) lets the next keyframe try a fresh codec at once.
+        self.backoff.on_flush();
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -193,6 +239,11 @@ impl MediaCodecDecoder {
             );
             self.active = None;
         }
+        if !self.backoff.may_build(Instant::now(), size) {
+            // The last codec's output was unconvertible; see
+            // UnsupportedBackoff for when this keyframe may retry.
+            return Ok(());
+        }
         // Old codec gone (or never there): no references until this
         // keyframe is queued.
         self.idr.reset();
@@ -202,8 +253,12 @@ impl MediaCodecDecoder {
                 "keyframe has no SPS+PPS pair for csd-0/csd-1; relying on in-band parameters"
             );
         }
+        if self.backoff.is_blocked() {
+            tracing::info!("retrying MediaCodec after an unconvertible output format");
+        }
         let active = ActiveCodec::create(size, csd.as_ref(), sps.profile_idc, sps.level_idc)?;
         self.stats.codecs_built += 1;
+        self.backoff.on_built();
         self.active = Some(active);
         Ok(())
     }
@@ -225,7 +280,9 @@ impl Decoder for MediaCodecDecoder {
                 // would otherwise drop it starts over.
                 self.stats.errors += 1;
                 self.errors.ok();
-                Err(Error::Decoder(self.drop_codec_after_panic("decode", &*payload)))
+                Err(Error::Decoder(
+                    self.drop_codec_after_panic("decode", &*payload),
+                ))
             }
         }
     }
@@ -281,6 +338,7 @@ impl ActiveCodec {
                 "SPS size {width}x{height} out of range"
             )));
         }
+        let color_format = requested_color_format();
         let mut last_error = String::new();
         for tier in LatencyTier::LADDER {
             let Some(codec) = MediaCodec::from_decoder_type(MIME_AVC) else {
@@ -288,7 +346,7 @@ impl ActiveCodec {
                     "no {MIME_AVC} decoder on this device"
                 )));
             };
-            let format = build_format(width, height, csd, tier);
+            let format = build_format(width, height, csd, tier, color_format);
             if let Err(e) = codec.configure(&format, None, MediaCodecDirection::Decoder) {
                 tracing::warn!(?tier, "MediaCodec configure rejected: {e}");
                 last_error = format!("configure ({tier:?}): {e}");
@@ -306,6 +364,7 @@ impl ActiveCodec {
                 level_idc,
                 ?tier,
                 csd = csd.is_some(),
+                requested_color_format = ?color_format,
                 "MediaCodec {MIME_AVC} decoder started"
             );
             let now = Instant::now();
@@ -423,10 +482,12 @@ struct OutputState {
     /// Picture size from the SPS the codec was configured with: the crop
     /// fallback when the output format reports none.
     sps_size: (u32, u32),
-    keys: Option<OutputFormatKeys>,
+    /// What was last logged, so an unchanged format is not logged again.
+    logged: Option<(OutputFormatKeys, Option<PlaneLayout>)>,
     layout: Option<PlaneLayout>,
-    /// The raw output color format, once one turned out to be something
-    /// `yuv` cannot convert. Permanent for this codec instance.
+    /// The raw output color format, once neither its keys nor its
+    /// `image-data` gave a layout `yuv` can convert. The decoder then drops
+    /// this codec instance.
     unsupported: Option<i32>,
 }
 
@@ -434,7 +495,7 @@ impl OutputState {
     fn new(sps_size: (u32, u32)) -> Self {
         Self {
             sps_size,
-            keys: None,
+            logged: None,
             layout: None,
             unsupported: None,
         }
@@ -447,36 +508,47 @@ impl OutputState {
         let keys = OutputFormatKeys::read(|k| format.i32(k), crop_rect(format), self.sps_size)
             .map_err(Error::Decoder)?;
         let color_format = normalize_color_format(keys.color_format);
-        if !color_format_supported(color_format) {
-            if self.unsupported.is_none() {
-                tracing::error!(
-                    "MediaCodec output color format {:#x} ({}) is not convertible; this \
-                     decoder instance is disabled until the stream size changes",
-                    keys.color_format,
-                    keys.color_format
-                );
-            }
-            self.unsupported = Some(keys.color_format);
-            return Err(Error::Decoder(format!(
-                "unsupported MediaCodec output color format {:#x}",
-                keys.color_format
-            )));
-        }
-        let layout = yuv::layout_from_format(
-            color_format,
-            keys.width,
-            keys.height,
-            keys.stride,
-            keys.slice_height,
-            keys.crop,
-        );
-        if self.keys != Some(keys) {
-            tracing::info!(
-                "MediaCodec output format: color-format={:#x} ({}, as {}) {}x{} stride={} \
-                 slice-height={} crop={:?} -> {:?}",
-                keys.color_format,
-                keys.color_format,
+        let (layout, source) = if color_format_supported(color_format) {
+            let layout = yuv::layout_from_format(
                 color_format,
+                keys.width,
+                keys.height,
+                keys.stride,
+                keys.slice_height,
+                keys.crop,
+            );
+            (layout, format!("color-format {color_format}"))
+        } else {
+            // YUV420Flexible or a value `yuv` does not know by number: the
+            // layout is described by the MediaImage2 in `image-data`.
+            let parsed = match format.buffer("image-data") {
+                Some(bytes) => layout_from_image_data(bytes, keys.crop),
+                None => Err("the output format has no image-data".to_string()),
+            };
+            match parsed {
+                Ok((layout, name)) => (Ok(layout), format!("image-data {name}")),
+                Err(why) => {
+                    self.unsupported = Some(keys.color_format);
+                    let flexible = if keys.color_format == COLOR_FORMAT_YUV420_FLEXIBLE {
+                        ", YUV420Flexible"
+                    } else {
+                        ""
+                    };
+                    return Err(Error::Decoder(format!(
+                        "MediaCodec output color format {:#x} ({}{flexible}) is not \
+                         convertible: {why}",
+                        keys.color_format, keys.color_format
+                    )));
+                }
+            }
+        };
+        let logged = (keys, layout.as_ref().ok().copied());
+        if self.logged != Some(logged) {
+            tracing::info!(
+                "MediaCodec output format: color-format={:#x} ({}) {}x{} stride={} \
+                 slice-height={} crop={:?} -> via {source}: {:?}",
+                keys.color_format,
+                keys.color_format,
                 keys.width,
                 keys.height,
                 keys.stride,
@@ -484,7 +556,7 @@ impl OutputState {
                 keys.crop,
                 layout
             );
-            self.keys = Some(keys);
+            self.logged = Some(logged);
         }
         self.layout = layout.as_ref().ok().copied();
         layout
@@ -577,11 +649,22 @@ fn drain(
     }
 }
 
+/// The [`COLOR_FORMAT_PROPERTY`] override, if set and valid.
+fn requested_color_format() -> Option<i32> {
+    let value = sys::system_property(COLOR_FORMAT_PROPERTY)?;
+    let parsed = parse_color_format_override(&value);
+    if parsed.is_none() {
+        tracing::warn!("ignoring {COLOR_FORMAT_PROPERTY}={value:?}: not a color format");
+    }
+    parsed
+}
+
 fn build_format(
     width: u32,
     height: u32,
     csd: Option<&(Vec<u8>, Vec<u8>)>,
     tier: LatencyTier,
+    color_format: Option<i32>,
 ) -> MediaFormat {
     let mut format = MediaFormat::new();
     format.set_str("mime", MIME_AVC);
@@ -589,7 +672,11 @@ fn build_format(
     format.set_i32("width", width as i32);
     format.set_i32("height", height as i32);
     format.set_i32("max-input-size", max_input_size(width, height));
-    format.set_i32("color-format", COLOR_FORMAT_YUV420_FLEXIBLE);
+    // Normally unset: the codec's native default is what converts best
+    // (see the module docs).
+    if let Some(color_format) = color_format {
+        format.set_i32("color-format", color_format);
+    }
     if let Some((sps, pps)) = csd {
         format.set_buffer("csd-0", sps);
         format.set_buffer("csd-1", pps);

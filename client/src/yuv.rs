@@ -29,7 +29,9 @@ use directdesk_shared::error::{Error, Result};
 pub enum Chroma {
     /// One interleaved U,V plane (NV12).
     InterleavedUv,
-    /// Separate U then V planes (I420).
+    /// One interleaved V,U plane (NV21): NV12 with each chroma pair swapped.
+    InterleavedVu,
+    /// Separate U and V planes (I420, or YV12 when `v_offset < u_offset`).
     Planar,
 }
 
@@ -41,9 +43,11 @@ pub struct PlaneLayout {
     /// Byte offset of row 0 of the Y plane.
     pub y_offset: usize,
     pub y_stride: usize,
-    /// Byte offset of row 0 of the UV plane (NV12) or the U plane (I420).
+    /// Byte offset of row 0 of the interleaved chroma plane — its first byte
+    /// is U for NV12, V for NV21 — or of the U plane (planar).
     pub u_offset: usize,
-    /// Byte offset of row 0 of the V plane (I420 only; unused for NV12).
+    /// Byte offset of row 0 of the V plane (planar only; unused when
+    /// interleaved).
     pub v_offset: usize,
     /// Row stride of the chroma plane(s).
     pub uv_stride: usize,
@@ -131,7 +135,7 @@ pub fn layout_from_format(
 
     let u_offset = y_stride * slice;
     let (uv_stride, v_offset) = match chroma {
-        Chroma::InterleavedUv => (y_stride, 0),
+        Chroma::InterleavedUv | Chroma::InterleavedVu => (y_stride, 0),
         Chroma::Planar => {
             let uvs = y_stride.div_ceil(2);
             (uvs, u_offset + uvs * slice.div_ceil(2))
@@ -196,7 +200,7 @@ fn validate(src_len: usize, l: &PlaneLayout) -> Result<Geometry> {
     };
     let y_end = end(l.y_offset, l.y_stride, y0 + h - 1, x0 + w);
     let (uv_row_end, planes): (usize, &[usize]) = match l.chroma {
-        Chroma::InterleavedUv => ((cx1 + 1) * 2, &[l.u_offset]),
+        Chroma::InterleavedUv | Chroma::InterleavedVu => ((cx1 + 1) * 2, &[l.u_offset]),
         Chroma::Planar => (cx1 + 1, &[l.u_offset, l.v_offset]),
     };
     if l.uv_stride < uv_row_end {
@@ -270,17 +274,13 @@ fn convert_rows(
 
         // Vertical 0.75 / 0.25 blend into Q2.
         match l.chroma {
-            Chroma::InterleavedUv => {
+            Chroma::InterleavedUv | Chroma::InterleavedVu => {
                 let near = &src[l.u_offset + k * l.uv_stride + g.cx0 * 2..][..cw * 2];
                 let farr = &src[l.u_offset + far * l.uv_stride + g.cx0 * 2..][..cw * 2];
-                for (((n, f), u), v) in near
-                    .chunks_exact(2)
-                    .zip(farr.chunks_exact(2))
-                    .zip(cu.iter_mut())
-                    .zip(cv.iter_mut())
-                {
-                    *u = 3 * n[0] as u16 + f[0] as u16;
-                    *v = 3 * n[1] as u16 + f[1] as u16;
+                if l.chroma == Chroma::InterleavedUv {
+                    blend_interleaved::<0, 1>(near, farr, &mut cu, &mut cv);
+                } else {
+                    blend_interleaved::<1, 0>(near, farr, &mut cu, &mut cv);
                 }
             }
             Chroma::Planar => {
@@ -328,6 +328,27 @@ fn convert_rows(
         {
             px.copy_from_slice(&[r, gc, b, 255]);
         }
+    }
+}
+
+/// Vertical 0.75 / 0.25 blend of one interleaved chroma row pair into Q2
+/// `cu`/`cv`. `U`/`V` are the byte positions of U and V inside each pair:
+/// `<0, 1>` for NV12, `<1, 0>` for NV21. Constant indices keep each variant
+/// the same branch-free, bounds-check-free loop.
+fn blend_interleaved<const U: usize, const V: usize>(
+    near: &[u8],
+    far: &[u8],
+    cu: &mut [u16],
+    cv: &mut [u16],
+) {
+    for (((n, f), u), v) in near
+        .chunks_exact(2)
+        .zip(far.chunks_exact(2))
+        .zip(cu.iter_mut())
+        .zip(cv.iter_mut())
+    {
+        *u = 3 * n[U] as u16 + f[U] as u16;
+        *v = 3 * n[V] as u16 + f[V] as u16;
     }
 }
 
@@ -634,6 +655,96 @@ mod tests {
         // Odd crop sizes are fine.
         let l = layout_from_format(21, 64, 64, 64, 64, Some((1, 1, 7, 5))).unwrap();
         assert_eq!((l.crop_w, l.crop_h), (7, 5));
+    }
+
+    /// The NV21 twin of an NV12 buffer: every chroma pair swapped in place,
+    /// luma and padding untouched.
+    fn swap_chroma_pairs(nv12: &[u8], l: &PlaneLayout, chroma_rows: usize) -> Vec<u8> {
+        let mut nv21 = nv12.to_vec();
+        for r in 0..chroma_rows {
+            let row = l.u_offset + r * l.uv_stride;
+            if row >= nv21.len() {
+                break;
+            }
+            let end = (row + l.uv_stride).min(nv21.len());
+            for pair in nv21[row..end].chunks_exact_mut(2) {
+                pair.swap(0, 1);
+            }
+        }
+        nv21
+    }
+
+    #[test]
+    fn nv21_matches_nv12_from_the_same_planes() {
+        let mut rng = Rng(0x0021_0012);
+        // Tight frames of every test size.
+        for (w, h) in SIZES {
+            let stride = w.next_multiple_of(2);
+            let rows_uv = h.div_ceil(2);
+            let buf = rng.fill(stride * h + stride * rows_uv);
+            let l12 = nv12_layout(w, h, stride, h);
+            let l21 = PlaneLayout {
+                chroma: Chroma::InterleavedVu,
+                ..l12
+            };
+            let nv21 = swap_chroma_pairs(&buf, &l12, rows_uv);
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            yuv420_to_rgba(&buf, &l12, &mut want).unwrap();
+            yuv420_to_rgba(&nv21, &l21, &mut got).unwrap();
+            assert_eq!(got, want, "{w}x{h}");
+        }
+        // Padded strides, a nonzero Y offset and odd crops, on a buffer
+        // trimmed to exactly what the layout needs (an over-read panics).
+        let (pw, ph, stride, slice, y_off) = (37usize, 29usize, 48usize, 32usize, 64usize);
+        let full = rng.fill(y_off + stride * slice + stride * slice / 2);
+        for (x, y, w, h) in [(0, 0, 37, 29), (1, 1, 7, 5), (3, 2, 33, 26), (36, 28, 1, 1)] {
+            let l12 = PlaneLayout {
+                chroma: Chroma::InterleavedUv,
+                y_offset: y_off,
+                y_stride: stride,
+                u_offset: y_off + stride * slice,
+                v_offset: 0,
+                uv_stride: stride,
+                crop_x: x,
+                crop_y: y,
+                crop_w: w,
+                crop_h: h,
+            };
+            let l21 = PlaneLayout {
+                chroma: Chroma::InterleavedVu,
+                ..l12
+            };
+            let (cx1, cy1) = ((x + w - 1) as usize / 2, (y + h - 1) as usize / 2);
+            let exact = (l12.u_offset + cy1 * stride + (cx1 + 1) * 2)
+                .max(y_off + (y + h - 1) as usize * stride + (x + w) as usize);
+            let nv12 = &full[..exact];
+            let nv21 = swap_chroma_pairs(nv12, &l12, ph.div_ceil(2));
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            yuv420_to_rgba(nv12, &l12, &mut want).unwrap();
+            yuv420_to_rgba(&nv21, &l21, &mut got).unwrap();
+            assert_eq!(got, want, "crop {x},{y} {w}x{h} of {pw}x{ph}");
+            assert!(yuv420_to_rgba(&nv21[..exact - 1], &l21, &mut got).is_err());
+        }
+    }
+
+    #[test]
+    fn nv21_is_not_nv12_unless_chroma_is_symmetric() {
+        // Guards against InterleavedVu silently reading U,V: a frame whose U
+        // and V differ must convert differently under the two layouts.
+        let (w, h) = (4usize, 2usize);
+        let mut buf = vec![128u8; w * h];
+        buf.extend_from_slice(&[60, 200, 60, 200]);
+        let l12 = nv12_layout(w, h, w, h);
+        let l21 = PlaneLayout {
+            chroma: Chroma::InterleavedVu,
+            ..l12
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        yuv420_to_rgba(&buf, &l12, &mut a).unwrap();
+        yuv420_to_rgba(&buf, &l21, &mut b).unwrap();
+        assert_ne!(a, b);
+        // U=60, V=200 read as NV12 is reddish (R > B); as NV21 the roles swap.
+        assert!(a[0] > a[2] && b[2] > b[0], "{:?} {:?}", &a[..4], &b[..4]);
     }
 
     /// `cargo test -p directdesk-client --release yuv -- --ignored --nocapture`
