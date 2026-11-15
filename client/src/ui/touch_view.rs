@@ -540,7 +540,7 @@ mod tests {
         r.step(0, &[touch(1, s, 300.0, 200.0)]);
         r.step(60, &[touch(1, egui::TouchPhase::End, 300.0, 200.0)]);
         r.step(100, &[touch(1, s, 300.0, 200.0)]);
-        r.step(300, &[]); // tick: hold presses left
+        r.step(500, &[]); // tick: hold presses left
         assert!(r.f.is_dragging());
         let before = net_down(&drain(&mut r.rx));
         assert_eq!(before, 1); // tap pair nets 0, the hold nets +1

@@ -10,14 +10,24 @@
 //! | gesture                                   | result                                  |
 //! |-------------------------------------------|-----------------------------------------|
 //! | 1-finger drag (> [`TAP_SLOP_PTS`])        | relative cursor move                    |
-//! | tap (<= [`TAP_MAX`], little movement)     | left click at the cursor                |
+//! | tap (lift before [`LONG_PRESS`], no slop) | left click at the cursor                |
 //! | two taps in [`DOUBLE_TAP_WINDOW`]         | two left clicks (host sees a dbl-click) |
-//! | tap, then touch again and hold/drag       | left button DOWN, drag, UP on release   |
+//! | tap, touch again, move past slop          | left button DOWN, drag, UP on release   |
+//! | tap, touch again, hold [`LONG_PRESS`]     | left button DOWN (hold), UP on release  |
 //! | hold >= [`LONG_PRESS`], little movement   | right click                             |
-//! | 2-finger tap (<= [`TWO_FINGER_TAP_MAX`])  | right click                             |
+//! | 2-finger tap (lift before [`LONG_PRESS`]) | right click                             |
 //! | 2-finger drag (centroid moves)            | wheel, vertical and horizontal          |
 //! | 2-finger pinch (distance changes)         | zoom `1.0..=`[`MAX_ZOOM`]               |
 //!
+//! # Frame timing
+//!
+//! egui touch events carry no event time, so `now` is the clock of the frame
+//! that delivered them. When the UI presents slowly (a few fps) a quick tap's
+//! Start and End are a whole frame or more apart. Classification therefore
+//! never asks "was this touch short?"; it asks "did anything decisive happen
+//! first?". A touch that lifts within slop before the long-press fired is a
+//! tap, however long it measured. Only [`LONG_PRESS`] (500 ms, two frames at
+//! 4 fps) and [`DOUBLE_TAP_WINDOW`] depend on the clock.
 //! # Why no button can stick
 //!
 //! Every `Button` down is emitted through [`TouchState::press`] and recorded in
@@ -39,17 +49,17 @@ pub use crate::renderer::MAX_ZOOM;
 pub const MIN_ZOOM: f32 = 1.0;
 /// A finger may wander this far (egui points) and still be a tap / long-press.
 pub const TAP_SLOP_PTS: f32 = 10.0;
-/// Longest touch that still counts as a tap.
-pub const TAP_MAX: Duration = Duration::from_millis(250);
-/// Hold time for the long-press right click.
+/// Hold time for the long-press right click, and for the tap-hold left press.
+/// A touch released before this (without slop) is a tap, however long it
+/// measured; see the module docs on frame timing.
 pub const LONG_PRESS: Duration = Duration::from_millis(500);
 /// A touch starting within this long of a tap's lift is the second half of a
-/// double-tap / tap-hold-drag.
-pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
+/// double-tap / tap-hold-drag. Wider than a typical 300 ms so one coarse
+/// frame (up to ~300 ms between the lift and the next touch's frame) still
+/// counts.
+pub const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 /// ...and within this distance (points) of that tap.
 pub const DOUBLE_TAP_SLOP_PTS: f32 = 40.0;
-/// Longest two-finger touch that still counts as a two-finger tap.
-pub const TWO_FINGER_TAP_MAX: Duration = Duration::from_millis(300);
 /// Centroid / spread change (points) before two fingers become scroll or pinch.
 pub const TWO_FINGER_SLOP_PTS: f32 = 12.0;
 /// Cursor gain at slow speed (1.0 = cursor tracks the finger 1:1 on screen).
@@ -447,7 +457,9 @@ impl TouchState {
                 let mut two = Two {
                     a: o.f,
                     b: finger,
-                    start_time: o.start_time,
+                    // Measured from the second finger landing: the first may
+                    // have waited a coarse frame for its partner.
+                    start_time: now,
                     start_dist: 1.0,
                     start_centroid: ev.pos,
                     last_dist: 1.0,
@@ -509,10 +521,9 @@ impl TouchState {
                 self.timers(&mut o, now, out);
                 if self.held[TouchButton::Left.index()] {
                     self.release(TouchButton::Left, out);
-                } else if !o.long_pressed
-                    && !o.moved
-                    && now.saturating_duration_since(o.start_time) <= TAP_MAX
-                {
+                } else if !o.long_pressed && !o.moved {
+                    // Duration is deliberately not checked: the long-press
+                    // timer above already claimed anything held long enough.
                     self.click(TouchButton::Left, out);
                     self.last_tap = Some((now, o.f.pos));
                 }
@@ -522,9 +533,7 @@ impl TouchState {
             Gesture::Two(t) if t.a.id == ev.id || t.b.id == ev.id => {
                 self.gesture = Gesture::Idle;
                 self.release_all(out);
-                if t.tap_ok
-                    && !t.moved
-                    && now.saturating_duration_since(t.start_time) <= TWO_FINGER_TAP_MAX
+                if t.tap_ok && !t.moved && now.saturating_duration_since(t.start_time) < LONG_PRESS
                 {
                     self.click(TouchButton::Right, out);
                 }
@@ -565,7 +574,7 @@ impl TouchState {
         }
         let held_for = now.saturating_duration_since(o.start_time);
         if o.follow_up {
-            if held_for >= TAP_MAX && !self.held[TouchButton::Left.index()] {
+            if held_for >= LONG_PRESS && !self.held[TouchButton::Left.index()] {
                 self.press(TouchButton::Left, out);
             }
         } else if held_for >= LONG_PRESS {
@@ -795,11 +804,16 @@ mod tests {
     }
 
     #[test]
-    fn slow_touch_without_movement_does_nothing() {
+    fn slow_touch_without_movement_is_still_a_tap_until_long_press() {
         let mut h = H::new();
         h.down(0, 1, 300.0, 200.0);
         let a = h.up(400, 1, 300.0, 200.0);
-        assert!(a.is_empty());
+        assert_eq!(buttons(&a), vec![(L, true), (L, false)]);
+        // Past the long-press with no tick in between: right click, no tap.
+        let mut h = H::new();
+        h.down(0, 1, 300.0, 200.0);
+        let a = h.up(700, 1, 300.0, 200.0);
+        assert_eq!(buttons(&a), vec![(R, true), (R, false)]);
     }
 
     #[test]
@@ -866,8 +880,9 @@ mod tests {
         h.down(0, 1, 300.0, 200.0);
         h.up(60, 1, 300.0, 200.0);
         h.down(100, 1, 300.0, 200.0);
-        // Held past the tap limit with no movement: left goes down on tick.
-        let a = h.tick(300);
+        // Held to the long-press time with no movement: left goes down on tick.
+        assert!(h.tick(300).is_empty());
+        let a = h.tick(200);
         assert_eq!(buttons(&a), vec![(L, true)]);
         assert!(h.s.button_held());
         h.mv(16, 1, 330.0, 200.0);
@@ -897,16 +912,17 @@ mod tests {
         let mut h = H::new();
         h.down(0, 1, 300.0, 200.0);
         h.up(60, 1, 300.0, 200.0);
-        // Too late.
-        h.down(400, 1, 300.0, 200.0);
-        assert!(h.tick(300).is_empty());
+        // Too late. A fresh hold ends in a right click; a follow-up would
+        // have pressed left instead.
+        h.down(450, 1, 300.0, 200.0);
+        assert_eq!(buttons(&h.tick(500)), vec![(R, true), (R, false)]);
         h.up(10, 1, 300.0, 200.0);
         // Too far.
         let mut h = H::new();
         h.down(0, 1, 300.0, 200.0);
         h.up(60, 1, 300.0, 200.0);
         h.down(100, 1, 600.0, 400.0);
-        assert!(h.tick(300).is_empty());
+        assert_eq!(buttons(&h.tick(500)), vec![(R, true), (R, false)]);
     }
 
     #[test]
@@ -964,6 +980,157 @@ mod tests {
         h.down(20, 2, 400.0, 200.0);
         let a = h.up(600, 1, 300.0, 200.0);
         assert!(buttons(&a).is_empty());
+    }
+
+    // ---- coarse / jittery frame timing -----------------------------------
+
+    /// One raw gesture event: (time ms, finger id, phase, x, y).
+    type Raw = (u64, u64, TouchPhase, f32, f32);
+
+    /// Replay `events` as a UI presenting a frame every `q` ms: each event is
+    /// delivered in the first frame at or after its time, then the frame
+    /// `tick`s, as the app does. Runs well past the last event.
+    fn replay_quantized(events: &[Raw], q: u64) -> H {
+        let mut h = H::new();
+        let end = events.iter().map(|e| e.0).max().unwrap_or(0) + 1500;
+        let mut frame = 0;
+        while frame <= end + q {
+            h.ms = frame;
+            for (t, id, phase, x, y) in events {
+                if t.div_ceil(q) * q == frame {
+                    let ev = TouchEvent {
+                        id: *id,
+                        phase: *phase,
+                        pos: pos2(*x, *y),
+                    };
+                    let a = h.s.handle(ev, &h.geo, h.at());
+                    h.log.extend(a);
+                }
+            }
+            let a = h.s.tick(h.at());
+            h.log.extend(a);
+            frame += q;
+        }
+        h
+    }
+
+    /// Frame intervals: fast, 60 fps, slow, and the observed ~4 fps / worse.
+    const FRAMES: [u64; 5] = [8, 16, 100, 250, 300];
+
+    #[test]
+    fn tap_is_a_click_at_any_frame_rate() {
+        use TouchPhase::*;
+        for q in FRAMES {
+            let h = replay_quantized(&[(0, 1, Start, 300., 200.), (60, 1, End, 300., 200.)], q);
+            assert_eq!(buttons(&h.log), vec![(L, true), (L, false)], "q={q}");
+        }
+    }
+
+    #[test]
+    fn double_tap_is_two_clicks_at_any_frame_rate() {
+        use TouchPhase::*;
+        for q in FRAMES {
+            let h = replay_quantized(
+                &[
+                    (0, 1, Start, 300., 200.),
+                    (60, 1, End, 300., 200.),
+                    (160, 1, Start, 302., 201.),
+                    (220, 1, End, 302., 201.),
+                ],
+                q,
+            );
+            assert_eq!(
+                buttons(&h.log),
+                vec![(L, true), (L, false), (L, true), (L, false)],
+                "q={q}"
+            );
+        }
+    }
+
+    #[test]
+    fn tap_drag_holds_left_and_releases_at_any_frame_rate() {
+        use TouchPhase::*;
+        for q in FRAMES {
+            let h = replay_quantized(
+                &[
+                    (0, 1, Start, 300., 200.),
+                    (60, 1, End, 300., 200.),
+                    (160, 1, Start, 300., 200.),
+                    (200, 1, Move, 330., 200.),
+                    (260, 1, Move, 380., 200.),
+                    (300, 1, End, 380., 200.),
+                ],
+                q,
+            );
+            // The tap's click, then press + release around the drag.
+            assert_eq!(
+                buttons(&h.log),
+                vec![(L, true), (L, false), (L, true), (L, false)],
+                "q={q}"
+            );
+            assert!(h.s.cursor().0 > 0.5, "q={q}: cursor did not move");
+            assert!(!h.s.button_held(), "q={q}");
+            let press = h
+                .log
+                .iter()
+                .rposition(|a| matches!(a, TouchAction::Button { pressed: true, .. }))
+                .unwrap();
+            let mv = h
+                .log
+                .iter()
+                .position(|a| matches!(a, TouchAction::MoveTo { .. }))
+                .unwrap();
+            assert!(press < mv, "q={q}: press must precede the first move");
+        }
+    }
+
+    #[test]
+    fn tap_then_hold_still_presses_left_at_any_frame_rate() {
+        use TouchPhase::*;
+        for q in FRAMES {
+            let h = replay_quantized(
+                &[
+                    (0, 1, Start, 300., 200.),
+                    (60, 1, End, 300., 200.),
+                    (160, 1, Start, 300., 200.),
+                    (1000, 1, End, 300., 200.),
+                ],
+                q,
+            );
+            assert_eq!(
+                buttons(&h.log),
+                vec![(L, true), (L, false), (L, true), (L, false)],
+                "q={q}"
+            );
+            assert_eq!(h.s.cursor(), (0.5, 0.5), "q={q}");
+        }
+    }
+
+    #[test]
+    fn long_press_is_one_right_click_at_any_frame_rate() {
+        use TouchPhase::*;
+        for q in FRAMES {
+            let h = replay_quantized(&[(0, 1, Start, 300., 200.), (900, 1, End, 300., 200.)], q);
+            assert_eq!(buttons(&h.log), vec![(R, true), (R, false)], "q={q}");
+        }
+    }
+
+    #[test]
+    fn two_finger_tap_is_a_right_click_at_any_frame_rate() {
+        use TouchPhase::*;
+        for q in FRAMES {
+            let h = replay_quantized(
+                &[
+                    (0, 1, Start, 300., 200.),
+                    (10, 2, Start, 400., 200.),
+                    (80, 2, End, 400., 200.),
+                    (90, 1, End, 300., 200.),
+                ],
+                q,
+            );
+            assert_eq!(buttons(&h.log), vec![(R, true), (R, false)], "q={q}");
+            assert_eq!(h.s.cursor(), (0.5, 0.5), "q={q}");
+        }
     }
 
     fn wheel_total(a: &[TouchAction], horizontal: bool) -> i32 {
@@ -1152,7 +1319,7 @@ mod tests {
         h.down(0, 1, 300.0, 200.0);
         h.up(60, 1, 300.0, 200.0);
         h.down(100, 1, 300.0, 200.0);
-        h.tick(300);
+        h.tick(500);
         assert!(h.s.button_held());
         let a = h.down(10, 2, 400.0, 200.0);
         assert_eq!(buttons(&a), vec![(L, false)]);
@@ -1165,7 +1332,7 @@ mod tests {
         h.down(0, 1, 300.0, 200.0);
         h.up(60, 1, 300.0, 200.0);
         h.down(100, 1, 300.0, 200.0);
-        h.tick(300);
+        h.tick(500);
         let a = h.ev(5, 1, TouchPhase::Cancel, 300.0, 200.0);
         assert_eq!(buttons(&a), vec![(L, false)]);
         assert!(!h.s.is_active());
@@ -1186,7 +1353,7 @@ mod tests {
         h.down(0, 1, 300.0, 200.0);
         h.up(60, 1, 300.0, 200.0);
         h.down(100, 1, 300.0, 200.0);
-        h.tick(300);
+        h.tick(500);
         let a = h.s.reset();
         assert_eq!(buttons(&a), vec![(L, false)]);
         assert!(!h.s.is_active() && !h.s.button_held());
