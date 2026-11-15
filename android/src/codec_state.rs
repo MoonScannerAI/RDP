@@ -214,14 +214,15 @@ pub fn max_input_size(width: u32, height: u32) -> i32 {
 }
 
 /// Which optional low-latency keys a configure attempt sets. Tried in order;
-/// some decoders reject `priority = 0` (realtime) combined with a high
-/// `operating-rate` at configure time, so the codec is rebuilt with fewer
-/// hints until one configures.
+/// the codec is rebuilt with fewer hints until one configures.
+///
+/// There is deliberately no tier with `priority = 0` + a high
+/// `operating-rate`: some vendor decoders are reported (Moonlight's
+/// experience) to *crash* on that combination rather than fail configure,
+/// and a crash is not something this ladder can recover from. The
+/// `low-latency` flags are what matter for a single-frame-in-flight stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatencyTier {
-    /// Everything: `low-latency`, Qualcomm's vendor key, realtime priority
-    /// and a high operating rate.
-    Full,
     /// Low-latency flags only; no realtime/operating-rate demands.
     LowLatencyOnly,
     /// No optional keys at all.
@@ -229,22 +230,12 @@ pub enum LatencyTier {
 }
 
 impl LatencyTier {
-    pub const LADDER: [LatencyTier; 3] = [
-        LatencyTier::Full,
-        LatencyTier::LowLatencyOnly,
-        LatencyTier::Plain,
-    ];
+    pub const LADDER: [LatencyTier; 2] = [LatencyTier::LowLatencyOnly, LatencyTier::Plain];
 
     /// The int32 keys this tier adds to the format. Unknown keys (the vendor
     /// one on non-Qualcomm decoders) are ignored by the codec.
     pub fn keys(self) -> &'static [(&'static str, i32)] {
         match self {
-            LatencyTier::Full => &[
-                ("low-latency", 1),
-                ("vendor.qti-ext-dec-low-latency.enable", 1),
-                ("priority", 0),
-                ("operating-rate", 120),
-            ],
             LatencyTier::LowLatencyOnly => &[
                 ("low-latency", 1),
                 ("vendor.qti-ext-dec-low-latency.enable", 1),
@@ -487,11 +478,11 @@ mod tests {
 
     #[test]
     fn latency_ladder_degrades_to_plain() {
-        assert_eq!(LatencyTier::LADDER[0], LatencyTier::Full);
-        assert!(LatencyTier::Full
+        assert_eq!(LatencyTier::LADDER[0], LatencyTier::LowLatencyOnly);
+        assert!(LatencyTier::LowLatencyOnly
             .keys()
             .iter()
-            .any(|(k, _)| *k == "priority"));
+            .any(|(k, _)| *k == "low-latency"));
         assert!(!LatencyTier::LowLatencyOnly
             .keys()
             .iter()

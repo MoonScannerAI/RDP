@@ -10,7 +10,6 @@
 //! * `mediacodec`  — `Decoder` over AMediaCodec (sync ByteBuffer mode).
 //! * `logcat`      — tracing/log → logcat (tag `DirectDesk`), panic hook.
 //! * `sys`         — the raw liblog / system-property FFI.
-//! * `store_shim`  — TEMPORARY plaintext `SecretStore` (TODO(W2 merge)).
 //! * `codec_state`, `log_chunks` — platform-neutral helpers. They are also
 //!   compiled under `cfg(test)` so their unit tests run on Windows with
 //!   `cargo test --workspace`; a normal Windows build of this crate is still
@@ -31,7 +30,5 @@ mod app_main;
 mod logcat;
 #[cfg(target_os = "android")]
 mod mediacodec;
-#[cfg(target_os = "android")]
-mod store_shim;
 #[cfg(target_os = "android")]
 mod sys;

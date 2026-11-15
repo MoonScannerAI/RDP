@@ -10,16 +10,12 @@ use std::time::{Duration, Instant};
 use android_activity::{AndroidApp, MainEvent, PollEvent, WindowManagerFlags};
 use directdesk_client::app::{self, LaunchArgs, PlatformConfig, UiProfile};
 use directdesk_client::connect::StreamCaps;
-use directdesk_client::monitors::MonitorChoice;
-use directdesk_shared::crypto::storage::SecretStore;
+use directdesk_shared::crypto::storage::{PlainFileStore, SecretStore};
 use jni::objects::JObject;
 use jni::{jni_sig, jni_str};
 
 use crate::logcat;
 use crate::mediacodec;
-// TODO(W2 merge): use directdesk_shared::crypto::storage::PlainFileStore and
-// delete `store_shim.rs`.
-use crate::store_shim::PlainFileStore;
 use crate::sys;
 
 /// Frame rate of the built-in loopback demo, should someone enable it.
@@ -164,7 +160,7 @@ fn run(app: AndroidApp) -> anyhow::Result<()> {
         data_dir,
         store,
         new_decoder: mediacodec::new_decoder,
-        caps: touch_caps(),
+        caps: StreamCaps::touch_device(),
         default_display_name,
         launch: LaunchArgs {
             demo_fps: DEMO_FPS,
@@ -188,21 +184,9 @@ fn open_store(data_dir: Option<&Path>) -> Result<Arc<dyn SecretStore>, String> {
     // clear reason instead of failing at the first pairing.
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     tracing::info!("secret store: {}", dir.display());
-    // TODO(W2 merge): directdesk_shared::crypto::storage::PlainFileStore::new(dir)
-    Ok(Arc::new(PlainFileStore::new(dir)))
-}
-
-/// Touch-device stream capabilities: no audio, no lossless tiles, primary
-/// monitor only, 30 fps.
-// TODO(W1 merge): StreamCaps::touch_device()
-fn touch_caps() -> StreamCaps {
-    StreamCaps {
-        preferred_fps: 30,
-        lossless_tiles: false,
-        system_audio: false,
-        monitor_choice: MonitorChoice::Primary,
-        ..StreamCaps::default()
-    }
+    let store = PlainFileStore::new(&dir)
+        .map_err(|e| format!("cannot open secret store {}: {e}", dir.display()))?;
+    Ok(Arc::new(store))
 }
 
 /// "Android <model>", e.g. "Android Pixel 6".
