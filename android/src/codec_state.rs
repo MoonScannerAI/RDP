@@ -13,6 +13,93 @@ use std::time::{Duration, Instant};
 /// vendor NV12 variant) that the output format then names.
 pub const COLOR_FORMAT_YUV420_FLEXIBLE: i32 = 0x7F42_0888;
 
+/// `COLOR_FormatYUV420Planar` (I420) and `COLOR_FormatYUV420SemiPlanar`
+/// (NV12): the two layouts `yuv::layout_from_format` names by number.
+const COLOR_FORMAT_YUV420_PLANAR: i32 = 19;
+const COLOR_FORMAT_YUV420_SEMIPLANAR: i32 = 21;
+/// `COLOR_FormatYUV420PackedPlanar` / `COLOR_FormatYUV420PackedSemiPlanar`:
+/// "packed" only promises no padding between the planes, which the stride and
+/// slice-height keys already describe, so they are I420 / NV12.
+const COLOR_FORMAT_YUV420_PACKED_PLANAR: i32 = 20;
+const COLOR_FORMAT_YUV420_PACKED_SEMIPLANAR: i32 = 39;
+
+/// Map MediaCodec color-format aliases onto the value
+/// `yuv::layout_from_format` understands; everything else passes through.
+pub fn normalize_color_format(color_format: i32) -> i32 {
+    match color_format {
+        COLOR_FORMAT_YUV420_PACKED_PLANAR => COLOR_FORMAT_YUV420_PLANAR,
+        COLOR_FORMAT_YUV420_PACKED_SEMIPLANAR => COLOR_FORMAT_YUV420_SEMIPLANAR,
+        other => other,
+    }
+}
+
+/// Whether `yuv::layout_from_format` can convert this (already normalized)
+/// color format at all, independent of any picture geometry: it is asked
+/// for a trivially valid 2x2 layout, so only the format itself can fail.
+/// Asking `yuv` rather than copying its list keeps the two from drifting.
+pub fn color_format_supported(color_format: i32) -> bool {
+    directdesk_client::yuv::layout_from_format(color_format, 2, 2, 0, 0, None).is_ok()
+}
+
+/// Decides which frames may be queued into the codec: after a flush, or on a
+/// brand-new codec, nothing but a keyframe has a valid reference, so delta
+/// frames are held back until one keyframe has gone in. Queuing them would
+/// at best waste the codec's time and at worst produce smeared pictures.
+#[derive(Debug)]
+pub struct IdrGate {
+    awaiting: bool,
+    skipped: u64,
+}
+
+impl IdrGate {
+    /// Starts out awaiting: there is no codec, let alone a reference.
+    pub fn new() -> Self {
+        Self {
+            awaiting: true,
+            skipped: 0,
+        }
+    }
+
+    /// The codec lost its references (flush, codec created or dropped).
+    pub fn reset(&mut self) {
+        self.awaiting = true;
+    }
+
+    /// May this frame be queued? A refused delta frame is counted.
+    pub fn admit(&mut self, keyframe: bool) -> bool {
+        if keyframe || !self.awaiting {
+            true
+        } else {
+            self.skipped += 1;
+            false
+        }
+    }
+
+    /// A frame was actually queued into the codec. Only a keyframe ends the
+    /// wait — a keyframe that failed to queue leaves it in place.
+    pub fn on_queued(&mut self, keyframe: bool) {
+        if keyframe {
+            self.awaiting = false;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn awaiting(&self) -> bool {
+        self.awaiting
+    }
+
+    /// Delta frames refused so far.
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+}
+
+impl Default for IdrGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// After this many consecutive failed `decode` calls the codec is dropped;
 /// the next keyframe builds a fresh one.
 pub const ERROR_LIMIT: u32 = 3;
@@ -164,7 +251,8 @@ pub struct OutputFormatKeys {
     pub stride: i32,
     /// 0 when the codec did not report it (falls back to `height`).
     pub slice_height: i32,
-    /// Inclusive (left, top, right, bottom), when the codec reported one.
+    /// Inclusive (left, top, right, bottom): the codec's own crop, or the
+    /// SPS-size fallback (see [`OutputFormatKeys::read`]).
     pub crop: Option<(i32, i32, i32, i32)>,
 }
 
@@ -172,9 +260,18 @@ impl OutputFormatKeys {
     /// `get_i32` reads one int32 key. `crop_rect` is the API-28 `"crop"` rect
     /// when it could be read; otherwise the four Java-style `crop-*` int keys
     /// are tried, and only all four together count.
+    ///
+    /// When neither yields a crop — always the case on API 26/27, where the
+    /// crop is stored as a rect the NDK cannot read and the int keys do not
+    /// exist — and the codec's picture is larger than `sps_size` (the
+    /// display size after SPS cropping, which the codec was configured
+    /// with), the visible picture is taken to be the top-left `sps_size`
+    /// rectangle: a 1920x1088 output then yields 1920x1080, not 8 rows of
+    /// padding.
     pub fn read(
         get_i32: impl Fn(&str) -> Option<i32>,
         crop_rect: Option<(i32, i32, i32, i32)>,
+        sps_size: (u32, u32),
     ) -> Result<Self, String> {
         let color_format = get_i32("color-format").ok_or("output format has no color-format")?;
         let width = get_i32("width")
@@ -183,14 +280,16 @@ impl OutputFormatKeys {
         let height = get_i32("height")
             .filter(|h| *h > 0)
             .ok_or("output format has no height")?;
-        let crop = crop_rect.or_else(|| {
-            Some((
-                get_i32("crop-left")?,
-                get_i32("crop-top")?,
-                get_i32("crop-right")?,
-                get_i32("crop-bottom")?,
-            ))
-        });
+        let crop = crop_rect
+            .or_else(|| {
+                Some((
+                    get_i32("crop-left")?,
+                    get_i32("crop-top")?,
+                    get_i32("crop-right")?,
+                    get_i32("crop-bottom")?,
+                ))
+            })
+            .or_else(|| sps_crop(width, height, sps_size));
         Ok(Self {
             color_format,
             width,
@@ -200,6 +299,16 @@ impl OutputFormatKeys {
             crop,
         })
     }
+}
+
+/// The top-left `sps_size` rectangle of a `width x height` picture, when that
+/// picture is strictly larger (never larger in one dimension and smaller in
+/// the other, which no padding explains).
+fn sps_crop(width: i32, height: i32, sps_size: (u32, u32)) -> Option<(i32, i32, i32, i32)> {
+    let sps_w = i32::try_from(sps_size.0).ok().filter(|w| *w > 0)?;
+    let sps_h = i32::try_from(sps_size.1).ok().filter(|h| *h > 0)?;
+    let padded = sps_w <= width && sps_h <= height && (sps_w, sps_h) != (width, height);
+    padded.then_some((0, 0, sps_w - 1, sps_h - 1))
 }
 
 /// `max-input-size` for a `width x height` stream: an uncompressed 4:2:0
@@ -423,7 +532,7 @@ mod tests {
             ("stride", 2560),
             ("slice-height", 1600),
         ]);
-        let k = OutputFormatKeys::read(&get, Some((0, 0, 2559, 1599))).unwrap();
+        let k = OutputFormatKeys::read(&get, Some((0, 0, 2559, 1599)), (2560, 1600)).unwrap();
         assert_eq!(k.color_format, 19);
         assert_eq!(
             (k.width, k.height, k.stride, k.slice_height),
@@ -443,7 +552,8 @@ mod tests {
             ("crop-right", 1919),
             ("crop-bottom", 1079),
         ]);
-        let k = OutputFormatKeys::read(&get, None).unwrap();
+        // The codec's crop wins over the SPS fallback even when they differ.
+        let k = OutputFormatKeys::read(&get, None, (1600, 900)).unwrap();
         assert_eq!(k.crop, Some((0, 0, 1919, 1079)));
         assert_eq!((k.stride, k.slice_height), (0, 0));
     }
@@ -456,11 +566,102 @@ mod tests {
             ("height", 64),
             ("crop-left", 2),
         ]);
-        assert_eq!(OutputFormatKeys::read(&get, None).unwrap().crop, None);
+        assert_eq!(OutputFormatKeys::read(&get, None, (64, 64)).unwrap().crop, None);
         let no_color = lookup(&[("width", 64), ("height", 64)]);
-        assert!(OutputFormatKeys::read(no_color, None).is_err());
+        assert!(OutputFormatKeys::read(no_color, None, (64, 64)).is_err());
         let zero_w = lookup(&[("color-format", 19), ("width", 0), ("height", 64)]);
-        assert!(OutputFormatKeys::read(zero_w, None).is_err());
+        assert!(OutputFormatKeys::read(zero_w, None, (64, 64)).is_err());
+    }
+
+    #[test]
+    fn missing_crop_falls_back_to_the_sps_size_on_a_padded_picture() {
+        // API 26/27: no "crop" rect, no crop-* ints, 16-row-aligned height.
+        let get = lookup(&[
+            ("color-format", 21),
+            ("width", 1920),
+            ("height", 1088),
+            ("stride", 1920),
+            ("slice-height", 1088),
+        ]);
+        let k = OutputFormatKeys::read(&get, None, (1920, 1080)).unwrap();
+        assert_eq!(k.crop, Some((0, 0, 1919, 1079)));
+        let layout = directdesk_client::yuv::layout_from_format(
+            k.color_format,
+            k.width,
+            k.height,
+            k.stride,
+            k.slice_height,
+            k.crop,
+        )
+        .unwrap();
+        assert_eq!((layout.crop_w, layout.crop_h), (1920, 1080));
+    }
+
+    #[test]
+    fn sps_fallback_only_for_a_strictly_padded_picture() {
+        // Same size: the full frame (None) is already right.
+        assert_eq!(sps_crop(1920, 1080, (1920, 1080)), None);
+        // Padded in either or both dimensions.
+        assert_eq!(sps_crop(1920, 1088, (1920, 1080)), Some((0, 0, 1919, 1079)));
+        assert_eq!(sps_crop(1376, 768, (1366, 768)), Some((0, 0, 1365, 767)));
+        assert_eq!(sps_crop(1920, 1088, (1918, 1080)), Some((0, 0, 1917, 1079)));
+        // Codec picture smaller than the SPS in any dimension: no guess.
+        assert_eq!(sps_crop(1920, 1072, (1920, 1080)), None);
+        assert_eq!(sps_crop(1936, 1072, (1920, 1080)), None);
+        // Degenerate SPS sizes never produce a rect.
+        assert_eq!(sps_crop(64, 64, (0, 0)), None);
+        assert_eq!(sps_crop(64, 64, (u32::MAX, 8)), None);
+    }
+
+    #[test]
+    fn packed_color_format_aliases_map_to_supported_layouts() {
+        assert_eq!(normalize_color_format(20), 19);
+        assert_eq!(normalize_color_format(39), 21);
+        for passthrough in [19, 21, 0x7FA3_0C00, 0x7FA3_0C04, COLOR_FORMAT_YUV420_FLEXIBLE] {
+            assert_eq!(normalize_color_format(passthrough), passthrough);
+        }
+        for cf in [19, 20, 21, 39, 0x7FA3_0C00, 0x7FA3_0C04] {
+            assert!(
+                color_format_supported(normalize_color_format(cf)),
+                "{cf:#x} should convert"
+            );
+        }
+        // Raw aliases are not something yuv knows by itself...
+        assert!(!color_format_supported(20));
+        assert!(!color_format_supported(39));
+        // ...and neither is "flexible" (needs the Image API) or garbage.
+        assert!(!color_format_supported(COLOR_FORMAT_YUV420_FLEXIBLE));
+        assert!(!color_format_supported(0));
+    }
+
+    #[test]
+    fn idr_gate_holds_delta_frames_until_a_keyframe_is_queued() {
+        let mut g = IdrGate::new();
+        // Fresh: nothing to reference yet.
+        assert!(g.awaiting());
+        assert!(!g.admit(false));
+        assert!(!g.admit(false));
+        assert_eq!(g.skipped(), 2);
+        // A keyframe is admitted, but only queuing it ends the wait.
+        assert!(g.admit(true));
+        assert!(g.awaiting(), "admitted is not queued");
+        assert!(!g.admit(false));
+        g.on_queued(true);
+        assert!(!g.awaiting());
+        assert!(g.admit(false));
+        g.on_queued(false);
+        assert!(g.admit(false));
+        assert_eq!(g.skipped(), 3);
+        // Flush (or a new codec): back to waiting.
+        g.reset();
+        assert!(!g.admit(false));
+        // Queuing a delta frame never ends the wait.
+        g.on_queued(false);
+        assert!(g.awaiting());
+        assert!(g.admit(true));
+        g.on_queued(true);
+        assert!(g.admit(false));
+        assert_eq!(g.skipped(), 4);
     }
 
     #[test]

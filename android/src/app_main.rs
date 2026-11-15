@@ -16,16 +16,25 @@ use jni::{jni_sig, jni_str};
 
 use crate::logcat;
 use crate::mediacodec;
+use crate::store_dir::{self, Migration};
 use crate::sys;
 
 /// Frame rate of the built-in loopback demo, should someone enable it.
 const DEMO_FPS: u32 = 30;
 
-/// Called by android-activity on a dedicated thread once the NativeActivity
-/// is created, once per Activity instance.
-///
 /// How long to wait for `MainEvent::Destroy` after `Activity.finish()`.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How often the destroy watchdog looks at the Activity.
+const WATCHDOG_PERIOD: Duration = Duration::from_millis(250);
+
+/// Consecutive failed watchdog checks (~10 s) after which it gives up.
+const WATCHDOG_MAX_FAILURES: u32 = 40;
+
+/// Set once this process has started ending the Activity itself (rule 1
+/// below). The destroy watchdog (rule 2) then stands down, so the two never
+/// both act on the same finish.
+static SELF_FINISHING: AtomicBool = AtomicBool::new(false);
 
 /// Called by android-activity on a dedicated thread once the NativeActivity
 /// is created, once per Activity instance.
@@ -36,7 +45,11 @@ const FINISH_TIMEOUT: Duration = Duration::from_secs(3);
 /// `EVENT_LOOP_CREATED` flag that is never reset), while android-activity
 /// starts a new `android_main` for every `onCreate`. A second `app::run` in
 /// the same process would fail with `RecreationAttempt` and leave a dead
-/// Activity. So:
+/// Activity. Worse, winit 0.30.13 ignores `MainEvent::Destroy` (it only logs
+/// a TODO), so `app::run` does not return when Android destroys the
+/// Activity — while android-activity's `onDestroy` blocks the Java main
+/// thread until `android_main` returns. A destroy this process did not start
+/// would freeze the window and end in an ANR. So:
 ///
 /// 1. After [`app::run`] returns (for any reason, panics included) the
 ///    process ends — but only once the Activity is gone: `Activity.finish()`,
@@ -47,14 +60,34 @@ const FINISH_TIMEOUT: Duration = Duration::from_secs(3);
 ///    `exit()`'s static destructors raced hwui's RenderThread into SIGABRT.
 ///    Hence finish-first, and `_exit` rather than `exit`. If the finish or
 ///    the Destroy does not happen, this returns instead and android-activity
-///    finishes the Activity (the process then stays cached; rule 2 covers
+///    finishes the Activity (the process then stays cached; rule 3 covers
 ///    the next launch).
-/// 2. A second entry in the same process (relaunch into a cached process,
-///    or an Activity re-created for a config change not in the manifest's
-///    `configChanges`) logs and ends the process immediately with `_exit(0)`.
-///    That Activity is the top one, so ActivityManager restarts it once, in
-///    a fresh process, where rule 1's path runs normally (measured: one
-///    restart, ~150 ms).
+/// 2. A destroy watchdog thread checks the Activity every
+///    [`WATCHDOG_PERIOD`] and, once Android is taking it down on its own,
+///    ends the process with `_exit(0)` instead of letting `onDestroy` hang:
+///    * `isFinishing()` — someone else finished it (Back on API < 31, a task
+///      removed or cleared, `am`); true from `finish()` on, and set before
+///      `onDestroy` for system-side finishes. A finishing Activity is not
+///      restarted.
+///    * `isChangingConfigurations()` — re-created for a configuration
+///      change. The manifest's `configChanges` lists every flag an app can
+///      declare, so this takes an undeclarable change (asset paths, e.g. a
+///      theme overlay) or `recreate()`; true from the start of the relaunch.
+///      A relaunching Activity has no saved state, so ActivityManager would
+///      drop it when the process dies; the manifest's `stateNotNeeded`
+///      makes it restart the (top) Activity in a fresh process instead.
+///      Measured on the API 34 emulator (cutout-overlay toggle): watchdog
+///      fires ~125 ms after the ignored Destroy, new process ~130 ms later.
+///    * `isDestroyed()` — any other destroy, e.g. the "Don't keep
+///      activities" developer option, which destroys a stopped Activity
+///      without finishing it: `Activity.performDestroy` sets it before
+///      calling `onDestroy`, i.e. while our `onDestroy` is blocked
+///      (measured: fires; returning to the app cold-starts it).
+/// 3. A second entry in the same process (relaunch into a cached process
+///    after rule 1 fell back to returning) logs and ends the process
+///    immediately with `_exit(0)`. That Activity is the top one, so
+///    ActivityManager restarts it once, in a fresh process, where rule 1's
+///    path runs normally (measured: one restart, ~150 ms).
 #[no_mangle]
 fn android_main(app: AndroidApp) {
     logcat::init();
@@ -72,6 +105,7 @@ fn android_main(app: AndroidApp) {
         version = env!("CARGO_PKG_VERSION"),
         "DirectDesk for Android starting"
     );
+    spawn_destroy_watchdog(&app);
     let run_app = app.clone();
     match std::panic::catch_unwind(AssertUnwindSafe(|| run(run_app))) {
         Ok(Ok(())) => tracing::info!("app::run returned"),
@@ -85,6 +119,12 @@ fn android_main(app: AndroidApp) {
 /// Rule 1 above: finish the Activity, wait for its Destroy, end the process.
 /// Returns only if that could not be done.
 fn finish_then_exit(app: &AndroidApp) {
+    // From here on this thread owns the process's end; the watchdog stands
+    // down. A watchdog check that was already past its first look at the
+    // flag re-reads it after querying the Activity, and even a lost race
+    // only ends the process before the Destroy, after `finish()` was
+    // accepted, which ActivityManager does not answer with a restart.
+    SELF_FINISHING.store(true, Ordering::SeqCst);
     if let Err(e) = request_finish(app) {
         tracing::warn!("Activity.finish() failed ({e}); returning so android-activity finishes it");
         return;
@@ -126,6 +166,117 @@ fn request_finish(app: &AndroidApp) -> Result<(), String> {
         Ok(())
     })
     .map_err(|e| e.to_string())
+}
+
+/// Rule 2 above. The thread owns a clone of `app`, which keeps the Activity
+/// global reference it queries valid for the thread's whole life.
+fn spawn_destroy_watchdog(app: &AndroidApp) {
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("dd-destroy-watch".into())
+        .spawn(move || destroy_watchdog(&app));
+    if let Err(e) = spawned {
+        tracing::error!("cannot start the destroy watchdog: {e}");
+    }
+}
+
+fn destroy_watchdog(app: &AndroidApp) {
+    let vm = match jni::JavaVM::singleton() {
+        Ok(vm) => vm,
+        Err(e) => {
+            tracing::error!("destroy watchdog: no JavaVM: {e}");
+            return;
+        }
+    };
+    let activity = app.activity_as_ptr() as jni::sys::jobject;
+    // Attached once, for the thread's life; each check runs in its own
+    // local frame (see `destroy_reason`).
+    let attached = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        let mut failures = 0u32;
+        loop {
+            std::thread::sleep(WATCHDOG_PERIOD);
+            if SELF_FINISHING.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            match destroy_reason(env, activity) {
+                Ok(None) => failures = 0,
+                Ok(Some(reason)) => {
+                    if SELF_FINISHING.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        "Activity {reason} by Android, not by us; winit cannot survive its \
+                         onDestroy, ending the process"
+                    );
+                    exit_now();
+                }
+                Err(e) => {
+                    failures += 1;
+                    if failures == 1 {
+                        tracing::warn!("destroy watchdog: Activity check failed: {e}");
+                    }
+                    if failures >= WATCHDOG_MAX_FAILURES {
+                        tracing::error!(
+                            "destroy watchdog: giving up after {failures} failed checks; last: {e}"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    });
+    if let Err(e) = attached {
+        tracing::error!("destroy watchdog stopped: {e}");
+    }
+}
+
+/// Why the Activity is going away, if it is: one check, in its own JNI local
+/// frame so the per-call class and result references never pile up. A Java
+/// exception thrown by a call is cleared (and returned as the error) inside
+/// the frame, so the frame pops cleanly and the next check starts clean.
+fn destroy_reason(
+    env: &mut jni::Env<'_>,
+    activity: jni::sys::jobject,
+) -> jni::errors::Result<Option<&'static str>> {
+    env.with_local_frame(8, |env| -> jni::errors::Result<Option<&'static str>> {
+        let result = query_activity(env, activity);
+        if result.is_err() {
+            // Err(CaughtJavaException) if one was pending; else the original.
+            env.exception_catch()?;
+        }
+        result
+    })
+}
+
+fn query_activity(
+    env: &mut jni::Env<'_>,
+    activity: jni::sys::jobject,
+) -> jni::errors::Result<Option<&'static str>> {
+    // SAFETY: `activity` is android-activity's global reference, valid while
+    // the watchdog's `AndroidApp` clone lives (the caller's whole life), and
+    // a `Cast` borrows it without ever deleting it.
+    let activity = unsafe { env.as_cast_raw::<JObject>(&activity)? };
+    let finishing = env
+        .call_method(&activity, jni_str!("isFinishing"), jni_sig!("()Z"), &[])?
+        .z()?;
+    if finishing {
+        return Ok(Some("finishing"));
+    }
+    let changing = env
+        .call_method(
+            &activity,
+            jni_str!("isChangingConfigurations"),
+            jni_sig!("()Z"),
+            &[],
+        )?
+        .z()?;
+    if changing {
+        return Ok(Some("re-created for a configuration change"));
+    }
+    let destroyed = env
+        .call_method(&activity, jni_str!("isDestroyed"), jni_sig!("()Z"), &[])?
+        .z()?;
+    Ok(destroyed.then_some("destroyed"))
 }
 
 /// End the process now.
@@ -174,15 +325,35 @@ fn run(app: AndroidApp) -> anyhow::Result<()> {
     app::run(cfg)
 }
 
-/// Client identity and trusted hosts: plaintext files under
-/// `<internal data>/keys`, private to this app's UID.
+/// Client identity and trusted hosts: plaintext files in `<app data>/no_backup`
+/// (excluded from backup and device-to-device transfer; see `store_dir`),
+/// private to this app's UID. `client.json` stays in the internal data dir.
 fn open_store(data_dir: Option<&Path>) -> Result<Arc<dyn SecretStore>, String> {
-    let dir = data_dir
-        .ok_or_else(|| "no app-private data directory".to_string())?
-        .join("keys");
+    let files = data_dir.ok_or_else(|| "no app-private data directory".to_string())?;
+    let dir = store_dir::store_dir(files)
+        .ok_or_else(|| format!("{} has no parent for no_backup", files.display()))?;
     // Created up front so an unusable directory disables Connect with a
     // clear reason instead of failing at the first pairing.
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let legacy = store_dir::legacy_store_dir(files);
+    match store_dir::migrate(&legacy, &dir) {
+        Ok(Migration::NothingToMove) => {}
+        Ok(Migration::Moved(n)) => tracing::info!(
+            "moved {n} secret store file(s) from {} to {}",
+            legacy.display(),
+            dir.display()
+        ),
+        Ok(Migration::LeftBehind(n)) => tracing::warn!(
+            "{} already holds the secret store; left {n} older file(s) in {}",
+            dir.display(),
+            legacy.display()
+        ),
+        Err(e) => tracing::error!(
+            "could not move the secret store from {} to {}: {e}",
+            legacy.display(),
+            dir.display()
+        ),
+    }
     tracing::info!("secret store: {}", dir.display());
     let store = PlainFileStore::new(&dir)
         .map_err(|e| format!("cannot open secret store {}: {e}", dir.display()))?;

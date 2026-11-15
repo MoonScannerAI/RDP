@@ -4,9 +4,21 @@
     Build the DirectDesk Android APK without Gradle.
 
 .DESCRIPTION
-    cargo ndk (release profile, minSdk 26) -> aapt2 link (manifest only) ->
-    aapt add lib/<abi>/libdirectdesk_android.so -> zipalign -> apksigner sign
-    -> apksigner verify.
+    cargo ndk (release profile, minSdk 26) -> 16 KB page-alignment check
+    (llvm-readelf) -> aapt2 link (manifest only) -> aapt add
+    lib/<abi>/libdirectdesk_android.so -> zipalign -> apksigner sign ->
+    apksigner verify.
+
+    16 KB pages: Android 15+ devices with 16 KB pages refuse to load a .so
+    whose LOAD segments are aligned to less than 16 KB, and NDK r27 links
+    with 4 KB by default. cargo-ndk 4.x already passes
+    -z max-page-size=16384 for 64-bit targets on NDK <= r27; this script also
+    passes it itself (CARGO_TARGET_<TRIPLE>_RUSTFLAGS, Android targets only,
+    so the Windows build is untouched) so the result does not depend on the
+    cargo-ndk version, and then fails the build if any LOAD segment of the
+    built library is aligned to less than 0x4000. (RUSTFLAGS or
+    CARGO_ENCODED_RUSTFLAGS in the environment make cargo ignore the
+    per-target variable; the check still catches the outcome.)
 
     Output: target\android\DirectDesk-debug.apk or DirectDesk-release.apk
     (under CARGO_TARGET_DIR when that is set). The Rust code is always built
@@ -65,6 +77,9 @@ $AbiTriples = [ordered]@{
     'arm64-v8a' = 'aarch64-linux-android'
     'x86_64'    = 'x86_64-linux-android'
 }
+# 16 KB: the largest page size Android ships (see .DESCRIPTION).
+$PageSizeLinkArg = '-C link-arg=-Wl,-z,max-page-size=16384'
+$MinLoadAlign = 0x4000
 
 function Fail([string]$Message) {
     throw $Message
@@ -84,6 +99,22 @@ function Invoke-Tool {
 function Step([string]$Text) {
     Write-Host ""
     Write-Host "==> $Text" -ForegroundColor Cyan
+}
+
+# Fail unless every PT_LOAD segment of $So is aligned to at least
+# $MinLoadAlign. Prints the alignments it found.
+function Assert-PageAlignment([string]$ReadElf, [string]$So, [string]$Label) {
+    $out = & $ReadElf -lW $So
+    if ($LASTEXITCODE -ne 0) { Fail "llvm-readelf -lW failed on $So (exit code $LASTEXITCODE)" }
+    # "  LOAD  0x000000 0x... 0x... 0x... 0x... R E 0x4000": Align is last.
+    $aligns = @($out | Where-Object { $_ -match '^\s*LOAD\s' } |
+        ForEach-Object { ($_.Trim() -split '\s+')[-1] })
+    if ($aligns.Count -eq 0) { Fail "no LOAD segments found in $So" }
+    $bad = @($aligns | Where-Object { [Convert]::ToInt64($_, 16) -lt $MinLoadAlign })
+    Write-Host ("    {0}: LOAD Align {1}" -f $Label, ($aligns -join ' '))
+    if ($bad.Count -gt 0) {
+        Fail ("$So has LOAD segments aligned below 0x{0:x} ({1}): it will not load on 16 KB-page devices" -f $MinLoadAlign, ($bad -join ' '))
+    }
 }
 
 function Use-UserEnv([string]$Name) {
@@ -107,7 +138,10 @@ try {
     $env:PATH = "$env:USERPROFILE\.cargo\bin;C:\Program Files\Git\bin;$env:PATH"
     $JavaHome = Use-UserEnv 'JAVA_HOME'
     $AndroidHome = Use-UserEnv 'ANDROID_HOME'
-    $null = Use-UserEnv 'ANDROID_NDK_HOME'
+    $NdkHome = Use-UserEnv 'ANDROID_NDK_HOME'
+    $ReadElf = Get-ChildItem (Join-Path $NdkHome 'toolchains\llvm\prebuilt\*\bin\llvm-readelf*') -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+    if ([string]::IsNullOrEmpty($ReadElf)) { Fail "llvm-readelf not found under $NdkHome\toolchains\llvm\prebuilt" }
 
     if ($Abi -eq 'all') { $Abis = @($AbiTriples.Keys) } else { $Abis = @($Abi) }
     if ($Release) { $Flavor = 'release' } else { $Flavor = 'debug' }
@@ -195,7 +229,36 @@ try {
     $ndkArgs = @('ndk')
     foreach ($a in $Abis) { $ndkArgs += @('-t', $a) }
     $ndkArgs += @('-P', "$MinSdk", 'build', '-p', 'directdesk-android', '--release')
-    Invoke-Tool 'cargo ndk build' 'cargo' $ndkArgs
+    foreach ($v in @('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS')) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($v, 'Process'))) {
+            Write-Host "$v is set, so cargo ignores the per-target 16 KB page-size flag; relying on cargo-ndk and the alignment check" -ForegroundColor Yellow
+        }
+    }
+    # Per-target, appended to any existing value, and restored afterwards so
+    # a dot-sourced or `&`-invoked run leaves the session as it found it.
+    $savedRustFlags = @{}
+    try {
+        foreach ($triple in $triples) {
+            $var = 'CARGO_TARGET_' + ($triple.ToUpperInvariant() -replace '-', '_') + '_RUSTFLAGS'
+            $old = [Environment]::GetEnvironmentVariable($var, 'Process')
+            $savedRustFlags[$var] = $old
+            $new = if ([string]::IsNullOrEmpty($old)) { $PageSizeLinkArg } else { "$old $PageSizeLinkArg" }
+            [Environment]::SetEnvironmentVariable($var, $new, 'Process')
+            Write-Host "    $var=$new" -ForegroundColor DarkGray
+        }
+        Invoke-Tool 'cargo ndk build' 'cargo' $ndkArgs
+    } finally {
+        foreach ($var in $savedRustFlags.Keys) {
+            [Environment]::SetEnvironmentVariable($var, $savedRustFlags[$var], 'Process')
+        }
+    }
+
+    Step "Checking 16 KB page alignment"
+    foreach ($a in $Abis) {
+        $so = Join-Path $TargetDir "$($AbiTriples[$a])\release\$LibName"
+        if (-not (Test-Path $so)) { Fail "build did not produce $so" }
+        Assert-PageAlignment $ReadElf $so $a
+    }
 
     # ------------------------------------------------------------- package
     Step "Packaging $Apk"
@@ -204,7 +267,6 @@ try {
     $libEntries = @()
     foreach ($a in $Abis) {
         $so = Join-Path $TargetDir "$($AbiTriples[$a])\release\$LibName"
-        if (-not (Test-Path $so)) { Fail "build did not produce $so" }
         $dst = Join-Path $Stage "lib\$a"
         New-Item -ItemType Directory -Force $dst | Out-Null
         Copy-Item $so $dst

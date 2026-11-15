@@ -12,11 +12,25 @@
 //! lazily from the first keyframe's SPS (size) and SPS/PPS (`csd-0/1`),
 //! rebuilt when a keyframe's SPS changes the size, and dropped after
 //! [`ERROR_LIMIT`] consecutive failed calls (the next keyframe rebuilds it).
-//! Delta frames while no codec exists decode to nothing; the pipeline's
-//! keyframe gate and `RequestKeyframe` handle recovery.
+//! Delta frames while no codec exists — and, through [`IdrGate`], after a
+//! flush or on a new codec until a keyframe has been queued — decode to
+//! nothing; the pipeline's keyframe gate and `RequestKeyframe` handle
+//! recovery.
+//!
+//! An output color format `yuv` cannot convert is reported as an error once
+//! and then disables that codec instance (every later frame decodes to
+//! nothing, without errors that would make the pipeline flush and request a
+//! keyframe per frame); a keyframe with a new SPS size builds a fresh codec
+//! that tries again.
+//!
+//! A panic anywhere inside [`Decoder::decode`] / [`Decoder::flush`] (the ndk
+//! crate unwraps on NULL from a few NDK calls) is caught, the codec dropped,
+//! and an error returned, so it cannot take the decode thread down.
 
+use std::any::Any;
 use std::ffi::c_void;
 use std::os::raw::c_char;
+use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -31,8 +45,8 @@ use ndk::media::media_codec::{
 use ndk::media::media_format::MediaFormat;
 
 use crate::codec_state::{
-    max_input_size, DecodeStats, ErrorStreak, LatencyTier, OutputFormatKeys, PtsMap,
-    COLOR_FORMAT_YUV420_FLEXIBLE, ERROR_LIMIT,
+    color_format_supported, max_input_size, normalize_color_format, DecodeStats, ErrorStreak,
+    IdrGate, LatencyTier, OutputFormatKeys, PtsMap, COLOR_FORMAT_YUV420_FLEXIBLE, ERROR_LIMIT,
 };
 
 const MIME_AVC: &str = "video/avc";
@@ -57,6 +71,7 @@ pub struct MediaCodecDecoder {
     active: Option<ActiveCodec>,
     errors: ErrorStreak,
     stats: DecodeStats,
+    idr: IdrGate,
 }
 
 impl MediaCodecDecoder {
@@ -65,10 +80,12 @@ impl MediaCodecDecoder {
             active: None,
             errors: ErrorStreak::default(),
             stats: DecodeStats::new(Instant::now(), SUMMARY_INTERVAL),
+            idr: IdrGate::new(),
         }
     }
 
     fn drop_codec(&mut self, why: &str) {
+        self.idr.reset();
         if let Some(active) = self.active.take() {
             tracing::warn!(
                 width = active.sps_size.0,
@@ -78,13 +95,73 @@ impl MediaCodecDecoder {
         }
     }
 
+    /// After a caught panic: drop the codec, which may itself be what is
+    /// broken (ndk's `Drop` unwraps `AMediaCodec_delete`'s status), so that
+    /// is guarded too. `active` is taken before anything can panic, so the
+    /// decoder is left codec-less either way.
+    fn drop_codec_after_panic(&mut self, what: &str, payload: &(dyn Any + Send)) -> String {
+        let msg = format!("MediaCodec {what} panicked: {}", panic_message(payload));
+        if std::panic::catch_unwind(AssertUnwindSafe(|| self.drop_codec(&msg))).is_err() {
+            tracing::error!("dropping the MediaCodec after a panic panicked as well");
+        }
+        self.idr.reset();
+        msg
+    }
+
     fn decode_inner(&mut self, frame: &EncodedFrame) -> Result<Vec<RawFrame>> {
         if frame.keyframe {
             self.prepare_for_keyframe(&frame.data)?;
         }
-        match self.active.as_mut() {
-            Some(active) => active.decode(frame, &mut self.stats),
-            None => Ok(Vec::new()),
+        let Some(active) = self.active.as_mut() else {
+            return Ok(Vec::new());
+        };
+        if active.output.unsupported.is_some() {
+            // Reported (once) when it was found; see OutputState.
+            return Ok(Vec::new());
+        }
+        if !self.idr.admit(frame.keyframe) {
+            return Ok(Vec::new());
+        }
+        active.decode(frame, &mut self.stats, &mut self.idr)
+    }
+
+    /// The whole of [`Decoder::decode`], run under `catch_unwind`.
+    fn decode_guarded(&mut self, frame: &EncodedFrame) -> Result<Vec<RawFrame>> {
+        let result = self.decode_inner(frame);
+        match &result {
+            Ok(_) => self.errors.ok(),
+            Err(e) => {
+                self.stats.errors += 1;
+                tracing::debug!(frame_id = frame.frame_id, "MediaCodec decode error: {e}");
+                if self.errors.fail() {
+                    self.drop_codec(&format!("{ERROR_LIMIT} consecutive errors, last: {e}"));
+                }
+            }
+        }
+        let (in_flight, dropped) = self
+            .active
+            .as_ref()
+            .map_or((0, 0), |a| (a.pts.in_flight(), a.pts.dropped()));
+        if let Some(line) = self.stats.summary_due(Instant::now(), in_flight, dropped) {
+            tracing::info!("{line} skipped_awaiting_idr={}", self.idr.skipped());
+        }
+        result
+    }
+
+    /// The whole of [`Decoder::flush`], run under `catch_unwind`.
+    fn flush_guarded(&mut self) {
+        // Whatever happens below, the next frame the codec may take is a
+        // keyframe.
+        self.idr.reset();
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        match active.codec.0.flush() {
+            Ok(()) => {
+                active.pts.clear();
+                tracing::debug!("MediaCodec flushed");
+            }
+            Err(e) => self.drop_codec(&format!("flush failed: {e}")),
         }
     }
 
@@ -116,6 +193,9 @@ impl MediaCodecDecoder {
             );
             self.active = None;
         }
+        // Old codec gone (or never there): no references until this
+        // keyframe is queued.
+        self.idr.reset();
         let csd = h264::extract_csd(annexb);
         if csd.is_none() {
             tracing::warn!(
@@ -137,39 +217,33 @@ impl Default for MediaCodecDecoder {
 
 impl Decoder for MediaCodecDecoder {
     fn decode(&mut self, frame: &EncodedFrame) -> Result<Vec<RawFrame>> {
-        let result = self.decode_inner(frame);
-        match &result {
-            Ok(_) => self.errors.ok(),
-            Err(e) => {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| self.decode_guarded(frame))) {
+            Ok(result) => result,
+            Err(payload) => {
+                // The panic hook has already logged message and backtrace.
+                // The codec is dropped outright, so the error streak that
+                // would otherwise drop it starts over.
                 self.stats.errors += 1;
-                tracing::debug!(frame_id = frame.frame_id, "MediaCodec decode error: {e}");
-                if self.errors.fail() {
-                    self.drop_codec(&format!("{ERROR_LIMIT} consecutive errors, last: {e}"));
-                }
+                self.errors.ok();
+                Err(Error::Decoder(self.drop_codec_after_panic("decode", &*payload)))
             }
         }
-        let (in_flight, dropped) = self
-            .active
-            .as_ref()
-            .map_or((0, 0), |a| (a.pts.in_flight(), a.pts.dropped()));
-        if let Some(line) = self.stats.summary_due(Instant::now(), in_flight, dropped) {
-            tracing::info!("{line}");
-        }
-        result
     }
 
     fn flush(&mut self) {
-        let Some(active) = self.active.as_mut() else {
-            return;
-        };
-        match active.codec.0.flush() {
-            Ok(()) => {
-                active.pts.clear();
-                tracing::debug!("MediaCodec flushed");
-            }
-            Err(e) => self.drop_codec(&format!("flush failed: {e}")),
+        if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| self.flush_guarded())) {
+            self.drop_codec_after_panic("flush", &*payload);
         }
     }
+}
+
+/// The text of a panic payload (`&str` or `String`, as `panic!` makes them).
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
 }
 
 /// `ndk::MediaCodec` wraps a raw `AMediaCodec*` and is therefore `!Send`.
@@ -239,7 +313,7 @@ impl ActiveCodec {
                 codec: SendCodec(codec),
                 sps_size: size,
                 pts: PtsMap::new(now),
-                output: OutputState::default(),
+                output: OutputState::new(size),
             });
         }
         Err(Error::Decoder(format!(
@@ -247,7 +321,12 @@ impl ActiveCodec {
         )))
     }
 
-    fn decode(&mut self, frame: &EncodedFrame, stats: &mut DecodeStats) -> Result<Vec<RawFrame>> {
+    fn decode(
+        &mut self,
+        frame: &EncodedFrame,
+        stats: &mut DecodeStats,
+        idr: &mut IdrGate,
+    ) -> Result<Vec<RawFrame>> {
         let codec = &self.codec.0;
         let mut out = Vec::new();
 
@@ -293,6 +372,7 @@ impl ActiveCodec {
                             frame.frame_id
                         )));
                     }
+                    idr.on_queued(frame.keyframe);
                     stats.on_input(self.pts.in_flight());
                     break;
                 }
@@ -339,18 +419,51 @@ impl Drop for ActiveCodec {
 }
 
 /// The current output layout, re-read on every format change.
-#[derive(Default)]
 struct OutputState {
+    /// Picture size from the SPS the codec was configured with: the crop
+    /// fallback when the output format reports none.
+    sps_size: (u32, u32),
     keys: Option<OutputFormatKeys>,
     layout: Option<PlaneLayout>,
+    /// The raw output color format, once one turned out to be something
+    /// `yuv` cannot convert. Permanent for this codec instance.
+    unsupported: Option<i32>,
 }
 
 impl OutputState {
+    fn new(sps_size: (u32, u32)) -> Self {
+        Self {
+            sps_size,
+            keys: None,
+            layout: None,
+            unsupported: None,
+        }
+    }
+
     fn update(&mut self, format: &MediaFormat) -> Result<PlaneLayout> {
-        let keys =
-            OutputFormatKeys::read(|k| format.i32(k), crop_rect(format)).map_err(Error::Decoder)?;
+        // Never keep converting with the previous layout if this format
+        // turns out unreadable: the next buffer re-reads it instead.
+        self.layout = None;
+        let keys = OutputFormatKeys::read(|k| format.i32(k), crop_rect(format), self.sps_size)
+            .map_err(Error::Decoder)?;
+        let color_format = normalize_color_format(keys.color_format);
+        if !color_format_supported(color_format) {
+            if self.unsupported.is_none() {
+                tracing::error!(
+                    "MediaCodec output color format {:#x} ({}) is not convertible; this \
+                     decoder instance is disabled until the stream size changes",
+                    keys.color_format,
+                    keys.color_format
+                );
+            }
+            self.unsupported = Some(keys.color_format);
+            return Err(Error::Decoder(format!(
+                "unsupported MediaCodec output color format {:#x}",
+                keys.color_format
+            )));
+        }
         let layout = yuv::layout_from_format(
-            keys.color_format,
+            color_format,
             keys.width,
             keys.height,
             keys.stride,
@@ -359,9 +472,11 @@ impl OutputState {
         );
         if self.keys != Some(keys) {
             tracing::info!(
-                "MediaCodec output format: color-format={:#x} ({}) {}x{} stride={} slice-height={} crop={:?} -> {:?}",
+                "MediaCodec output format: color-format={:#x} ({}, as {}) {}x{} stride={} \
+                 slice-height={} crop={:?} -> {:?}",
                 keys.color_format,
                 keys.color_format,
+                color_format,
                 keys.width,
                 keys.height,
                 keys.stride,
