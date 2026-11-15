@@ -413,7 +413,7 @@ pub enum NetEvent {
 /// What the UI (or the tray) can ask the listener to do.
 #[derive(Debug, Clone)]
 pub enum NetCommand {
-    /// Generate a code and open the 120-second pairing window.
+    /// Generate a code and open the pairing window (`PAIRING_TTL_MS`).
     ArmPairing,
     CancelPairing,
     /// Close the current client's connection now. Input is released.

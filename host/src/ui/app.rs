@@ -472,7 +472,10 @@ impl HostApp {
                         {
                             self.note("could not arm pairing: the listener is not running");
                         }
-                        ui.label("Opens a 120-second window with a single-use 8-digit code.");
+                        ui.label(format!(
+                            "Opens a {}-minute window with a single-use 8-digit code.",
+                            directdesk_shared::crypto::pairing::PAIRING_TTL_MS / 60_000
+                        ));
                     });
                 }
             });

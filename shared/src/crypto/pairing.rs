@@ -65,7 +65,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const PAIRING_CODE_DIGITS: usize = 8;
 
 /// How long a pairing code stays valid, in milliseconds.
-pub const PAIRING_TTL_MS: u64 = 120_000;
+pub const PAIRING_TTL_MS: u64 = 300_000;
 
 /// Exact size of a SPAKE2 Ed25519-group message: one side byte + one 32-byte
 /// group element.

@@ -246,12 +246,14 @@ pub async fn run_client(
     };
 
     // In-memory record of the host we trust. Set by a successful pairing, or
-    // loaded when reconnecting in auth mode.
-    let mut known_host: Option<TrustedPeer> = if params.pairing_code.is_some() {
-        None
+    // discovered by trying each stored pin until the server's certificate
+    // matches one (the store keys records by identity, not address).
+    let candidate_hosts: Vec<TrustedPeer> = if params.pairing_code.is_some() {
+        Vec::new()
     } else {
-        sole_trusted_host(store.as_ref())
+        trusted_hosts(store.as_ref())
     };
+    let mut known_host: Option<TrustedPeer> = None;
     let mut want_pairing = params.pairing_code.is_some();
     let mut backoff = BACKOFF_MIN;
 
@@ -264,15 +266,41 @@ pub async fn run_client(
         let _ = state_tx.try_send(ConnectionState::Connecting);
         let _ = route_tx.try_send(None);
 
-        let established = connect_and_auth(
-            &params,
-            &client_id,
-            store.as_ref(),
-            want_pairing,
-            known_host.as_ref(),
-            &state_tx,
-        )
-        .await;
+        let established = if want_pairing || known_host.is_some() {
+            connect_and_auth(
+                &params,
+                &client_id,
+                store.as_ref(),
+                want_pairing,
+                known_host.as_ref(),
+                &state_tx,
+            )
+            .await
+        } else {
+            let mut result = Err(HandshakeError::fatal(
+                "no paired host on record — pair with a code first",
+            ));
+            for peer in &candidate_hosts {
+                result = connect_and_auth(
+                    &params,
+                    &client_id,
+                    store.as_ref(),
+                    false,
+                    Some(peer),
+                    &state_tx,
+                )
+                .await;
+                match &result {
+                    Ok(_) => {
+                        known_host = Some(peer.clone());
+                        break;
+                    }
+                    Err(e) if !e.recoverable => break,
+                    Err(_) => {}
+                }
+            }
+            result
+        };
 
         let Established {
             _endpoint,
@@ -1234,23 +1262,13 @@ fn persist_trusted_host(store: &dyn SecretStore, peer: &TrustedPeer) -> Result<(
     hosts.save(store, TRUSTED_HOSTS_KEY)
 }
 
-/// If exactly one host is trusted, return it. With none or several we cannot
-/// pick by address (the record has no address), so we decline — auth mode then
-/// reports "no paired host". (Multi-host address disambiguation is a follow-up.)
-fn sole_trusted_host(store: &dyn SecretStore) -> Option<TrustedPeer> {
-    let hosts = TrustedPeers::load(store, TRUSTED_HOSTS_KEY).ok()?;
-    match hosts.peers() {
-        [only] => Some(only.clone()),
-        many => {
-            if many.len() > 1 {
-                tracing::warn!(
-                    "{} trusted hosts on record; cannot disambiguate by address without pairing",
-                    many.len()
-                );
-            }
-            None
-        }
-    }
+/// Every trusted host on record. Records carry no address, so `run_client`
+/// tries each pin in turn: a wrong pin fails the TLS handshake (recoverable)
+/// and the next one is tried; an empty store means "no paired host".
+fn trusted_hosts(store: &dyn SecretStore) -> Vec<TrustedPeer> {
+    TrustedPeers::load(store, TRUSTED_HOSTS_KEY)
+        .map(|h| h.peers().to_vec())
+        .unwrap_or_default()
 }
 
 /// Resolve the host to ordered candidate addresses: IPv4 first (DirectUdp),

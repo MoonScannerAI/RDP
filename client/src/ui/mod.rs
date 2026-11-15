@@ -1628,6 +1628,17 @@ impl ClientApp {
             self.input
                 .forward_pointer_events(&events, viewport, &view, self.pointer);
             self.input.forward_key_events(&events);
+            // While keys stream to the host, no egui widget may keep keyboard
+            // focus: a toolbar button focused by an earlier click would be
+            // re-activated by the next forwarded Space/Enter (observed as the
+            // session disconnecting itself mid-typing).
+            if self.input.is_capturing() {
+                ui.ctx().memory_mut(|mem| {
+                    if let Some(id) = mem.focused() {
+                        mem.surrender_focus(id);
+                    }
+                });
+            }
         }
         self.input.pump();
     }
