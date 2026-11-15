@@ -339,6 +339,108 @@ impl SecretStore for DpapiFileStore {
 }
 
 // ---------------------------------------------------------------------------
+// Plain file store (Android app-private directory)
+// ---------------------------------------------------------------------------
+
+/// Plaintext files under a directory, one `<dir>/<key>.bin` per key.
+///
+/// # NOT encrypted at rest
+///
+/// Contents are written exactly as given. This is acceptable only when `dir`
+/// is an OS-sandboxed, app-private directory (Android's per-app data dir),
+/// where the kernel's per-UID isolation is the protection and other apps and
+/// unprivileged users cannot read it. Do not point this at a shared or
+/// world-readable location; use [`DpapiFileStore`] on Windows. Wrapping with
+/// the Android Keystore is deferred work.
+///
+/// On unix, files are created `0600` and the directory `0700`. Writes go to
+/// `<key>.bin.tmp`, are flushed and synced, then renamed over the target, so a
+/// crash cannot leave a half-written file; a stray `.tmp` is never read.
+///
+/// Semantics match [`DpapiFileStore`]: `read` of a missing key is `Ok(None)`,
+/// and `delete` of a missing key succeeds.
+#[derive(Debug, Clone)]
+pub struct PlainFileStore {
+    dir: PathBuf,
+}
+
+impl PlainFileStore {
+    /// Open a store rooted at `dir`, creating it if missing.
+    pub fn new(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(Self { dir })
+    }
+
+    /// The directory this store writes into.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn path(&self, key: &str) -> Result<PathBuf> {
+        validate_key(key)?;
+        Ok(self.dir.join(format!("{key}.bin")))
+    }
+}
+
+impl SecretStore for PlainFileStore {
+    fn read(&self, key: &str) -> Result<Option<Secret<Vec<u8>>>> {
+        let path = self.path(key)?;
+        match std::fs::read(&path) {
+            Ok(b) => Ok(Some(Secret::new(b))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn write(&self, key: &str, plaintext: &[u8]) -> Result<()> {
+        let path = self.path(key)?;
+        // The directory may have been removed since `new` (e.g. cache wipe).
+        std::fs::create_dir_all(&self.dir)?;
+
+        let tmp = path.with_extension("bin.tmp");
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all(plaintext)?;
+            f.flush()?;
+            f.sync_all()?;
+        }
+        // Same Windows fallback as DpapiFileStore: rename over an existing
+        // file can fail there, so remove the target and retry.
+        std::fs::rename(&tmp, &path).or_else(|_| {
+            let _ = std::fs::remove_file(&path);
+            std::fs::rename(&tmp, &path)
+        })?;
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let path = self.path(key)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        Ok(self.path(key)?.exists())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-memory store (tests, and the "ephemeral identity" mode)
 // ---------------------------------------------------------------------------
 
@@ -482,6 +584,100 @@ mod tests {
         let s = MemoryStore::new();
         assert!(s.write("BAD", b"x").is_err());
         assert!(s.read("../x").is_err());
+    }
+
+    fn plain_tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "directdesk-plain-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn got(s: &PlainFileStore, k: &str) -> Option<Vec<u8>> {
+        s.read(k).unwrap().map(|v| v.expose().clone())
+    }
+
+    #[test]
+    fn plain_store_roundtrip_overwrite_delete() {
+        let dir = plain_tmp_dir("rt");
+        let s = PlainFileStore::new(dir.join("nested")).unwrap();
+        assert!(s.read("client_identity").unwrap().is_none());
+        assert!(!s.exists("client_identity").unwrap());
+
+        s.write("client_identity", b"seed-1").unwrap();
+        assert!(s.exists("client_identity").unwrap());
+        assert_eq!(got(&s, "client_identity").unwrap(), b"seed-1");
+
+        s.write("client_identity", b"seed-2-longer").unwrap();
+        assert_eq!(got(&s, "client_identity").unwrap(), b"seed-2-longer");
+        s.write("client_identity", b"s3").unwrap();
+        assert_eq!(got(&s, "client_identity").unwrap(), b"s3");
+
+        s.delete("client_identity").unwrap();
+        assert!(!s.exists("client_identity").unwrap());
+        assert!(s.read("client_identity").unwrap().is_none());
+        s.delete("client_identity").unwrap(); // missing delete succeeds
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_store_rejects_bad_keys() {
+        let dir = plain_tmp_dir("bad");
+        let s = PlainFileStore::new(&dir).unwrap();
+        for k in ["", "../evil", "Host", "a/b", "a.b", &"x".repeat(65)] {
+            assert!(s.write(k, b"x").is_err(), "{k}");
+            assert!(s.read(k).is_err(), "{k}");
+            assert!(s.delete(k).is_err(), "{k}");
+            assert!(s.exists(k).is_err(), "{k}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_store_ignores_stale_tmp() {
+        let dir = plain_tmp_dir("tmp");
+        let s = PlainFileStore::new(&dir).unwrap();
+        std::fs::write(dir.join("k.bin.tmp"), b"partial").unwrap();
+        assert!(s.read("k").unwrap().is_none());
+        assert!(!s.exists("k").unwrap());
+        s.write("k", b"real").unwrap();
+        assert_eq!(got(&s, "k").unwrap(), b"real");
+        assert!(!dir.join("k.bin.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_store_persists_across_instances() {
+        let dir = plain_tmp_dir("persist");
+        PlainFileStore::new(&dir)
+            .unwrap()
+            .write("trusted_hosts", b"[1,2,3]")
+            .unwrap();
+        let s2 = PlainFileStore::new(&dir).unwrap();
+        assert_eq!(got(&s2, "trusted_hosts").unwrap(), b"[1,2,3]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_store_unix_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = plain_tmp_dir("mode");
+        let s = PlainFileStore::new(&dir).unwrap();
+        s.write("k", b"v").unwrap();
+        s.write("k", b"v2").unwrap();
+        let fmode = std::fs::metadata(dir.join("k.bin"))
+            .unwrap()
+            .permissions()
+            .mode();
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(fmode & 0o777, 0o600);
+        assert_eq!(dmode & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]
