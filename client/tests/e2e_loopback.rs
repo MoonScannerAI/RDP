@@ -465,6 +465,7 @@ fn pair_params(addr: SocketAddr, code: &str) -> ConnectParams {
         lossless_tiles: true,
         system_audio: true,
         monitor_choice: MonitorChoice::default(),
+        multi_monitor: true,
     }
 }
 
@@ -750,6 +751,7 @@ async fn mismatched_spki_pin_is_rejected() {
         lossless_tiles: true,
         system_audio: true,
         monitor_choice: MonitorChoice::default(),
+        multi_monitor: true,
     };
     let (client, shutdown, client_task) = spawn_client(params, store);
 

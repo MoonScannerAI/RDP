@@ -46,7 +46,7 @@ use directdesk_shared::protocol::InputMsg;
 
 /// Stream capabilities advertised on every connect. Fixed for now; the host
 /// clamps to what it can actually encode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamCaps {
     pub max_width: u32,
     pub max_height: u32,
@@ -78,6 +78,15 @@ pub struct StreamCaps {
     /// Seeded from [`crate::config::ClientConfig::monitor_choice`] and
     /// updated live by [`ConnectSupervisor::set_monitor_choice`].
     pub monitor_choice: MonitorChoice,
+    /// Offer `features::MULTI_MONITOR` in the `Hello` at all.
+    ///
+    /// Default **true**: today's desktop client offers the bit unconditionally
+    /// (see `ConnectParams::hello_features` for why that is deliberate). A
+    /// client that can only ever show one window — a phone — clears it, so the
+    /// host never sends a `MonitorList`, the handshake skips the selection
+    /// exchange, and no second stream can ever be armed, whatever
+    /// [`monitor_choice`](Self::monitor_choice) says.
+    pub multi_monitor: bool,
 }
 
 impl Default for StreamCaps {
@@ -94,6 +103,22 @@ impl Default for StreamCaps {
             lossless_tiles: true,
             system_audio: true,
             monitor_choice: MonitorChoice::default(),
+            multi_monitor: true,
+        }
+    }
+}
+
+impl StreamCaps {
+    /// The preset for a touch device (Android): one window, no audio
+    /// playback path, no lossless tiles, and a 30 fps ceiling to spare the
+    /// battery and the hardware decoder. Everything else as [`Default`].
+    pub fn touch_device() -> Self {
+        Self {
+            system_audio: false,
+            lossless_tiles: false,
+            multi_monitor: false,
+            preferred_fps: 30,
+            ..Self::default()
         }
     }
 }
@@ -124,6 +149,7 @@ impl ConnectRequest {
             lossless_tiles: caps.lossless_tiles,
             system_audio: caps.system_audio,
             monitor_choice: caps.monitor_choice,
+            multi_monitor: caps.multi_monitor,
         }
     }
 }
@@ -382,6 +408,66 @@ mod tests {
             ..StreamCaps::default()
         };
         assert!(!request().into_params(quiet).system_audio);
+    }
+
+    /// The desktop default is pinned field by field, so adding `multi_monitor`
+    /// (or anything after it) cannot silently change what a Windows client
+    /// asks for; and its `Hello` offer is exactly today's three bits.
+    #[test]
+    fn the_default_caps_and_their_hello_offer_are_unchanged() {
+        use directdesk_shared::protocol::features;
+
+        assert_eq!(
+            StreamCaps::default(),
+            StreamCaps {
+                max_width: 3840,
+                max_height: 2160,
+                preferred_fps: 0,
+                lossless_tiles: true,
+                system_audio: true,
+                monitor_choice: MonitorChoice::Primary,
+                multi_monitor: true,
+            }
+        );
+        assert_eq!(
+            request()
+                .into_params(StreamCaps::default())
+                .hello_features(false),
+            features::LOSSLESS_TILES | features::SYSTEM_AUDIO | features::MULTI_MONITOR
+        );
+    }
+
+    /// The touch preset declines every optional layer in the `Hello` itself —
+    /// asked through the real `into_params` + `hello_features`, not a copy —
+    /// and differs from the default only where it says it does.
+    #[test]
+    fn touch_device_offers_no_audio_tiles_or_monitors() {
+        use directdesk_shared::protocol::features;
+
+        let touch = StreamCaps::touch_device();
+        assert_eq!(
+            touch,
+            StreamCaps {
+                system_audio: false,
+                lossless_tiles: false,
+                multi_monitor: false,
+                preferred_fps: 30,
+                ..StreamCaps::default()
+            }
+        );
+
+        let params = request().into_params(touch);
+        assert_eq!(params.preferred_fps, 30);
+        let bits = params.hello_features(false);
+        assert_eq!(bits & features::SYSTEM_AUDIO, 0, "no audio offer");
+        assert_eq!(bits & features::LOSSLESS_TILES, 0, "no tiles offer");
+        assert_eq!(bits & features::MULTI_MONITOR, 0, "no monitors offer");
+        assert_eq!(bits, 0, "nothing else is offered either");
+        // Pairing stays orthogonal to the caps.
+        assert_eq!(
+            params.hello_features(true),
+            crate::net::FEATURE_PAIRING_REQUEST
+        );
     }
 
     #[test]

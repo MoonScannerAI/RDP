@@ -300,8 +300,12 @@ impl Pipeline {
     ///   builds a second Media Foundation MFT or enters a second COM apartment.
     ///   The thread costs one parked 100 ms poll, exactly like the audio thread
     ///   on a session that never negotiated audio.
+    ///
+    /// `new_decoder` is the platform's decoder factory (see [`NewDecoder`]),
+    /// the same one handed to [`spawn_decode_thread`].
     pub fn attach_decode_thread(
         &mut self,
+        new_decoder: NewDecoder,
         video_rx: Receiver<EncodedFrame>,
         slot: Arc<FrameSlot>,
         control_tx: mpsc::Sender<ControlMsg>,
@@ -317,7 +321,7 @@ impl Pipeline {
             .name("directdesk-decode-1".into())
             .spawn(move || {
                 let mut decode_loop = DecodeLoop::new(
-                    crate::decoder::new_decoder,
+                    new_decoder,
                     thread_status,
                     tiles,
                     tile_highlight,
@@ -382,7 +386,12 @@ impl Drop for Pipeline {
 /// Decodes **every** frame it receives, in order. It never inspects timestamps
 /// to decide whether decoding is "worth it" — that decision belongs to the
 /// presenter, after decoding.
+///
+/// `new_decoder` builds the platform's H.264 decoder on this thread, lazily,
+/// on the first frame (Media Foundation on Windows: `crate::decoder::new_decoder`;
+/// MediaCodec on Android). See [`NewDecoder`].
 pub fn spawn_decode_thread(
+    new_decoder: NewDecoder,
     video_rx: Receiver<EncodedFrame>,
     slot: Arc<FrameSlot>,
     control_tx: mpsc::Sender<ControlMsg>,
@@ -398,7 +407,7 @@ pub fn spawn_decode_thread(
         .name("directdesk-decode".into())
         .spawn(move || {
             let mut decode_loop = DecodeLoop::new(
-                crate::decoder::new_decoder,
+                new_decoder,
                 status,
                 tiles,
                 tile_highlight,
@@ -2001,7 +2010,13 @@ mod tests {
             Arc::new(SourceStatus::default()),
             Arc::new(AtomicBool::new(false)),
         );
-        let status1 = pipeline.attach_decode_thread(video_rx, slot2.clone(), control_tx, || {});
+        let status1 = pipeline.attach_decode_thread(
+            crate::decoder::new_decoder,
+            video_rx,
+            slot2.clone(),
+            control_tx,
+            || {},
+        );
 
         assert!(
             !Arc::ptr_eq(&pipeline.status, &status1),

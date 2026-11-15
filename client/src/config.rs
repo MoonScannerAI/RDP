@@ -5,6 +5,7 @@
 //! that way — this file is world-readable by anything running as the user.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use directdesk_shared::protocol::{
     MonitorInfo, QualityMode, DEFAULT_UDP_PORT, MAX_MONITORS, MAX_TARGET_FPS, MIN_TARGET_FPS,
@@ -106,9 +107,43 @@ impl Default for ClientConfig {
     }
 }
 
+/// Process-wide override for the directory holding `client.json`; see
+/// [`set_config_dir`].
+static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point [`config_path`] at `dir` instead of the desktop default, for the rest
+/// of the process.
+///
+/// For platforms with no `dirs::config_dir()` worth using: Android passes the
+/// app's private files directory. Desktop never calls this.
+///
+/// First call wins, and that is deliberate rather than a limitation. Android
+/// can re-enter `android_main` in the same process (activity recreated, process
+/// kept), so a second call is expected; it carries the same path in practice,
+/// and if it ever did not, switching the config file out from under a process
+/// that has already loaded (and may yet save) the first one would be worse
+/// than keeping it. A differing later path is logged and ignored — never a
+/// panic.
+pub fn set_config_dir(dir: PathBuf) {
+    if let Err(rejected) = CONFIG_DIR_OVERRIDE.set(dir) {
+        let current = CONFIG_DIR_OVERRIDE.get();
+        if current != Some(&rejected) {
+            tracing::warn!(
+                kept = ?current,
+                ignored = %rejected.display(),
+                "config directory already set for this process; keeping the first one"
+            );
+        }
+    }
+}
+
 /// `%APPDATA%\DirectDesk\client.json` (roaming), or `None` if the OS has no
-/// config directory for us.
+/// config directory for us. A directory set with [`set_config_dir`] takes
+/// precedence (`<dir>\client.json`).
 pub fn config_path() -> Option<PathBuf> {
+    if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
+        return Some(dir.join("client.json"));
+    }
     dirs::config_dir().map(|d| d.join("DirectDesk").join("client.json"))
 }
 
@@ -363,6 +398,30 @@ mod tests {
         assert!(c.cached_monitors[0]
             .name
             .is_char_boundary(c.cached_monitors[0].name.len()));
+    }
+
+    /// The only test that touches the process-wide override, so first-call-wins
+    /// is observable here. Covers the Android re-entry shape: the same path
+    /// again is a no-op, a different one is ignored, and neither panics.
+    #[test]
+    fn config_dir_override_is_first_call_wins_and_never_panics() {
+        let dir = std::env::temp_dir().join(format!(
+            "directdesk-client-config-test-{}",
+            std::process::id()
+        ));
+        set_config_dir(dir.clone());
+        set_config_dir(dir.clone());
+        set_config_dir(dir.join("elsewhere"));
+        assert_eq!(config_path(), Some(dir.join("client.json")));
+
+        // load/save follow the override (and create the directory).
+        let c = ClientConfig {
+            host_address: "pc.lan".into(),
+            ..Default::default()
+        };
+        c.save();
+        assert_eq!(ClientConfig::load().host_address, "pc.lan");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

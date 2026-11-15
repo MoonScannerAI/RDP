@@ -107,6 +107,9 @@ pub struct AppInit {
     /// `--loopback-demo`, so it is meaningless (and never set) under
     /// `SourceMode::Live`.
     pub demo_second_window: bool,
+    /// Interaction model. `Touch` (Android, or `--touch-ui` on Windows) never
+    /// installs the low-level keyboard hook; `Desktop` is today's client.
+    pub profile: crate::app::UiProfile,
 }
 
 pub struct ClientApp {
@@ -233,6 +236,8 @@ pub struct ClientApp {
     /// every mid-session `SelectMonitors` re-send — the UI is the only place
     /// that knows whether the feature was negotiated.
     monitors: Option<Vec<MonitorInfo>>,
+    /// Interaction model, from [`AppInit::profile`].
+    profile: crate::app::UiProfile,
 }
 
 impl ClientApp {
@@ -242,7 +247,13 @@ impl ClientApp {
         // a remote screen belongs on a dark surround, always.
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         let input_tx = init.session.input_tx.clone();
-        let input = InputCapture::new(input_tx.clone());
+        // A touch device has no physical keyboard to hook (and Android no
+        // `SetWindowsHookEx`); every other part of capture behaves the same.
+        let input = match init.profile {
+            crate::app::UiProfile::Touch => InputCapture::without_hook(input_tx.clone()),
+            crate::app::UiProfile::Desktop => InputCapture::new(input_tx.clone()),
+        };
+        let profile = init.profile;
         let show_diagnostics = init.config.show_diagnostics;
         let auto_snap_scale = init.config.auto_snap_scale;
         let fullscreen = init.config.start_fullscreen;
@@ -332,7 +343,13 @@ impl ClientApp {
             stream1_video: None,
             stream1_monitor: None,
             monitors: None,
+            profile,
         }
+    }
+
+    /// The interaction model this app was built with (fixed for its life).
+    pub fn profile(&self) -> crate::app::UiProfile {
+        self.profile
     }
 
     /// Dump the live counters every couple of seconds. This is what makes a

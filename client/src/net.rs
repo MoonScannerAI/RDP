@@ -160,12 +160,19 @@ pub struct ConnectParams {
     ///
     /// Unlike [`lossless_tiles`](Self::lossless_tiles) and
     /// [`system_audio`](Self::system_audio) this does **not** decide what the
-    /// `Hello` offers — the bit is offered unconditionally (see
-    /// [`ConnectParams::hello_features`]) — only what the client does with the
-    /// host's `MonitorList` once it has one. `Primary` is today's behaviour
-    /// exactly: one stream, one window, and a `SelectMonitors { ids: [0] }`
-    /// that tells the host so explicitly.
+    /// `Hello` offers — that is [`multi_monitor`](Self::multi_monitor) — only
+    /// what the client does with the host's `MonitorList` once it has one.
+    /// `Primary` is today's behaviour exactly: one stream, one window, and a
+    /// `SelectMonitors { ids: [0] }` that tells the host so explicitly.
     pub monitor_choice: MonitorChoice,
+    /// Offer `features::MULTI_MONITOR` in the `Hello`.
+    ///
+    /// `true` for every desktop client, regardless of
+    /// [`monitor_choice`](Self::monitor_choice) — see
+    /// [`ConnectParams::hello_features`] for why. `false` (a single-window
+    /// touch client) means the bit is never offered, so the host never sends a
+    /// `MonitorList` and the session is single-stream by construction.
+    pub multi_monitor: bool,
 }
 
 impl ConnectParams {
@@ -184,16 +191,19 @@ impl ConnectParams {
     /// reply — and the host answers with the intersection, so everything here
     /// is a request that is off unless it comes back.
     ///
-    /// `MULTI_MONITOR` is offered **unconditionally**, including for
-    /// [`MonitorChoice::Primary`], and that is deliberate rather than sloppy.
-    /// Offering it costs one bit and buys two things a conditional offer could
-    /// not: the host sends its `MonitorList`, which is the only way the connect
-    /// screen ever learns what outputs exist (a user cannot pick "second
-    /// monitor" before anything has told them there is one), and the client
-    /// sends an explicit `SelectMonitors { ids: [0] }` instead of leaving the
-    /// host to infer the selection. Neither costs a second encoder: the host
-    /// starts a second stream only when a selection asks for one.
-    fn hello_features(&self, want_pairing: bool) -> u64 {
+    /// `MULTI_MONITOR` is offered whenever [`ConnectParams::multi_monitor`] is
+    /// set — which a desktop client always is — **regardless of the monitor
+    /// choice**, including [`MonitorChoice::Primary`], and that is deliberate
+    /// rather than sloppy. Offering it costs one bit and buys two things a
+    /// choice-conditional offer could not: the host sends its `MonitorList`,
+    /// which is the only way the connect screen ever learns what outputs exist
+    /// (a user cannot pick "second monitor" before anything has told them there
+    /// is one), and the client sends an explicit `SelectMonitors { ids: [0] }`
+    /// instead of leaving the host to infer the selection. Neither costs a
+    /// second encoder: the host starts a second stream only when a selection
+    /// asks for one. Only a client that can never show a second window (a
+    /// touch device) clears `multi_monitor` and so never offers it.
+    pub(crate) fn hello_features(&self, want_pairing: bool) -> u64 {
         let mut features = if want_pairing {
             FEATURE_PAIRING_REQUEST
         } else {
@@ -205,7 +215,9 @@ impl ConnectParams {
         if self.system_audio {
             features |= protocol::features::SYSTEM_AUDIO;
         }
-        features |= protocol::features::MULTI_MONITOR;
+        if self.multi_monitor {
+            features |= protocol::features::MULTI_MONITOR;
+        }
         features
     }
 }
@@ -1482,13 +1494,14 @@ mod tests {
             lossless_tiles: true,
             system_audio: true,
             monitor_choice: choice,
+            multi_monitor: true,
         }
     }
 
     /// The offer is assembled by the real function, not a test's copy of it.
-    /// `MULTI_MONITOR` is in every `Hello` — even a `Primary` one, which is the
-    /// point: the host's `MonitorList` is the only way the picker ever learns a
-    /// second screen exists.
+    /// `MULTI_MONITOR` is in every desktop `Hello` — even a `Primary` one,
+    /// which is the point: the host's `MonitorList` is the only way the picker
+    /// ever learns a second screen exists.
     #[test]
     fn the_hello_offer_always_includes_multi_monitor() {
         for choice in [
@@ -1524,6 +1537,32 @@ mod tests {
                 | protocol::features::LOSSLESS_TILES
                 | protocol::features::SYSTEM_AUDIO
         );
+    }
+
+    /// A single-window client withholds the bit, whatever its monitor choice
+    /// says — so the host never sends a `MonitorList` and no second stream can
+    /// be armed — and the other bits are untouched by it.
+    #[test]
+    fn a_client_without_multi_monitor_never_offers_the_bit() {
+        for choice in [
+            MonitorChoice::Primary,
+            MonitorChoice::Second,
+            MonitorChoice::Both,
+        ] {
+            let single = ConnectParams {
+                multi_monitor: false,
+                ..params(choice)
+            };
+            assert_eq!(
+                single.hello_features(false),
+                protocol::features::LOSSLESS_TILES | protocol::features::SYSTEM_AUDIO,
+                "{choice:?}"
+            );
+            assert_eq!(
+                single.hello_features(true) & protocol::features::MULTI_MONITOR,
+                0
+            );
+        }
     }
 
     fn monitor(id: u8) -> MonitorInfo {
