@@ -897,6 +897,33 @@ mod tests {
         assert!(!t.is_expanded(t0));
     }
 
+    #[test]
+    fn toolbar_visibility_rule_against_an_injected_clock() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        // Expand (handle tap): up at +4.9 s, gone at +5.1 s.
+        let mut t = ToolbarState::default();
+        t.show(t0);
+        assert!(t.is_expanded(t0 + ms(4900)));
+        assert!(!t.is_expanded(t0 + ms(5100)));
+        // A button press at +3 s extends to +8 s.
+        let mut t = ToolbarState::default();
+        t.show(t0);
+        t.show(t0 + ms(3000));
+        assert!(t.is_expanded(t0 + ms(7900)));
+        assert!(!t.is_expanded(t0 + ms(8100)));
+        assert_eq!(t.remaining(t0 + ms(7000)), Some(ms(1000)));
+        // Hide hides immediately.
+        t.hide();
+        assert!(!t.is_expanded(t0 + ms(3001)));
+        assert_eq!(t.remaining(t0 + ms(3001)), None);
+        // Go-live auto-show is the same 5 s window.
+        let mut t = ToolbarState::default();
+        t.show(t0);
+        assert!(t.is_expanded(t0 + ms(4999)));
+        assert!(!t.is_expanded(t0 + ms(5000)));
+    }
+
     // -- connect screen action row --------------------------------------------
 
     #[test]

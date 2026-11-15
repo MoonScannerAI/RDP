@@ -2425,9 +2425,26 @@ impl ClientApp {
                     self.touch_toolbar_handle(ui, now);
                 }
             });
-        self.touch_toolbar_rect = Some(shown.response.rect);
+        let rect = shown.response.rect;
+        self.touch_toolbar_rect = Some(rect);
+        // A finger resting on (or sliding over) the expanded bar is an
+        // interaction even when it never completes a click on a button.
+        if expanded {
+            let on_bar = ctx.input(|i| {
+                i.pointer.any_down() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p))
+            });
+            if on_bar {
+                self.touch_toolbar.show(now);
+            }
+        }
+        // The handle tap (or a button press) changed the state *after* this
+        // frame decided what to draw: paint again now, not at the deadline.
+        if self.touch_toolbar.is_expanded(now) != expanded {
+            ctx.request_repaint();
+        }
         if let Some(left) = self.touch_toolbar.remaining(now) {
-            ctx.request_repaint_after(left);
+            // Wake exactly when the deadline passes so an idle screen hides it.
+            ctx.request_repaint_after(left + Duration::from_millis(5));
         }
     }
 
