@@ -90,7 +90,19 @@ function Fail([string]$Message) {
 function Invoke-Tool {
     param([string]$What, [string]$Exe, [string[]]$ArgList)
     Write-Host ("    > " + (Split-Path -Leaf $Exe) + " " + ($ArgList -join ' ')) -ForegroundColor DarkGray
-    & $Exe @ArgList | Out-Host
+    # Windows PowerShell 5.1 turns every native stderr line into an
+    # ErrorRecord when the caller redirects streams (e.g. `*> build.log`);
+    # under $ErrorActionPreference = 'Stop' the first harmless line
+    # (rustup's "info: ... is up to date", cargo's "Compiling ...") then
+    # aborts the build. Merge stderr as plain text and judge success by the
+    # exit code alone.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Exe @ArgList 2>&1 | ForEach-Object { "$_" } | Out-Host
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
     if ($LASTEXITCODE -ne 0) {
         Fail "$What failed (exit code $LASTEXITCODE)"
     }
