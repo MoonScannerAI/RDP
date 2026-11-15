@@ -266,6 +266,66 @@ pub struct VideoView {
     pub remote_h: u32,
 }
 
+/// Largest pinch zoom the touch profile allows.
+pub const MAX_ZOOM: f32 = 4.0;
+
+/// Clamp to `1.0..=MAX_ZOOM`; anything non-finite is 1.0 (no zoom).
+pub fn sanitize_zoom(zoom: f32) -> f32 {
+    if zoom.is_finite() {
+        zoom.clamp(1.0, MAX_ZOOM)
+    } else {
+        1.0
+    }
+}
+
+/// The letterboxed rect `fit` enlarged by `zoom`, with the remote point
+/// `focus` (normalized, clamped to 0..1) at the centre of `viewport`.
+///
+/// Per axis: when the enlarged picture is larger than the viewport the offset
+/// is clamped so it still covers the viewport edge to edge; when it is still
+/// smaller (a letterboxed axis at modest zoom) it stays centred like the
+/// unzoomed layout. `zoom <= 1` returns `fit` untouched, bit for bit.
+pub fn zoomed_rect(
+    fit: egui::Rect,
+    viewport: egui::Rect,
+    zoom: f32,
+    focus: (f32, f32),
+) -> egui::Rect {
+    let zoom = sanitize_zoom(zoom);
+    if zoom <= 1.0 {
+        return fit;
+    }
+    let size = fit.size() * zoom;
+    let axis = |fit_c: f32, size: f32, vp_min: f32, vp_max: f32, f: f32| -> f32 {
+        if size <= vp_max - vp_min {
+            return fit_c - size / 2.0;
+        }
+        let f = if f.is_finite() {
+            f.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let want = (vp_min + vp_max) / 2.0 - f * size;
+        want.clamp(vp_max - size, vp_min)
+    };
+    let min = egui::pos2(
+        axis(
+            fit.center().x,
+            size.x,
+            viewport.min.x,
+            viewport.max.x,
+            focus.0,
+        ),
+        axis(
+            fit.center().y,
+            size.y,
+            viewport.min.y,
+            viewport.max.y,
+            focus.1,
+        ),
+    );
+    egui::Rect::from_min_size(min, size)
+}
 /// egui texture name for the main window's video surface.
 ///
 /// **Load-bearing string.** `Context::load_texture` keys the managed texture by
@@ -398,7 +458,15 @@ impl Presenter {
         viewport: egui::Rect,
         ppp: f32,
     ) -> Option<VideoView> {
-        let texture = self.texture.as_ref()?;
+        let view = self.layout_video(viewport, ppp)?;
+        self.paint_video(painter, &view);
+        Some(view)
+    }
+
+    /// Where the letterboxed video goes inside `viewport`. Also records the
+    /// scale for the next upload's filter choice. Pure of any painting.
+    fn layout_video(&self, viewport: egui::Rect, ppp: f32) -> Option<VideoView> {
+        self.texture.as_ref()?;
         let (src_w, src_h) = (self.tex_size[0] as u32, self.tex_size[1] as u32);
         // fit_rect is unit-agnostic; feed it PHYSICAL pixels, not egui points,
         // or a 1:1-sized host frame gets resampled against a too-small box on
@@ -434,20 +502,56 @@ impl Presenter {
             snap_to_physical_pixel(origin.x, ppp),
             snap_to_physical_pixel(origin.y, ppp),
         );
-        let rect = egui::Rect::from_min_size(origin, egui::vec2(w, h));
-        painter.image(
-            texture.id(),
-            rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
         Some(VideoView {
-            rect,
+            rect: egui::Rect::from_min_size(origin, egui::vec2(w, h)),
             remote_w: src_w,
             remote_h: src_h,
         })
     }
 
+    fn paint_video(&self, painter: &egui::Painter, view: &VideoView) {
+        if let Some(texture) = self.texture.as_ref() {
+            painter.image(
+                texture.id(),
+                view.rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    /// Like [`Self::draw`], but the video is enlarged by `zoom` (clamped to
+    /// `1.0..=`[`MAX_ZOOM`]) with the remote point `focus` (normalized 0..1)
+    /// placed at the viewport centre, then clamped so the picture always covers
+    /// the viewport on any axis where it is larger than it (no black gutter
+    /// inside a zoomed view). Painting is clipped to the viewport.
+    ///
+    /// The returned [`VideoView::rect`] is the *enlarged* rect and may extend
+    /// past the viewport, so input mapping (`map_pointer`) keeps working
+    /// unchanged; callers that care whether a point is visible test it against
+    /// the viewport. `zoom == 1.0` is exactly [`Self::draw`].
+    pub fn draw_zoomed(
+        &self,
+        ui: &mut egui::Ui,
+        zoom: f32,
+        focus: (f32, f32),
+    ) -> (egui::Rect, Option<VideoView>) {
+        let (viewport, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let painter = ui.painter_at(viewport);
+        painter.rect_filled(viewport, 0.0, egui::Color32::BLACK);
+        let ppp = ui.ctx().pixels_per_point();
+        let Some(mut view) = self.layout_video(viewport, ppp) else {
+            return (viewport, None);
+        };
+        let zoom = sanitize_zoom(zoom);
+        if zoom > 1.0 {
+            view.rect = zoomed_rect(view.rect, viewport, zoom, focus);
+            // The texture is now sampled at `zoom` times the fitted scale.
+            self.last_scale.set(self.last_scale.get() * zoom);
+        }
+        self.paint_video(&painter, &view);
+        (viewport, Some(view))
+    }
     pub fn has_frame(&self) -> bool {
         self.texture.is_some()
     }
@@ -680,5 +784,65 @@ mod tests {
         assert!(is_exact_scale(3.0));
         // A fractional scale between two integers is exact at neither.
         assert!(!is_exact_scale(2.5));
+    }
+
+    fn r(x0: f32, y0: f32, x1: f32, y1: f32) -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    }
+
+    #[test]
+    fn zoom_one_is_the_fit_rect_exactly() {
+        let fit = r(0.0, 100.3, 800.0, 550.3);
+        let vp = r(0.0, 0.0, 800.0, 650.0);
+        assert_eq!(zoomed_rect(fit, vp, 1.0, (0.2, 0.9)), fit);
+        assert_eq!(zoomed_rect(fit, vp, 0.5, (0.2, 0.9)), fit);
+        assert_eq!(zoomed_rect(fit, vp, f32::NAN, (0.2, 0.9)), fit);
+    }
+
+    #[test]
+    fn zoom_centres_the_focus_and_covers_the_viewport() {
+        let vp = r(0.0, 0.0, 800.0, 450.0);
+        let fit = vp;
+        let z = zoomed_rect(fit, vp, 2.0, (0.5, 0.5));
+        assert_eq!(z.size(), egui::vec2(1600.0, 900.0));
+        assert_eq!(z.center(), vp.center());
+        // Focus at a corner clamps: the picture edge meets the viewport edge.
+        let z = zoomed_rect(fit, vp, 2.0, (0.0, 0.0));
+        assert_eq!(z.min, vp.min);
+        let z = zoomed_rect(fit, vp, 2.0, (1.0, 1.0));
+        assert_eq!(z.max, vp.max);
+        // A mid focus puts that remote point at the viewport centre.
+        let z = zoomed_rect(fit, vp, 2.0, (0.25, 0.75));
+        let at = z.min + egui::vec2(0.25 * z.width(), 0.75 * z.height());
+        assert!((at - vp.center()).length() < 1e-3);
+    }
+
+    #[test]
+    fn letterboxed_axis_stays_centred_until_it_overflows() {
+        // 16:9 video in a tall viewport: bars above and below.
+        let vp = r(10.0, 20.0, 410.0, 720.0);
+        let fit = r(10.0, 20.0 + 237.5, 410.0, 20.0 + 237.5 + 225.0);
+        let z = zoomed_rect(fit, vp, 1.5, (0.9, 0.9));
+        // 600x337.5: height still fits the 700pt viewport, so it stays centred.
+        assert!((z.center().y - fit.center().y).abs() < 1e-3);
+        assert!(z.min.x <= vp.min.x && z.max.x >= vp.max.x);
+        let z = zoomed_rect(fit, vp, 4.0, (0.9, 0.9));
+        assert!(z.min.y <= vp.min.y && z.max.y >= vp.max.y);
+    }
+
+    #[test]
+    fn zoom_is_capped_and_pointer_mapping_survives_offscreen_rects() {
+        let vp = r(0.0, 0.0, 400.0, 400.0);
+        let z = zoomed_rect(vp, vp, 99.0, (0.5, 0.5));
+        assert_eq!(z.size(), egui::vec2(400.0 * MAX_ZOOM, 400.0 * MAX_ZOOM));
+        // The focus point maps through the enlarged rect to the viewport centre.
+        let view = VideoView {
+            rect: zoomed_rect(vp, vp, 2.0, (0.3, 0.6)),
+            remote_w: 1000,
+            remote_h: 1000,
+        };
+        let (x, y) = crate::input_capture::map_pointer(vp.center(), &view).unwrap();
+        assert!((x as f32 / 65535.0 - 0.3).abs() < 0.002);
+        assert!((y as f32 / 65535.0 - 0.6).abs() < 0.002);
     }
 }
