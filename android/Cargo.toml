@@ -13,6 +13,11 @@ license.workspace = true
 # `[target.'cfg(target_os = "android")'.dependencies]`: with resolver 2 their
 # features (eframe's `android-native-activity`, ...) then never unify into the
 # Windows client build.
+#
+# Build the APK with `tools/build-android.ps1`; lint with the Android stage of
+# `tools/check.ps1` (cargo ndk ... clippy -p directdesk-android --lib). Never
+# use `--all-targets` for Android: the client's dev-dependency on the host
+# crate does not build there.
 [lib]
 name = "directdesk_android"
 crate-type = ["cdylib"]
@@ -21,3 +26,23 @@ path = "src/lib.rs"
 [dependencies]
 directdesk-client = { path = "../client" }
 directdesk-shared = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Same version/features as the workspace plus the NativeActivity backend.
+# `NativeOptions::android_app` only exists with one of the android-* features.
+eframe = { workspace = true, features = ["android-native-activity"] }
+egui = { workspace = true }
+# Pinned: the AndroidApp type must be the exact one winit 0.30 re-exports, and
+# the Phase-0 spike validated this pair on the emulator.
+android-activity = { version = "=0.6.1", features = ["native-activity"] }
+# `media` = AMediaCodec/AMediaFormat. `api-level-26` matches minSdk 26: do not
+# raise it, API-28+ symbols would make the .so fail to load on Android 8.x.
+# (AMediaFormat_getRect, API 28, is looked up at runtime instead.)
+ndk = { version = "=0.9.0", features = ["media", "api-level-26"] }
+# Only to call Activity.finish() before the process exits (app_main.rs). Same
+# version android-activity uses, so `JavaVM::singleton()` is the one it set up.
+jni = "0.22"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+libc = "0.2"

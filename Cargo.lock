@@ -632,8 +632,17 @@ dependencies = [
 name = "directdesk-android"
 version = "0.1.0"
 dependencies = [
+ "android-activity",
+ "anyhow",
  "directdesk-client",
  "directdesk-shared",
+ "eframe",
+ "egui",
+ "jni",
+ "libc",
+ "ndk",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

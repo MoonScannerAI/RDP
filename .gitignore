@@ -3,3 +3,7 @@
 *.pdb
 /installer/output/
 /logs/
+# Android signing keys must never be committed (tools/build-android.ps1
+# keeps the debug keystore under %USERPROFILE%\.android instead).
+*.keystore
+*.jks
