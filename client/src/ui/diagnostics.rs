@@ -78,6 +78,54 @@ pub fn show(ctx: &egui::Context, open: &mut bool, input: DiagnosticsInput<'_>) {
         .show(ctx, |ui| body(ui, input));
 }
 
+/// Room left above the window for the touch toolbar's handle.
+const TOUCH_TOP_CLEARANCE: f32 = 44.0;
+
+/// The touch profile's variant of [`show`]: the same body, in a window that
+/// fits a phone screen (it scrolls instead of running off the bottom), keeps
+/// clear of the toolbar handle, and has a finger-sized Close button — the
+/// title bar's own close cross is too small to hit reliably.
+pub fn show_touch(ctx: &egui::Context, open: &mut bool, input: DiagnosticsInput<'_>) {
+    let screen = ctx.content_rect();
+    let margin = 8.0;
+    let width = (screen.width() - 2.0 * margin).clamp(200.0, 440.0);
+    let max_h = (screen.height() - 2.0 * margin - TOUCH_TOP_CLEARANCE).max(120.0);
+    let mut close = false;
+    egui::Window::new("Diagnostics")
+        .id(egui::Id::new("diagnostics_touch"))
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        // Anchored: nothing to drag it around with on a phone, and it must
+        // stay clear of the toolbar handle whatever the screen does.
+        .anchor(
+            egui::Align2::LEFT_TOP,
+            egui::vec2(margin, margin + TOUCH_TOP_CLEARANCE),
+        )
+        .default_width(width)
+        .max_width(width)
+        .max_height(max_h)
+        .vscroll(true)
+        .show(ctx, |ui| {
+            if ui
+                .add(egui::Button::new("Close").min_size(egui::vec2(96.0, 36.0)))
+                .clicked()
+            {
+                close = true;
+            }
+            ui.separator();
+            // The touch style's 36 pt interact height would make every grid
+            // row below a finger target; they are read-only, so keep them
+            // dense enough that a phone screen shows a useful amount.
+            ui.spacing_mut().interact_size.y = 20.0;
+            ui.spacing_mut().item_spacing.y = 4.0;
+            body(ui, input);
+        });
+    if close {
+        *open = false;
+    }
+}
+
 fn body(ui: &mut egui::Ui, input: DiagnosticsInput<'_>) {
     if input.demo_mode {
         ui.colored_label(

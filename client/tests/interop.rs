@@ -14,7 +14,10 @@
 //!  * (c) a WRONG pairing code fails cleanly (never `Connected`) and the host
 //!    burns the single-use code;
 //!  * (d) a host presenting a DIFFERENT SPKI is rejected at pinning (the client
-//!    never reaches `Connected`).
+//!    never reaches `Connected`);
+//!  * (e) `StreamCaps::touch_device()` (the Android preset), through the real
+//!    `ConnectSupervisor`, negotiates one plain stream against a host that
+//!    offers every optional layer, and still receives video.
 //!
 //! Requires an interactive desktop session for the host capture pipeline (real
 //! frames); the auth/pairing assertions do not depend on it. Run with:
@@ -29,13 +32,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use directdesk_client::connect::{ConnectRequest, ConnectSupervisor, StreamCaps};
 use directdesk_client::monitors::MonitorChoice;
 use directdesk_client::net::{run_client, ConnectParams};
 use directdesk_client::session::{ClientSession, ConnectionState};
 use directdesk_shared::crypto::auth::{TrustedPeer, TrustedPeers, TRUSTED_HOSTS_KEY};
 use directdesk_shared::crypto::storage::{MemoryStore, SecretStore};
 use directdesk_shared::crypto::{ClientIdentity, HostIdentity};
-use directdesk_shared::protocol::QualityMode;
+use directdesk_shared::protocol::{ControlMsg, QualityMode};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
@@ -66,14 +70,25 @@ fn boot_host(
     identity: Arc<HostIdentity>,
     store: Arc<dyn SecretStore>,
 ) -> Host {
-    let status = Arc::new(Mutex::new(StatusSnapshot::default()));
-    let pairing = Arc::new(PairingSlot::new());
-
     let host_cfg = HostConfig {
         udp_port: 0,
         target_fps: 60,
         ..HostConfig::default()
     };
+    boot_host_with(rt, identity, store, host_cfg)
+}
+
+/// [`boot_host`] with an explicit host configuration (the bind address is
+/// still forced to an ephemeral loopback port).
+fn boot_host_with(
+    rt: &tokio::runtime::Handle,
+    identity: Arc<HostIdentity>,
+    store: Arc<dyn SecretStore>,
+    host_cfg: HostConfig,
+) -> Host {
+    let status = Arc::new(Mutex::new(StatusSnapshot::default()));
+    let pairing = Arc::new(PairingSlot::new());
+
     let mut net_cfg = NetConfig::from_host_config(&host_cfg);
     net_cfg.bind = "127.0.0.1:0".parse().expect("literal address");
 
@@ -176,6 +191,7 @@ fn pair_params(addr: SocketAddr, code: Option<&str>) -> ConnectParams {
         // and stream normally with no audio bridge spawned.
         system_audio: true,
         monitor_choice: MonitorChoice::default(),
+        multi_monitor: true,
     }
 }
 
@@ -345,6 +361,166 @@ fn pairing_then_reconnect_against_real_host() {
     println!("[b] RECONNECT OK : trusted-host auth Connected");
 
     client2.stop(&client_rt);
+    host.handle.shutdown();
+    let _ = wait_for(Duration::from_secs(10), || {
+        host.handle.is_stopped().then_some(())
+    });
+    client_rt.shutdown_timeout(Duration::from_secs(5));
+    host_rt.shutdown_timeout(Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------
+// (e): the touch-device caps negotiate one plain stream.
+// ---------------------------------------------------------------------------
+
+/// Stream-0 frames the touch case must receive. Lower than [`MIN_FRAMES`]
+/// because the touch preset caps the host at 30 fps: on an idle desktop the
+/// host's 250 ms keepalive alone yields ~20 in the 5 s window.
+const MIN_TOUCH_FRAMES: u64 = 10;
+
+/// What arrived on each inbound lane during a collection window.
+#[derive(Debug, Default)]
+struct LaneCounts {
+    frames: u64,
+    frames2: u64,
+    tiles: u64,
+    audio: u64,
+    monitor_lists: u64,
+    stream1_configs: u64,
+}
+
+fn collect_lanes(session: &ClientSession, window: Duration) -> LaneCounts {
+    let end = Instant::now() + window;
+    let mut c = LaneCounts::default();
+    while Instant::now() < end {
+        while session.video_rx.try_recv().is_ok() {
+            c.frames += 1;
+        }
+        while session.video2_rx.try_recv().is_ok() {
+            c.frames2 += 1;
+        }
+        while session.tiles_rx.try_recv().is_ok() {
+            c.tiles += 1;
+        }
+        while session.audio_rx.try_recv().is_ok() {
+            c.audio += 1;
+        }
+        while let Ok(msg) = session.control_rx.try_recv() {
+            match msg {
+                ControlMsg::MonitorList { .. } => c.monitor_lists += 1,
+                ControlMsg::StreamConfig { id, .. } if id != 0 => c.stream1_configs += 1,
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    c
+}
+
+/// `StreamCaps::touch_device()` through the production path `app::run` uses —
+/// a [`ConnectSupervisor`] built with those caps — against a real host that
+/// *offers* multi-monitor, system audio and lossless tiles. The touch client
+/// asks for none of them, so the session must come up as one plain stream: no
+/// `MonitorList`, nothing on the second-stream, tile or audio lanes, and real
+/// video on stream 0.
+///
+/// A second connection with the desktop default caps against the same host is
+/// the positive control: it does get a `MonitorList`, so the first half's
+/// silence is the client's doing rather than a host that never offered.
+#[test]
+fn touch_device_caps_negotiate_one_plain_stream() {
+    let _capture = directdesk_host::testsupport::CaptureLock::acquire();
+    let (host_rt, client_rt) = runtimes();
+    let client_store: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    let host_store: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    let identity = Arc::new(HostIdentity::generate("interop-host-e").expect("host identity"));
+
+    let host = boot_host_with(
+        host_rt.handle(),
+        identity,
+        host_store,
+        HostConfig {
+            udp_port: 0,
+            target_fps: 60,
+            multi_monitor_enabled: true,
+            system_audio_enabled: true,
+            lossless_tiles_enabled: true,
+            ..HostConfig::default()
+        },
+    );
+    println!(
+        "[e] host bound   : {} (offers monitors, audio, tiles)",
+        host.addr
+    );
+    let code = arm_pairing(&host);
+
+    let request = |pairing_code: Option<String>| ConnectRequest {
+        host: host.addr.ip().to_string(),
+        udp_port: host.addr.port(),
+        display_name: "interop-touch-client".into(),
+        pairing_code,
+        quality: QualityMode::Balanced,
+    };
+
+    // --- touch caps: pair and stream ----------------------------------------
+    let (session, transport) = ClientSession::new();
+    let mut touch = ConnectSupervisor::new(
+        client_rt.handle().clone(),
+        client_store.clone(),
+        transport,
+        StreamCaps::touch_device(),
+    );
+    touch.connect(request(Some(code)));
+    let mut states = Vec::new();
+    assert!(
+        wait_for_connected(&session, &mut states, Duration::from_secs(20)),
+        "[e] touch client never reached Connected; states={states:?}"
+    );
+    let lanes = collect_lanes(&session, Duration::from_secs(5));
+    println!("[e] touch lanes  : {lanes:?}");
+    assert_eq!(
+        lanes.monitor_lists, 0,
+        "[e] MULTI_MONITOR must not be negotiated"
+    );
+    assert_eq!(
+        lanes.stream1_configs, 0,
+        "[e] no secondary stream may be configured"
+    );
+    assert_eq!(lanes.frames2, 0, "[e] nothing on the second-stream lane");
+    assert_eq!(lanes.tiles, 0, "[e] LOSSLESS_TILES must not be negotiated");
+    assert_eq!(lanes.audio, 0, "[e] SYSTEM_AUDIO must not be negotiated");
+    assert!(
+        lanes.frames >= MIN_TOUCH_FRAMES,
+        "[e] expected >= {MIN_TOUCH_FRAMES} real frames on stream 0, got {}",
+        lanes.frames
+    );
+    touch.disconnect();
+    drop(touch);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // --- positive control: desktop caps, same (now trusted) host -------------
+    let (session2, transport2) = ClientSession::new();
+    let mut desktop = ConnectSupervisor::new(
+        client_rt.handle().clone(),
+        client_store,
+        transport2,
+        StreamCaps::default(),
+    );
+    desktop.connect(request(None));
+    let mut states2 = Vec::new();
+    assert!(
+        wait_for_connected(&session2, &mut states2, Duration::from_secs(20)),
+        "[e] desktop control never reached Connected; states={states2:?}"
+    );
+    let control = collect_lanes(&session2, Duration::from_secs(2));
+    println!("[e] desktop lanes: {control:?}");
+    assert!(
+        control.monitor_lists >= 1,
+        "[e] control: the host offers MULTI_MONITOR, so default caps must get a MonitorList"
+    );
+    desktop.disconnect();
+    drop(desktop);
+
     host.handle.shutdown();
     let _ = wait_for(Duration::from_secs(10), || {
         host.handle.is_stopped().then_some(())

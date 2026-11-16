@@ -10,6 +10,10 @@
 
         powershell -NoProfile -File tools\check.ps1
 
+    When ANDROID_NDK_HOME and cargo-ndk are available, an Android stage also
+    clippy-checks directdesk-android for arm64-v8a and x86_64; otherwise it
+    prints a yellow SKIP that does not count towards OVERALL.
+
     Written for PowerShell 5.1 compatibility: no && / || chaining, no
     ternary operator, no null-conditional operator.
 #>
@@ -75,13 +79,50 @@ try {
     $testOk = Run-Check -Name "cargo test --workspace" -ArgList @("test", "--workspace")
     if (-not $testOk) { $overallPass = $false }
 
+    # Android cross-check: clippy the NativeActivity crate (and, through it,
+    # client + shared as compiled for Android) for both shipped ABIs. On
+    # Windows `directdesk-android` is an empty library, so the clippy run
+    # above never sees its code; only this stage does.
+    #
+    # Counted exactly like the checks above when the toolchain is present. A
+    # machine without the NDK gets a visible yellow SKIP that is NOT a PASS
+    # and does not change OVERALL — the remaining checks decide it.
+    #
+    # `--lib` and never `--all-targets`: the client's dev-dependency on the
+    # host crate (Windows capture/encode) does not build for Android.
+    $androidName = "cargo ndk clippy -p directdesk-android (arm64-v8a, x86_64) -D warnings"
+    $androidSkip = $null
+    if ([string]::IsNullOrEmpty($env:ANDROID_NDK_HOME)) {
+        $userNdk = [Environment]::GetEnvironmentVariable("ANDROID_NDK_HOME", "User")
+        if (-not [string]::IsNullOrEmpty($userNdk)) { $env:ANDROID_NDK_HOME = $userNdk }
+    }
+    if ([string]::IsNullOrEmpty($env:ANDROID_NDK_HOME)) {
+        $androidSkip = "ANDROID_NDK_HOME not set"
+    } else {
+        & cargo ndk --version 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { $androidSkip = "cargo-ndk not installed" }
+    }
+    if ($null -eq $androidSkip) {
+        $androidOk = Run-Check -Name $androidName -ArgList @(
+            "ndk", "-t", "arm64-v8a", "-t", "x86_64", "-P", "26",
+            "clippy", "-p", "directdesk-android", "--lib", "--", "-D", "warnings")
+        if (-not $androidOk) { $overallPass = $false }
+    } else {
+        Write-Host ""
+        Write-Host "SKIP: android cross-check ($androidSkip)" -ForegroundColor Yellow
+        [void]$results.Add([PSCustomObject]@{ Name = "android cross-check ($androidSkip)"; Pass = $false; Skip = $true })
+    }
+
     Write-Host ""
     Write-Host "===================================" -ForegroundColor Cyan
     Write-Host "DirectDesk check.ps1 summary" -ForegroundColor Cyan
     Write-Host "===================================" -ForegroundColor Cyan
 
     foreach ($r in $results) {
-        if ($r.Pass) {
+        # A SKIP is neither PASS nor FAIL: shown, never counted.
+        if ($r.PSObject.Properties["Skip"] -and $r.Skip) {
+            Write-Host ("  SKIP  " + $r.Name) -ForegroundColor Yellow
+        } elseif ($r.Pass) {
             Write-Host ("  PASS  " + $r.Name) -ForegroundColor Green
         } else {
             Write-Host ("  FAIL  " + $r.Name) -ForegroundColor Red

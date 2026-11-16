@@ -7,7 +7,8 @@
 //! show it honestly.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use directdesk_shared::geometry::fit_rect;
@@ -115,6 +116,103 @@ fn snap_to_physical_pixel(points: f32, ppp: f32) -> f32 {
     (points * ppp).round() / ppp
 }
 
+/// Recycled frame buffers for decoders that convert pictures on the CPU.
+///
+/// A 2560x1600 RGBA frame is 16 MB. Allocating one per decoded frame costs a
+/// page fault plus kernel page zeroing for every 4 KB of it, then a memset —
+/// measured on Android at roughly half of the decode thread. A buffer that is
+/// done with (copied out by the [`Presenter`], or superseded unshown in the
+/// [`FrameSlot`]) comes back here instead, and the decoder takes it again for
+/// the next frame of the same size.
+///
+/// **Off unless a decoder enables it** ([`FramePool::enable`]): at capacity 0
+/// a returned buffer is simply dropped, as it always was. Only the Android
+/// MediaCodec decoder enables the [global](FramePool::global) pool; the
+/// Windows Media Foundation decoder allocates its own frames and never does.
+///
+/// Bounded: past `capacity` the oldest buffer is dropped, so after a size
+/// change the old-sized buffers (never taken again) age out on their own.
+pub struct FramePool {
+    capacity: AtomicUsize,
+    free: Mutex<VecDeque<Vec<u8>>>,
+}
+
+static FRAME_POOL: FramePool = FramePool::new();
+
+impl FramePool {
+    /// A disabled pool (capacity 0).
+    pub const fn new() -> Self {
+        Self {
+            capacity: AtomicUsize::new(0),
+            free: parking_lot::const_mutex(VecDeque::new()),
+        }
+    }
+
+    /// The process-wide pool every [`FrameSlot`] returns its buffers to.
+    pub fn global() -> &'static FramePool {
+        &FRAME_POOL
+    }
+
+    /// Keep up to `capacity` idle buffers from now on (0 disables the pool and
+    /// frees what it holds).
+    pub fn enable(&self, capacity: usize) {
+        self.capacity.store(capacity, Ordering::Relaxed);
+        let evicted: Vec<Vec<u8>> = {
+            let mut free = self.free.lock();
+            let excess = free.len().saturating_sub(capacity);
+            free.drain(..excess).collect()
+        };
+        drop(evicted);
+    }
+
+    /// A buffer for one `len`-byte frame: a recycled one whose length is
+    /// already exactly `len` (stale contents — the caller overwrites every
+    /// byte), or an empty `Vec` when none is idle.
+    pub fn take(&self, len: usize) -> Vec<u8> {
+        if self.capacity.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut free = self.free.lock();
+        // Newest first: the most recently used buffer is the warmest.
+        match free.iter().rposition(|b| b.len() == len) {
+            Some(i) => free.remove(i).unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Return a buffer that is no longer needed. Dropped when the pool is
+    /// disabled; when it is full, the oldest idle buffer is dropped instead.
+    pub fn recycle(&self, buf: Vec<u8>) {
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        if capacity == 0 || buf.is_empty() {
+            return;
+        }
+        // The (large) drop of an evicted buffer happens after the lock is
+        // released, not under it.
+        let evicted = {
+            let mut free = self.free.lock();
+            free.push_back(buf);
+            if free.len() > capacity {
+                free.pop_front()
+            } else {
+                None
+            }
+        };
+        drop(evicted);
+    }
+
+    /// Idle buffers currently held.
+    pub fn idle(&self) -> usize {
+        self.free.lock().len()
+    }
+}
+
+impl Default for FramePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One decoded frame waiting to be shown.
 struct Slotted {
     frame: RawFrame,
@@ -136,6 +234,9 @@ pub struct FrameSlot {
     dropped_at_present: AtomicU64,
     width: AtomicU32,
     height: AtomicU32,
+    /// Where buffers go once no one needs them: a superseded frame here, a
+    /// presented one via [`FrameSlot::recycle`]. See [`FramePool`].
+    pool: &'static FramePool,
 }
 
 impl Default for FrameSlot {
@@ -146,6 +247,10 @@ impl Default for FrameSlot {
 
 impl FrameSlot {
     pub fn new() -> Self {
+        Self::with_pool(FramePool::global())
+    }
+
+    fn with_pool(pool: &'static FramePool) -> Self {
         Self {
             inner: Mutex::new(None),
             generation: AtomicU64::new(0),
@@ -154,6 +259,7 @@ impl FrameSlot {
             dropped_at_present: AtomicU64::new(0),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
+            pool,
         }
     }
 
@@ -174,11 +280,15 @@ impl FrameSlot {
             // decoded frame is discarded.
             self.dropped_at_present.fetch_add(1, Ordering::Relaxed);
         }
-        *guard = Some(Slotted {
+        let superseded = guard.replace(Slotted {
             frame,
             generation,
             arrived: now,
         });
+        drop(guard);
+        if let Some(old) = superseded {
+            self.pool.recycle(old.frame.data);
+        }
     }
 
     /// Consume the pending frame if it is newer than `last_generation`.
@@ -214,9 +324,18 @@ impl FrameSlot {
         self.dropped_at_present.load(Ordering::Relaxed)
     }
 
+    /// Hand back a frame taken with [`FrameSlot::take_newer_than`] once its
+    /// pixels have been copied out, so its buffer can be reused.
+    pub fn recycle(&self, frame: RawFrame) {
+        self.pool.recycle(frame.data);
+    }
+
     /// Forget any pending frame (used on stream restart / disconnect).
     pub fn clear(&self) {
-        *self.inner.lock() = None;
+        let pending = self.inner.lock().take();
+        if let Some(s) = pending {
+            self.pool.recycle(s.frame.data);
+        }
     }
 }
 
@@ -266,6 +385,66 @@ pub struct VideoView {
     pub remote_h: u32,
 }
 
+/// Largest pinch zoom the touch profile allows.
+pub const MAX_ZOOM: f32 = 4.0;
+
+/// Clamp to `1.0..=MAX_ZOOM`; anything non-finite is 1.0 (no zoom).
+pub fn sanitize_zoom(zoom: f32) -> f32 {
+    if zoom.is_finite() {
+        zoom.clamp(1.0, MAX_ZOOM)
+    } else {
+        1.0
+    }
+}
+
+/// The letterboxed rect `fit` enlarged by `zoom`, with the remote point
+/// `focus` (normalized, clamped to 0..1) at the centre of `viewport`.
+///
+/// Per axis: when the enlarged picture is larger than the viewport the offset
+/// is clamped so it still covers the viewport edge to edge; when it is still
+/// smaller (a letterboxed axis at modest zoom) it stays centred like the
+/// unzoomed layout. `zoom <= 1` returns `fit` untouched, bit for bit.
+pub fn zoomed_rect(
+    fit: egui::Rect,
+    viewport: egui::Rect,
+    zoom: f32,
+    focus: (f32, f32),
+) -> egui::Rect {
+    let zoom = sanitize_zoom(zoom);
+    if zoom <= 1.0 {
+        return fit;
+    }
+    let size = fit.size() * zoom;
+    let axis = |fit_c: f32, size: f32, vp_min: f32, vp_max: f32, f: f32| -> f32 {
+        if size <= vp_max - vp_min {
+            return fit_c - size / 2.0;
+        }
+        let f = if f.is_finite() {
+            f.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let want = (vp_min + vp_max) / 2.0 - f * size;
+        want.clamp(vp_max - size, vp_min)
+    };
+    let min = egui::pos2(
+        axis(
+            fit.center().x,
+            size.x,
+            viewport.min.x,
+            viewport.max.x,
+            focus.0,
+        ),
+        axis(
+            fit.center().y,
+            size.y,
+            viewport.min.y,
+            viewport.max.y,
+            focus.1,
+        ),
+    );
+    egui::Rect::from_min_size(min, size)
+}
 /// egui texture name for the main window's video surface.
 ///
 /// **Load-bearing string.** `Context::load_texture` keys the managed texture by
@@ -321,7 +500,11 @@ impl Presenter {
     /// Pull the newest frame (if any) and upload it. Cheap when idle.
     pub fn update(&mut self, ctx: &egui::Context, slot: &FrameSlot) {
         if let Some((frame, generation, arrived)) = slot.take_newer_than(self.last_generation) {
-            match self.build_color_image(&frame) {
+            let image = self.build_color_image(&frame);
+            // The pixels now live in `image`; the buffer can be decoded into
+            // again (a no-op unless a decoder enabled the FramePool).
+            slot.recycle(frame);
+            match image {
                 Some(image) => {
                     self.tex_size = image.size;
                     let opts = video_texture_options(self.last_scale.get());
@@ -398,7 +581,15 @@ impl Presenter {
         viewport: egui::Rect,
         ppp: f32,
     ) -> Option<VideoView> {
-        let texture = self.texture.as_ref()?;
+        let view = self.layout_video(viewport, ppp)?;
+        self.paint_video(painter, &view);
+        Some(view)
+    }
+
+    /// Where the letterboxed video goes inside `viewport`. Also records the
+    /// scale for the next upload's filter choice. Pure of any painting.
+    fn layout_video(&self, viewport: egui::Rect, ppp: f32) -> Option<VideoView> {
+        self.texture.as_ref()?;
         let (src_w, src_h) = (self.tex_size[0] as u32, self.tex_size[1] as u32);
         // fit_rect is unit-agnostic; feed it PHYSICAL pixels, not egui points,
         // or a 1:1-sized host frame gets resampled against a too-small box on
@@ -434,20 +625,56 @@ impl Presenter {
             snap_to_physical_pixel(origin.x, ppp),
             snap_to_physical_pixel(origin.y, ppp),
         );
-        let rect = egui::Rect::from_min_size(origin, egui::vec2(w, h));
-        painter.image(
-            texture.id(),
-            rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
         Some(VideoView {
-            rect,
+            rect: egui::Rect::from_min_size(origin, egui::vec2(w, h)),
             remote_w: src_w,
             remote_h: src_h,
         })
     }
 
+    fn paint_video(&self, painter: &egui::Painter, view: &VideoView) {
+        if let Some(texture) = self.texture.as_ref() {
+            painter.image(
+                texture.id(),
+                view.rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    /// Like [`Self::draw`], but the video is enlarged by `zoom` (clamped to
+    /// `1.0..=`[`MAX_ZOOM`]) with the remote point `focus` (normalized 0..1)
+    /// placed at the viewport centre, then clamped so the picture always covers
+    /// the viewport on any axis where it is larger than it (no black gutter
+    /// inside a zoomed view). Painting is clipped to the viewport.
+    ///
+    /// The returned [`VideoView::rect`] is the *enlarged* rect and may extend
+    /// past the viewport, so input mapping (`map_pointer`) keeps working
+    /// unchanged; callers that care whether a point is visible test it against
+    /// the viewport. `zoom == 1.0` is exactly [`Self::draw`].
+    pub fn draw_zoomed(
+        &self,
+        ui: &mut egui::Ui,
+        zoom: f32,
+        focus: (f32, f32),
+    ) -> (egui::Rect, Option<VideoView>) {
+        let (viewport, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+        let painter = ui.painter_at(viewport);
+        painter.rect_filled(viewport, 0.0, egui::Color32::BLACK);
+        let ppp = ui.ctx().pixels_per_point();
+        let Some(mut view) = self.layout_video(viewport, ppp) else {
+            return (viewport, None);
+        };
+        let zoom = sanitize_zoom(zoom);
+        if zoom > 1.0 {
+            view.rect = zoomed_rect(view.rect, viewport, zoom, focus);
+            // The texture is now sampled at `zoom` times the fitted scale.
+            self.last_scale.set(self.last_scale.get() * zoom);
+        }
+        self.paint_video(&painter, &view);
+        (viewport, Some(view))
+    }
     pub fn has_frame(&self) -> bool {
         self.texture.is_some()
     }
@@ -589,6 +816,68 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_pool_keeps_nothing() {
+        static POOL: FramePool = FramePool::new();
+        POOL.recycle(vec![1; 16]);
+        assert_eq!(POOL.idle(), 0);
+        assert!(POOL.take(16).is_empty());
+        // The global pool is off unless a decoder turns it on, so the Windows
+        // client keeps dropping its frames exactly as before.
+        assert_eq!(
+            FramePool::global().capacity.load(Ordering::Relaxed),
+            0,
+            "nothing in the client may enable the global pool"
+        );
+    }
+
+    #[test]
+    fn pool_hands_back_only_exact_sizes_and_stays_bounded() {
+        static POOL: FramePool = FramePool::new();
+        POOL.enable(2);
+        POOL.recycle(vec![1; 16]);
+        POOL.recycle(vec![2; 32]);
+        POOL.recycle(vec![3; 16]);
+        // Bounded: the oldest (the first 16-byte buffer) was evicted.
+        assert_eq!(POOL.idle(), 2);
+        assert!(POOL.take(8).is_empty(), "no size match: a fresh Vec");
+        let b = POOL.take(16);
+        assert_eq!(b, vec![3; 16], "the matching buffer, contents untouched");
+        assert!(POOL.take(16).is_empty());
+        assert_eq!(POOL.take(32).len(), 32);
+        assert_eq!(POOL.idle(), 0);
+        // Shrinking frees the excess at once; 0 disables.
+        POOL.recycle(vec![4; 16]);
+        POOL.recycle(vec![5; 16]);
+        POOL.enable(1);
+        assert_eq!(POOL.idle(), 1);
+        assert_eq!(POOL.take(16), vec![5; 16], "the newest survives");
+        POOL.enable(0);
+        POOL.recycle(vec![6; 16]);
+        assert_eq!(POOL.idle(), 0);
+    }
+
+    #[test]
+    fn superseded_and_presented_frames_return_to_the_pool() {
+        static POOL: FramePool = FramePool::new();
+        POOL.enable(3);
+        let slot = FrameSlot::with_pool(&POOL);
+        slot.publish(frame(2, 2, 1));
+        slot.publish(frame(2, 2, 2));
+        assert_eq!(POOL.idle(), 1, "the superseded frame's buffer");
+        let (shown, _, _) = slot.take_newer_than(0).unwrap();
+        assert_eq!(shown.data[0], 2);
+        slot.recycle(shown);
+        assert_eq!(POOL.idle(), 2);
+        slot.publish(frame(2, 2, 3));
+        slot.clear();
+        assert_eq!(POOL.idle(), 3);
+        // Counters are unchanged by recycling.
+        assert_eq!(slot.dropped_at_present(), 1);
+        assert_eq!(slot.presented_count(), 1);
+        assert_eq!(POOL.take(16).len(), 16);
+    }
+
+    #[test]
     fn rate_meter_measures_over_its_window() {
         let t0 = Instant::now();
         let mut m = RateMeter::new(t0);
@@ -680,5 +969,65 @@ mod tests {
         assert!(is_exact_scale(3.0));
         // A fractional scale between two integers is exact at neither.
         assert!(!is_exact_scale(2.5));
+    }
+
+    fn r(x0: f32, y0: f32, x1: f32, y1: f32) -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    }
+
+    #[test]
+    fn zoom_one_is_the_fit_rect_exactly() {
+        let fit = r(0.0, 100.3, 800.0, 550.3);
+        let vp = r(0.0, 0.0, 800.0, 650.0);
+        assert_eq!(zoomed_rect(fit, vp, 1.0, (0.2, 0.9)), fit);
+        assert_eq!(zoomed_rect(fit, vp, 0.5, (0.2, 0.9)), fit);
+        assert_eq!(zoomed_rect(fit, vp, f32::NAN, (0.2, 0.9)), fit);
+    }
+
+    #[test]
+    fn zoom_centres_the_focus_and_covers_the_viewport() {
+        let vp = r(0.0, 0.0, 800.0, 450.0);
+        let fit = vp;
+        let z = zoomed_rect(fit, vp, 2.0, (0.5, 0.5));
+        assert_eq!(z.size(), egui::vec2(1600.0, 900.0));
+        assert_eq!(z.center(), vp.center());
+        // Focus at a corner clamps: the picture edge meets the viewport edge.
+        let z = zoomed_rect(fit, vp, 2.0, (0.0, 0.0));
+        assert_eq!(z.min, vp.min);
+        let z = zoomed_rect(fit, vp, 2.0, (1.0, 1.0));
+        assert_eq!(z.max, vp.max);
+        // A mid focus puts that remote point at the viewport centre.
+        let z = zoomed_rect(fit, vp, 2.0, (0.25, 0.75));
+        let at = z.min + egui::vec2(0.25 * z.width(), 0.75 * z.height());
+        assert!((at - vp.center()).length() < 1e-3);
+    }
+
+    #[test]
+    fn letterboxed_axis_stays_centred_until_it_overflows() {
+        // 16:9 video in a tall viewport: bars above and below.
+        let vp = r(10.0, 20.0, 410.0, 720.0);
+        let fit = r(10.0, 20.0 + 237.5, 410.0, 20.0 + 237.5 + 225.0);
+        let z = zoomed_rect(fit, vp, 1.5, (0.9, 0.9));
+        // 600x337.5: height still fits the 700pt viewport, so it stays centred.
+        assert!((z.center().y - fit.center().y).abs() < 1e-3);
+        assert!(z.min.x <= vp.min.x && z.max.x >= vp.max.x);
+        let z = zoomed_rect(fit, vp, 4.0, (0.9, 0.9));
+        assert!(z.min.y <= vp.min.y && z.max.y >= vp.max.y);
+    }
+
+    #[test]
+    fn zoom_is_capped_and_pointer_mapping_survives_offscreen_rects() {
+        let vp = r(0.0, 0.0, 400.0, 400.0);
+        let z = zoomed_rect(vp, vp, 99.0, (0.5, 0.5));
+        assert_eq!(z.size(), egui::vec2(400.0 * MAX_ZOOM, 400.0 * MAX_ZOOM));
+        // The focus point maps through the enlarged rect to the viewport centre.
+        let view = VideoView {
+            rect: zoomed_rect(vp, vp, 2.0, (0.3, 0.6)),
+            remote_w: 1000,
+            remote_h: 1000,
+        };
+        let (x, y) = crate::input_capture::map_pointer(vp.center(), &view).unwrap();
+        assert!((x as f32 / 65535.0 - 0.3).abs() < 0.002);
+        assert!((y as f32 / 65535.0 - 0.6).abs() < 0.002);
     }
 }

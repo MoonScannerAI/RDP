@@ -56,6 +56,22 @@ pub fn is_pairing_mode(code_input: &str) -> bool {
     code_input.chars().any(|c| c.is_ascii_digit())
 }
 
+/// The connect form's text fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormField {
+    Host,
+    UdpPort,
+    DisplayName,
+    PairingCode,
+}
+
+/// Touch: does Enter in `field` connect? In the host and pairing-code fields,
+/// where "done typing" means "go" (they are the last thing a reconnect or a
+/// first pairing needs). Elsewhere Enter just closes the keyboard.
+pub fn enter_submits(field: FormField) -> bool {
+    matches!(field, FormField::Host | FormField::PairingCode)
+}
+
 /// The raw text fields as the UI holds them.
 pub struct FormInputs<'a> {
     pub host: &'a str,
@@ -129,6 +145,26 @@ mod tests {
         assert!(normalize_pairing_code("1234").is_err(), "too short");
         assert!(normalize_pairing_code("123456789").is_err(), "too long");
         assert!(normalize_pairing_code("12ab5678").is_err(), "non-digit");
+    }
+
+    #[test]
+    fn enter_connects_only_from_the_host_and_code_fields() {
+        assert!(enter_submits(FormField::Host));
+        assert!(enter_submits(FormField::PairingCode));
+        assert!(!enter_submits(FormField::DisplayName));
+        assert!(!enter_submits(FormField::UdpPort));
+    }
+
+    #[test]
+    fn a_code_typed_on_a_phone_keyboard_is_accepted_with_any_separators() {
+        for typed in ["12345678", "1234 5678", "1234-5678", " 12-34 56_78 "] {
+            assert_eq!(
+                normalize_pairing_code(typed),
+                Ok(Some("12345678".into())),
+                "{typed:?}"
+            );
+            assert!(is_pairing_mode(typed));
+        }
     }
 
     #[test]

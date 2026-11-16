@@ -45,7 +45,7 @@ and `shared::protocol::AuthMsg` (the wire messages) — see
    travel in the clear.
 
 2. **Pairing code.** The host generates a fresh **8-digit numeric code**,
-   valid for **120 seconds**, **single-use**. It is shown on the host (tray
+   valid for **5 minutes**, **single-use**. It is shown on the host (tray
    icon) and entered on the client — this is the only secret a human ever
    has to move between the two machines, and it never touches the network
    as plaintext.
@@ -61,7 +61,7 @@ and `shared::protocol::AuthMsg` (the wire messages) — see
    connection they control (a classic MITM-relay), the exporter value would
    differ and the confirm MAC would not match. A guessed/brute-forced code
    without ever seeing the real TLS session gets nowhere, and — because the
-   code is single-use and 120-second-lived — even an attacker who tried
+   code is single-use and 5-minute-lived — even an attacker who tried
    many codes against a live host session gets at most a handful of guesses
    before the code rotates.
 
@@ -281,7 +281,7 @@ itself. DirectDesk does **not** protect against:
   network flood aimed at the host's listening ports. Rate limiting exists
   narrowly for specific things (e.g. keyframe request throttling) but this
   is not a hardened Internet-facing service in the DDoS-resistance sense.
-- **The pairing code channel itself.** The 120-second/single-use/
+- **The pairing code channel itself.** The 5-minute/single-use/
   SPAKE2-bound design defeats network-level attacks on the code, but if you
   read the pairing code out loud over a compromised phone call, screen-share
   it to someone untrusted, or otherwise leak it out-of-band, DirectDesk has

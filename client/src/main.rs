@@ -12,12 +12,9 @@
 
 use std::sync::Arc;
 
-use directdesk_client::config::ClientConfig;
-use directdesk_client::connect::{ConnectSupervisor, StreamCaps};
-use directdesk_client::renderer::FrameSlot;
-use directdesk_client::session::{ClientSession, TransportEndpoints};
-use directdesk_client::ui::{AppInit, ClientApp, SourceMode};
-use directdesk_client::{decoder, pipeline};
+use directdesk_client::app::{self, LaunchArgs, PlatformConfig, UiProfile};
+use directdesk_client::connect::StreamCaps;
+use directdesk_client::decoder;
 use directdesk_shared::crypto::storage::{DpapiFileStore, SecretStore};
 
 const USAGE: &str = "\
@@ -39,6 +36,9 @@ DirectDeskClient — DirectDesk remote desktop client
                        across focus loss, minimize and reconnects; also forces
                        'Background capture' on for this run, so keys keep going
                        to the host while DirectDesk is in the background
+  --touch-ui           test aid: run the touch UI profile the Android client
+                       uses (no low-level keyboard hook); stream capabilities
+                       stay the desktop defaults
   -h, --help           this text
 ";
 
@@ -53,6 +53,7 @@ struct Args {
     decoder_selftest: bool,
     capture_on_start: bool,
     hold_capture: bool,
+    touch_ui: bool,
     help: bool,
 }
 
@@ -68,6 +69,7 @@ impl Default for Args {
             decoder_selftest: false,
             capture_on_start: false,
             hold_capture: false,
+            touch_ui: false,
             help: false,
         }
     }
@@ -103,6 +105,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--decoder-selftest" => args.decoder_selftest = true,
             "--capture-on-start" => args.capture_on_start = true,
             "--hold-capture" => args.hold_capture = true,
+            "--touch-ui" => args.touch_ui = true,
             "-h" | "--help" => args.help = true,
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -139,83 +142,17 @@ fn main() -> anyhow::Result<()> {
         return decoder_selftest();
     }
 
-    let mut config = ClientConfig::load();
-    // An explicit `--host` both pre-fills the field and auto-triggers a connect.
-    let host_given = args.host.is_some();
-    if let Some(host) = args.host {
-        config.host_address = host;
-    }
-    if let Some(p) = args.udp_port {
-        config.udp_port = p;
-    }
+    // The client's secret store. Opening it only resolves `%APPDATA%` —
+    // nothing touches the disk until a read or write, and nothing is logged —
+    // so opening it here, ahead of the config load and even under
+    // `--loopback-demo` (which never uses it), changes nothing observable. A
+    // failure is reported by `app::run` exactly where it always was: when the
+    // Live supervisor would be built.
+    let store = DpapiFileStore::client()
+        .map(|store| Arc::new(store) as Arc<dyn SecretStore>)
+        .map_err(|e| e.to_string());
 
-    let (session, transport) = ClientSession::new();
-    let slot = Arc::new(FrameSlot::new());
-    // The second monitor's frame slot. Created unconditionally — whether a
-    // session ever carries a second stream is decided per connection, in the
-    // handshake — and stays empty until one does.
-    let slot2 = Arc::new(FrameSlot::new());
-
-    let mode = if args.loopback_demo {
-        SourceMode::LoopbackDemo
-    } else {
-        SourceMode::Live
-    };
-
-    // One long-lived runtime shared by the connect supervisor for the whole app.
-    // The supervisor holds only a `Handle`; this owns the worker threads and is
-    // dropped (shutting the runtime down) once the window closes.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-
-    // The name shown on the host: a remembered name wins, else the machine name.
-    let display_name = {
-        let saved = config.display_name.trim();
-        if saved.is_empty() {
-            client_display_name()
-        } else {
-            saved.chars().filter(|c| !c.is_control()).take(64).collect()
-        }
-    };
-
-    // Build the connect supervisor for Live mode. `--loopback-demo` has no
-    // transport at all; if the secret store cannot be opened we keep the
-    // channels alive (so the UI still runs) but Connect stays disabled.
-    let (supervisor, transport_for_app) = match mode {
-        SourceMode::LoopbackDemo => {
-            tracing::warn!(
-                "--loopback-demo: synthetic frames at {} fps; decoder and network are BYPASSED",
-                args.demo_fps
-            );
-            spawn_input_sink(transport);
-            (None, None)
-        }
-        SourceMode::Live => match DpapiFileStore::client() {
-            Ok(store) => {
-                let store: Arc<dyn SecretStore> = Arc::new(store);
-                let supervisor = ConnectSupervisor::new(
-                    runtime.handle().clone(),
-                    store,
-                    transport,
-                    StreamCaps::default(),
-                );
-                (Some(supervisor), None)
-            }
-            Err(e) => {
-                tracing::error!("secret store unavailable ({e}); transport disabled");
-                (None, Some(transport))
-            }
-        },
-    };
-
-    // An explicit CLI `--host` auto-triggers one connect on the first frame; a
-    // merely-remembered host just pre-fills the form. Needs a live supervisor.
-    let auto_connect = host_given && supervisor.is_some();
-    let initial_pair_code = args.pair_code.clone();
-
-    let options = eframe::NativeOptions {
+    let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 400.0])
@@ -223,109 +160,30 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let video_rx = session.video_rx.clone();
-    let video2_rx = session.video2_rx.clone();
-    let demo_fps = args.demo_fps;
-    let demo_second_window = args.demo_second_window;
-    let capture_on_start = args.capture_on_start;
-    let hold_capture = args.hold_capture;
-
-    eframe::run_native(
-        "DirectDesk",
-        options,
-        Box::new(move |cc| {
-            let ctx = cc.egui_ctx.clone();
-            let repaint = {
-                let ctx = ctx.clone();
-                move || ctx.request_repaint()
-            };
-            let mut pipeline = match mode {
-                SourceMode::LoopbackDemo => {
-                    pipeline::spawn_demo_source(slot.clone(), demo_fps, repaint)
-                }
-                SourceMode::Live => {
-                    // The decode thread asks for a keyframe when a decode fails,
-                    // so it needs the outbound control channel.
-                    let control_tx = session.control_tx.clone();
-                    pipeline::spawn_decode_thread(video_rx, slot.clone(), control_tx, repaint)
-                }
-            };
-
-            // The second decode path, attached once here exactly like the tile
-            // and audio threads: whether a connection carries a second monitor
-            // is decided per handshake, long after this point, and the thread
-            // costs one parked poll until a stream-1 frame actually arrives (it
-            // builds no decoder before then). Wiring it here rather than on
-            // connect also means a mid-session `SelectMonitors` needs no thread
-            // plumbing at all.
-            let stream1_status = match mode {
-                SourceMode::Live => {
-                    // Repaints the *child* viewport, not the root: the second
-                    // window paints on its own cadence, which is the whole
-                    // reason it is a deferred viewport.
-                    let repaint2 = move || {
-                        ctx.request_repaint_of(
-                            directdesk_client::ui::second_window::stream1_viewport_id(),
-                        )
-                    };
-                    pipeline.attach_decode_thread(
-                        video2_rx,
-                        slot2.clone(),
-                        session.control_tx.clone(),
-                        repaint2,
-                    )
-                }
-                // `--loopback-demo` has no transport, so nothing could ever
-                // reach a second decode thread — unless `--demo-second-window`
-                // asked for a synthetic source to feed the second slot
-                // instead, exercising the same window/focus/close/diagnostics
-                // path with no dual-monitor host at all. Without that flag the
-                // gauges still exist so the UI has something honest to read:
-                // they report nothing measured.
-                SourceMode::LoopbackDemo => {
-                    if demo_second_window {
-                        let repaint2 = move || {
-                            ctx.request_repaint_of(
-                                directdesk_client::ui::second_window::stream1_viewport_id(),
-                            )
-                        };
-                        pipeline.attach_demo_thread(slot2.clone(), demo_fps, repaint2)
-                    } else {
-                        Arc::new(pipeline::SourceStatus::default())
-                    }
-                }
-            };
-
-            Ok(Box::new(ClientApp::new(
-                cc,
-                AppInit {
-                    config,
-                    session,
-                    transport: transport_for_app,
-                    slot,
-                    slot2,
-                    stream1_status,
-                    pipeline,
-                    mode,
-                    supervisor,
-                    display_name,
-                    initial_pair_code,
-                    auto_connect,
-                    capture_on_start,
-                    hold_capture,
-                    demo_second_window,
-                },
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))?;
-
-    // The window has closed and `ClientApp` (with the supervisor) has been
-    // dropped, cancelling any live connection. Drop the runtime to stop its
-    // worker threads.
-    drop(runtime);
-
-    Ok(())
+    app::run(PlatformConfig {
+        profile: if args.touch_ui {
+            UiProfile::Touch
+        } else {
+            UiProfile::Desktop
+        },
+        // `%APPDATA%\DirectDesk\client.json`, as always.
+        data_dir: None,
+        store,
+        new_decoder: decoder::new_decoder,
+        caps: StreamCaps::default(),
+        default_display_name: client_display_name(),
+        launch: LaunchArgs {
+            host: args.host,
+            udp_port: args.udp_port,
+            pair_code: args.pair_code,
+            loopback_demo: args.loopback_demo,
+            demo_fps: args.demo_fps,
+            demo_second_window: args.demo_second_window,
+            capture_on_start: args.capture_on_start,
+            hold_capture: args.hold_capture,
+        },
+        native_options,
+    })
 }
 
 /// A friendly name for this client, shown on the host after pairing. Derived
@@ -341,47 +199,6 @@ fn client_display_name() -> String {
     } else {
         cleaned
     }
-}
-
-/// Demo mode has no transport, so drain the outbound channels and count what
-/// the UI produces. This is how `--loopback-demo` proves input capture works.
-fn spawn_input_sink(mut transport: TransportEndpoints) {
-    std::thread::Builder::new()
-        .name("directdesk-input-sink".into())
-        .spawn(move || {
-            use directdesk_shared::input::InputEvent;
-            use directdesk_shared::protocol::InputMsg;
-
-            let (mut keys, mut moves, mut buttons, mut wheels, mut releases) =
-                (0u64, 0u64, 0u64, 0u64, 0u64);
-            let mut last_log = std::time::Instant::now();
-            while let Some(msg) = transport.input_rx.blocking_recv() {
-                match msg {
-                    InputMsg::Event(InputEvent::Key { .. }) => keys += 1,
-                    InputMsg::Event(InputEvent::MouseMove { .. }) => moves += 1,
-                    InputMsg::Event(InputEvent::MouseButton { .. }) => buttons += 1,
-                    InputMsg::Event(InputEvent::MouseWheel { .. }) => wheels += 1,
-                    InputMsg::ReleaseAll => releases += 1,
-                    // Appended alongside `features::MULTI_MONITOR`; the capture
-                    // path cannot produce one until that feature is wired, so
-                    // this sink has nothing to count yet.
-                    InputMsg::EventOn { .. } => {}
-                }
-                if last_log.elapsed() >= std::time::Duration::from_secs(2) {
-                    last_log = std::time::Instant::now();
-                    tracing::info!(keys, moves, buttons, wheels, releases, "input sink totals");
-                }
-            }
-            tracing::info!(
-                keys,
-                moves,
-                buttons,
-                wheels,
-                releases,
-                "input sink final totals"
-            );
-        })
-        .expect("spawn input sink");
 }
 
 fn decoder_selftest() -> anyhow::Result<()> {
@@ -486,6 +303,16 @@ mod tests {
 
         let a = args(&["--capture-on-start", "--hold-capture"]).unwrap();
         assert!(a.capture_on_start && a.hold_capture);
+    }
+
+    #[test]
+    fn touch_ui_is_opt_in_and_independent() {
+        assert!(!args(&[]).unwrap().touch_ui, "desktop profile by default");
+        let a = args(&["--touch-ui"]).unwrap();
+        assert!(a.touch_ui);
+        assert!(!a.loopback_demo && !a.capture_on_start && !a.hold_capture);
+        let a = args(&["--loopback-demo", "--touch-ui"]).unwrap();
+        assert!(a.touch_ui && a.loopback_demo);
     }
 
     #[test]

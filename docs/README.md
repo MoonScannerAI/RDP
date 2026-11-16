@@ -50,7 +50,7 @@ DirectDesk ships as three executables built from one Cargo workspace:
    5. Relay (**stub in this MVP — no relay server exists**; if every direct
       path fails, the connection simply fails rather than silently claiming
       success)
-3. **Pairing**: a fresh 8-digit numeric code, valid for 120 seconds and
+3. **Pairing**: a fresh 8-digit numeric code, valid for 5 minutes and
    single-use, is generated on the host and entered on the client. It runs
    through SPAKE2 (a password-authenticated key exchange) bound to the live
    TLS channel via exporter keying material, so the pairing code cannot be
@@ -159,7 +159,7 @@ relying on this for anything important. In short, as of this MVP:
    Spectrum-specific walkthrough, or [NETWORK_SETUP.md](NETWORK_SETUP.md)
    for the general case.
 4. On the client machine, run `DirectDeskClient.exe`, enter the host's
-   address and the pairing code. The code expires after 120 seconds and can
+   address and the pairing code. The code expires after 5 minutes and can
    only be used once.
 5. Once connected, the client window shows the active route label (e.g.
    "Direct UDP") and live stats. Press **Ctrl+Alt+Shift+F12** at any time to
@@ -192,6 +192,7 @@ rdp/                     cargo workspace root
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — connection and quality problems, log locations
 - [LIMITATIONS.md](LIMITATIONS.md) — MVP scope honesty
 - [TEST_REPORT.md](TEST_REPORT.md) — milestone-by-milestone test status
+- [ANDROID.md](ANDROID.md) — the Android client: building, installing, pairing, gestures
 
 ## License
 

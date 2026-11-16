@@ -362,6 +362,7 @@ static HOOK_STATE: Mutex<HookState> = Mutex::new(HookState {
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 static RELEASE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static KEYS_FORWARDED: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
 static KEYS_SWALLOWED: AtomicU64 = AtomicU64::new(0);
 /// Every HC_ACTION the hook saw. Distinguishes "hook never fired" from
 /// "hook fired but the event was filtered" when diagnosing capture.
@@ -396,6 +397,7 @@ static SESSION_LIVE: AtomicBool = AtomicBool::new(false);
 ///
 /// Exactly one combination swallows: capture on, window in the background,
 /// background capture opted in, and a live session to send the key to.
+#[cfg(any(windows, test))]
 fn swallow_decision(
     capturing: bool,
     foreground: bool,
@@ -406,6 +408,7 @@ fn swallow_decision(
 }
 
 /// [`swallow_decision`] applied to the live statics.
+#[cfg(windows)]
 fn swallow_active() -> bool {
     swallow_decision(
         CAPTURING.load(Ordering::Relaxed),
@@ -1223,6 +1226,10 @@ pub struct InputCapture {
     /// is legacy `Event` too, and so is the second window's.
     keys: EguiKeyForwarder,
     last_error: Option<String>,
+    /// False on platforms with no low-level keyboard hook (Android): capture
+    /// is then purely the focused-window egui path plus explicit
+    /// [`Self::send_key`] calls, and `start_capture` never tries to start one.
+    use_hook: bool,
 }
 
 impl InputCapture {
@@ -1235,7 +1242,48 @@ impl InputCapture {
             hook: None,
             capture_requested: false,
             last_error: None,
+            use_hook: true,
         }
+    }
+
+    /// Capture without the low-level keyboard hook. Everything else — the
+    /// capture toggle, the egui key path, release-on-focus-loss, `ReleaseAll`
+    /// — behaves exactly as with [`Self::new`].
+    pub fn without_hook(tx: mpsc::Sender<InputMsg>) -> Self {
+        let mut capture = Self::new(tx);
+        capture.use_hook = false;
+        capture
+    }
+
+    /// The main window's pointer forwarder, for input sources that are not
+    /// egui pointer events (the touch layer drives it directly so it keeps the
+    /// drag latch, clamped release and move-flush-before-click guarantees).
+    pub fn pointer_mut(&mut self) -> &mut PointerForwarder {
+        &mut self.pointer
+    }
+
+    /// Send one key transition that did not come from egui (the on-screen
+    /// keyboard). Gated on capture exactly like [`Self::forward_key_events`].
+    /// Returns false if capture is off or the input channel is closed.
+    /// Counted in [`Self::keys_forwarded`] like every other forwarded key, so
+    /// the diagnostics and metrics see on-screen typing too.
+    pub fn send_key(&mut self, scan_code: u16, extended: bool, down: bool) -> bool {
+        if !self.capture_requested {
+            return false;
+        }
+        let action = if down { KeyAction::Down } else { KeyAction::Up };
+        let ok = send_input(
+            &self.tx,
+            InputMsg::Event(InputEvent::Key {
+                scan_code,
+                extended,
+                action,
+            }),
+        );
+        if ok {
+            KEYS_FORWARDED.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
     }
 
     /// Mirror "**any** DirectDesk window is the foreground window" into the
@@ -1302,7 +1350,7 @@ impl InputCapture {
         if self.capture_requested {
             return;
         }
-        if self.hook.is_none() {
+        if self.use_hook && self.hook.is_none() {
             match hook::HookThread::start() {
                 Ok(thread) => self.hook = Some(thread),
                 Err(e) => {
@@ -2206,5 +2254,46 @@ mod tests {
             map_button(egui::PointerButton::Extra2),
             Some(MouseButton::X2)
         );
+    }
+
+    /// The touch profile's guarantee: no key — on-screen or hardware — reaches
+    /// the host before capture starts, or after it stops.
+    #[test]
+    fn hookless_capture_sends_no_key_outside_capture() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut cap = InputCapture::without_hook(tx);
+        let a_down = egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        assert!(!cap.send_key(0x1E, false, true), "OSK key before capture");
+        cap.forward_key_events(std::slice::from_ref(&a_down));
+        assert!(drain(&mut rx).is_empty(), "nothing before capture");
+
+        cap.start_capture();
+        assert!(cap.is_capturing());
+        assert!(!cap.hook_active(), "no hook on the touch path");
+        assert!(cap.send_key(0x1E, false, true));
+        cap.forward_key_events(std::slice::from_ref(&a_down));
+        let keys = drain(&mut rx)
+            .into_iter()
+            .filter(|m| matches!(m, InputMsg::Event(InputEvent::Key { .. })))
+            .count();
+        assert_eq!(keys, 2, "one on-screen, one hardware");
+
+        cap.stop_capture();
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, InputMsg::ReleaseAll)),
+            "stopping releases everything"
+        );
+        assert!(!cap.send_key(0x1E, false, false));
+        cap.forward_key_events(&[a_down]);
+        assert!(drain(&mut rx).is_empty(), "nothing after capture");
     }
 }

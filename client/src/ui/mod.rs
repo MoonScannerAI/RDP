@@ -7,27 +7,65 @@
 //!
 //! eframe 0.35 splits a frame into [`eframe::App::logic`] (state, no drawing)
 //! and [`eframe::App::ui`] (drawing only); this app keeps to that split.
+//!
+//! # Two profiles
+//!
+//! [`UiProfile::Desktop`] is the Windows client exactly as it always was.
+//! [`UiProfile::Touch`] (Android, or `--touch-ui`) swaps in, and only in that
+//! profile:
+//!
+//! * the streaming view: [`touch_view::TouchView`] gestures + pinch zoom
+//!   instead of mouse forwarding, with hardware-keyboard keys still forwarded;
+//! * capture that follows the session (on at go-live, off at session end)
+//!   instead of a toggle, gated on a focus debounce that ignores Android's
+//!   one-frame focus flicker on resume;
+//! * the egui [`keyboard::Keyboard`] — Remote while streaming (toolbar button
+//!   or Back toggles it), Local on the connect screen whenever a text field
+//!   has focus, its events injected through `raw_input_hook`; the system IME
+//!   is never requested;
+//! * a compact auto-hiding overlay toolbar instead of the top panel;
+//! * on Windows only, mouse-to-touch synthesis so all of it runs with a mouse.
+//!
+//! Frame order in Touch: `raw_input_hook` (strip Back, synthesize touches,
+//! inject local keyboard events) → `logic` (focus debounce, session drain,
+//! capture policy, Back, key repeat) → `ui` (toolbar first, so its rect is
+//! current when the streaming view filters touches; then the views).
 
 pub mod connect_form;
 pub mod diagnostics;
+pub mod keyboard;
 pub mod second_window;
+pub mod touch_shell;
+pub mod touch_view;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use directdesk_shared::protocol::{ControlMsg, MonitorInfo, QualityMode};
+use directdesk_shared::protocol::{ControlMsg, InputMsg, MonitorInfo, QualityMode};
 use directdesk_shared::stats::{validate_stats, ConnStats, TransportRoute};
 use parking_lot::Mutex;
 
+use crate::app::UiProfile;
 use crate::config::ClientConfig;
-use crate::connect::ConnectSupervisor;
+use crate::connect::{ConnectSupervisor, DisconnectHandle, StoppingDriver};
 use crate::input_capture::{chord_pressed, CaptureLoss, InputCapture, RELEASE_CHORD};
 use crate::monitors::{self, MonitorChoice};
 use crate::pipeline::{Pipeline, SourceStatus};
 use crate::renderer::{describe_scale, is_exact_scale, FrameSlot, Presenter, MAIN_VIDEO_TEXTURE};
 use crate::session::{ClientSession, ConnectionState, TransportEndpoints};
 use crate::tiles::TileStore;
+use crate::ui::keyboard::{Keyboard, KeyboardOutput, KeyboardTarget};
 use crate::ui::second_window::SecondaryShared;
+#[cfg(not(target_os = "android"))]
+use crate::ui::touch_shell::MouseTouchSynth;
+use crate::ui::touch_shell::{
+    back_action, click_dismisses_text_focus, split_action_row, split_for_keyboard, strip_back_key,
+    touch_wants_capture, without_injected, BackAction, BackgroundShared, BackgroundWatchdog,
+    FocusDebounce, FocusEdge, OverlayTouchFilter, ResumeAction, ResumeAfterBackground,
+    ToolbarState, WatchdogAction, ACTION_ROW_PTS, BACKGROUND_WATCHDOG_POLL, HEARTBEAT_REPAINT,
+    TOUCH_TARGET_PTS,
+};
+use crate::ui::touch_view::TouchView;
 
 /// An outstanding UAC prompt on the remote host, awaiting an operator
 /// decision. Shown as a banner over the session view; auto-dismisses so a
@@ -63,6 +101,87 @@ pub enum SourceMode {
     Live,
     /// `--loopback-demo`: synthetic frames, no decode, no network.
     LoopbackDemo,
+}
+
+/// How long the watchdog lets a `ReleaseAll` reach the wire before it raises
+/// the shutdown that ends the session (the two travel different paths into
+/// the driver, and the driver's `select!` has no order between them).
+const RELEASE_BEFORE_BYE: Duration = Duration::from_millis(150);
+
+/// Touch: the UI's half of the background watchdog (see
+/// `touch_shell::BackgroundWatchdog`). The thread holds only a `Weak` to the
+/// shared state, so dropping this (with the app) ends it within a poll.
+struct BackgroundGuard {
+    shared: Arc<BackgroundShared>,
+    driver: DisconnectHandle,
+}
+
+impl BackgroundGuard {
+    /// Start the watchdog thread. `None` (logged) if it cannot be spawned:
+    /// the app then simply behaves as before.
+    fn start(
+        driver: DisconnectHandle,
+        input_tx: tokio::sync::mpsc::Sender<InputMsg>,
+    ) -> Option<Self> {
+        let shared = Arc::new(BackgroundShared::new(Instant::now()));
+        let weak = Arc::downgrade(&shared);
+        let thread_driver = driver.clone();
+        let spawned = std::thread::Builder::new()
+            .name("directdesk-bg-watchdog".into())
+            .spawn(move || background_watchdog(weak, thread_driver, input_tx));
+        match spawned {
+            Ok(_) => Some(Self { shared, driver }),
+            Err(e) => {
+                tracing::error!("could not start the background watchdog: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// The watchdog thread: ends a session whose UI has stopped drawing (the app
+/// is in the background) the way the UI's own Disconnect would — input
+/// released on the host, a graceful close with `Bye`, no reconnect — then
+/// reports it once the driver has gone, for the reconnect on resume.
+fn background_watchdog(
+    shared: Weak<BackgroundShared>,
+    driver: DisconnectHandle,
+    input_tx: tokio::sync::mpsc::Sender<InputMsg>,
+) {
+    let mut dog = BackgroundWatchdog::default();
+    let mut stopping: Option<StoppingDriver> = None;
+    loop {
+        std::thread::sleep(BACKGROUND_WATCHDOG_POLL);
+        let Some(shared) = shared.upgrade() else {
+            return; // the app is gone
+        };
+        let now = Instant::now();
+        let alive = match &stopping {
+            Some(s) => !s.has_exited(),
+            None => driver.is_running(),
+        };
+        match dog.step(&shared, now, alive) {
+            WatchdogAction::Nothing => {}
+            WatchdogAction::Disconnect => {
+                tracing::info!(
+                    no_frame_for = ?shared.heartbeat_age(now),
+                    "touch: the app is in the background — ending the session \
+                     (disconnected because backgrounded)"
+                );
+                // Lift anything the host holds for us before the session goes.
+                let _ = input_tx.try_send(InputMsg::ReleaseAll);
+                std::thread::sleep(RELEASE_BEFORE_BYE);
+                stopping = driver.shut_down();
+            }
+            WatchdogAction::Settled => {
+                tracing::info!(
+                    exited = stopping.as_ref().is_none_or(StoppingDriver::has_exited),
+                    "touch: background disconnect complete; reconnecting on resume"
+                );
+                stopping = None;
+            }
+        }
+    }
 }
 
 pub struct AppInit {
@@ -105,6 +224,9 @@ pub struct AppInit {
     /// `--loopback-demo`, so it is meaningless (and never set) under
     /// `SourceMode::Live`.
     pub demo_second_window: bool,
+    /// Interaction model. `Touch` (Android, or `--touch-ui` on Windows) never
+    /// installs the low-level keyboard hook; `Desktop` is today's client.
+    pub profile: crate::app::UiProfile,
 }
 
 pub struct ClientApp {
@@ -231,6 +353,53 @@ pub struct ClientApp {
     /// every mid-session `SelectMonitors` re-send — the UI is the only place
     /// that knows whether the feature was negotiated.
     monitors: Option<Vec<MonitorInfo>>,
+    /// Interaction model, from [`AppInit::profile`].
+    profile: UiProfile,
+
+    // -- Touch profile. Everything below is inert in `UiProfile::Desktop`:
+    // -- nothing reads or writes it outside a `profile == Touch` gate.
+    /// Trackpad gestures, pinch zoom and the cursor sprite for the main window.
+    touch: TouchView,
+    /// The on-screen keyboard: Remote while streaming, Local on the connect
+    /// screen. Hidden unless asked for.
+    keyboard: Keyboard,
+    /// The operator's keyboard toggle while streaming (toolbar or Back).
+    osk_streaming: bool,
+    /// Window focus with Android's one-frame resume flicker filtered out.
+    touch_focus: FocusDebounce,
+    /// The session was live last frame (edge for "show the toolbar").
+    touch_was_live: bool,
+    /// The compact overlay toolbar: expanded until a deadline.
+    touch_toolbar: ToolbarState,
+    /// The overlay toolbar's rect *this* frame (it is drawn before the video).
+    touch_toolbar_rect: Option<egui::Rect>,
+    /// Fingers that started on an overlay; the gesture layer never sees them.
+    touch_filter: OverlayTouchFilter,
+    /// Local keyboard events waiting for the next frame's `raw_input_hook`.
+    pending_local_events: Vec<egui::Event>,
+    /// What `raw_input_hook` injected into the current frame. Subtracted from
+    /// the events the streaming view forwards, so a local keystroke can never
+    /// reach the host as if typed on a hardware keyboard.
+    injected_events: Vec<egui::Event>,
+    /// Back presses stripped from this frame's raw input, acted on in `logic`.
+    back_presses: u32,
+    /// Connect-screen text fields drawn last frame: (id, rect).
+    connect_text_edits: Vec<(egui::Id, egui::Rect)>,
+    /// The connect-screen field that had focus last frame.
+    connect_focus: Option<egui::Id>,
+    /// Scroll the focused field into view on its next draw (the keyboard just
+    /// took the bottom of the screen, or focus moved).
+    connect_scroll_pending: bool,
+    /// The connect form's "Advanced" section (UDP port) is expanded.
+    touch_advanced_open: bool,
+    /// The heartbeat + watchdog that end a session left running in the
+    /// background. `None` without a transport (nothing to end).
+    background: Option<BackgroundGuard>,
+    /// Reconnect-once-on-resume after the watchdog ended a session.
+    bg_resume: ResumeAfterBackground,
+    /// `--touch-ui` on Windows: the mouse plays a single finger.
+    #[cfg(not(target_os = "android"))]
+    mouse_touch: MouseTouchSynth,
 }
 
 impl ClientApp {
@@ -240,7 +409,33 @@ impl ClientApp {
         // a remote screen belongs on a dark surround, always.
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         let input_tx = init.session.input_tx.clone();
-        let input = InputCapture::new(input_tx.clone());
+        // A touch device has no physical keyboard to hook (and Android no
+        // `SetWindowsHookEx`); every other part of capture behaves the same.
+        let input = match init.profile {
+            UiProfile::Touch => InputCapture::without_hook(input_tx.clone()),
+            UiProfile::Desktop => InputCapture::new(input_tx.clone()),
+        };
+        let profile = init.profile;
+        if profile == UiProfile::Touch {
+            // Tapping the on-screen keyboard is a click outside the focused
+            // text field, which by default surrenders its focus before the
+            // injected keystroke arrives. Focus is dropped explicitly instead
+            // (tap elsewhere, Enter, Back) — see `touch_connect_screen`.
+            cc.egui_ctx.options_mut(|o| {
+                o.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never;
+            });
+            // Finger-sized controls everywhere the touch profile reuses
+            // desktop widgets (connect form, combo boxes, dialogs).
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.spacing.interact_size.y = style.spacing.interact_size.y.max(TOUCH_TARGET_PTS);
+                style.spacing.button_padding = egui::vec2(10.0, 6.0);
+                style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            });
+        }
+        // `Keyboard::new` starts visible; this app shows it on demand only.
+        // Nothing is held yet, so there is nothing to deliver.
+        let mut keyboard = Keyboard::new();
+        let _ = keyboard.set_visible(false);
         let show_diagnostics = init.config.show_diagnostics;
         let auto_snap_scale = init.config.auto_snap_scale;
         let fullscreen = init.config.start_fullscreen;
@@ -248,15 +443,33 @@ impl ClientApp {
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
         }
-        // The supervisor is built with `StreamCaps::default()` before the
-        // persisted config is known; seed the persisted fps choice into it
-        // now so the *first* connect carries it too, not just ones made after
-        // the toolbar combo is touched.
+        // The supervisor is built with the platform's `StreamCaps` (the
+        // default on Windows: fps 0 = host decides; `StreamCaps::touch_device`
+        // on Android: 30) before the persisted config is known. Seed a
+        // persisted fps choice into it now so the *first* connect carries it
+        // too, not just ones made after the toolbar combo is touched — but
+        // only an explicit one: 0 means "Auto", which must not override the
+        // platform preset (it used to, silently lifting Android's 30 fps cap).
+        // On Windows the preset is itself 0, so skipping 0 changes nothing.
         let mut supervisor = init.supervisor;
         if let Some(sup) = supervisor.as_mut() {
-            sup.set_preferred_fps(init.config.preferred_fps);
-            sup.set_monitor_choice(init.config.monitor_choice);
+            if let Some(fps) = persisted_fps_override(init.config.preferred_fps) {
+                sup.set_preferred_fps(fps);
+            }
+            // Same reasoning as `begin_connect`: only a session that can
+            // offer multi-monitor takes the picker's choice.
+            if monitor_picker_offered(profile, Some(sup.offers_multi_monitor())) {
+                sup.set_monitor_choice(init.config.monitor_choice);
+            }
         }
+        // Touch: end sessions left running in the background (Android drops
+        // the window and stops calling us; the transport would not notice).
+        let background = match (profile, supervisor.as_ref()) {
+            (UiProfile::Touch, Some(sup)) => {
+                BackgroundGuard::start(sup.disconnect_handle(), input_tx.clone())
+            }
+            _ => None,
+        };
 
         // Lossless refinement tiles. The store belongs to the pipeline (the
         // decode thread paints from it and is spawned before this app exists);
@@ -330,7 +543,58 @@ impl ClientApp {
             stream1_video: None,
             stream1_monitor: None,
             monitors: None,
+            profile,
+            touch: TouchView::new(),
+            keyboard,
+            osk_streaming: false,
+            touch_focus: FocusDebounce::default(),
+            touch_was_live: false,
+            touch_toolbar: ToolbarState::default(),
+            touch_toolbar_rect: None,
+            touch_filter: OverlayTouchFilter::default(),
+            pending_local_events: Vec::new(),
+            injected_events: Vec::new(),
+            back_presses: 0,
+            connect_text_edits: Vec::new(),
+            connect_focus: None,
+            connect_scroll_pending: false,
+            touch_advanced_open: false,
+            background,
+            bg_resume: ResumeAfterBackground::default(),
+            #[cfg(not(target_os = "android"))]
+            mouse_touch: MouseTouchSynth::default(),
         }
+    }
+
+    /// The interaction model this app was built with (fixed for its life).
+    pub fn profile(&self) -> UiProfile {
+        self.profile
+    }
+
+    fn is_touch(&self) -> bool {
+        self.profile == UiProfile::Touch
+    }
+
+    /// The monitor choice connects and notices act on: the persisted picker
+    /// value where the picker is offered, otherwise `Primary` — a hidden
+    /// picker's stale value must not produce a "host too old" notice for a
+    /// `MonitorList` that can never arrive. Desktop: always the config value.
+    fn effective_monitor_choice(&self) -> MonitorChoice {
+        if self.monitor_picker_shown() {
+            self.config.monitor_choice
+        } else {
+            MonitorChoice::Primary
+        }
+    }
+
+    /// See [`monitor_picker_offered`].
+    fn monitor_picker_shown(&self) -> bool {
+        monitor_picker_offered(
+            self.profile,
+            self.supervisor
+                .as_ref()
+                .map(ConnectSupervisor::offers_multi_monitor),
+        )
     }
 
     /// Dump the live counters every couple of seconds. This is what makes a
@@ -420,6 +684,8 @@ impl ClientApp {
                 // lease ran out. `clear` also disarms until the host's next
                 // `Reset`, which closes the race against strips still in flight.
                 self.tiles.clear();
+                // Touch: release held fingers/keys while capture is still on.
+                self.touch_session_end();
                 // With background capture on, keep the hook installed across
                 // connection churn (connecting, WAN stalls, reconnects) so the
                 // capture path is live again the moment the session is. Nothing
@@ -514,7 +780,7 @@ impl ClientApp {
                 // republish and cry wolf on every multi-monitor session.
                 if first_config {
                     if let Some(note) =
-                        old_host_notice(self.monitors.is_some(), self.config.monitor_choice)
+                        old_host_notice(self.monitors.is_some(), self.effective_monitor_choice())
                     {
                         self.notice = Some(note);
                     }
@@ -540,8 +806,11 @@ impl ClientApp {
                 // list. Re-showing it on every re-send would nag about a fact
                 // the operator already acted on.
                 let first_list = self.monitors.is_none();
-                let plan =
-                    plan_monitor_list(self.stream1_intent, self.config.monitor_choice, &monitors);
+                let plan = plan_monitor_list(
+                    self.stream1_intent,
+                    self.effective_monitor_choice(),
+                    &monitors,
+                );
                 if first_list {
                     if let Some(note) = plan.notice {
                         self.notice = Some(note);
@@ -666,6 +935,7 @@ impl ClientApp {
                 self.state = ConnectionState::Failed(format!("Host disconnected: {reason}"));
                 self.route = None;
                 self.elevation = None;
+                self.touch_session_end();
                 // Background capture keeps the hook across a host `Bye` so a
                 // transient disconnect/reconnect doesn't silently kill capture
                 // for the rest of the session (observed: a mid-stream `Bye` tore
@@ -827,10 +1097,11 @@ impl ClientApp {
             // the operator's persisted choice, so this narrows the session to
             // one stream without changing *which* monitor the main window
             // shows.
+            let choice = self.effective_monitor_choice();
             let ids = self
                 .monitors
                 .as_ref()
-                .map(|m| monitors::resolve_selection(self.config.monitor_choice, m).ids)
+                .map(|m| monitors::resolve_selection(choice, m).ids)
                 .unwrap_or_else(|| vec![0]);
             self.send_select_monitors(ids.into_iter().take(1).collect());
         }
@@ -898,7 +1169,10 @@ impl ClientApp {
     /// background: the persisted opt-in, or `--hold-capture` forcing it on for
     /// the run.
     fn effective_background_capture(&self) -> bool {
-        self.config.capture_in_background || self.hold_capture
+        // Touch has no hook, so "keep capturing in the background" has
+        // nothing to keep: capture there simply follows the session.
+        self.profile == UiProfile::Desktop
+            && (self.config.capture_in_background || self.hold_capture)
     }
 
     /// Re-send `StartStream` on the live connection to apply the current
@@ -1316,6 +1590,7 @@ impl ClientApp {
     }
 
     fn connect_screen(&mut self, ui: &mut egui::Ui) {
+        let touch = self.is_touch();
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
             ui.heading("DirectDesk");
@@ -1328,58 +1603,51 @@ impl ClientApp {
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.label("Host");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.address_input)
+                    let r = ui.add(
+                        fit_text_edit(touch, egui::TextEdit::singleline(&mut self.address_input))
                             .hint_text("hostname or IP")
                             .desired_width(240.0),
                     );
+                    self.note_text_edit(&r);
                     ui.end_row();
 
                     ui.label("UDP port");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.udp_port_input).desired_width(90.0),
+                    let r = ui.add(
+                        fit_text_edit(touch, egui::TextEdit::singleline(&mut self.udp_port_input))
+                            .desired_width(90.0),
                     );
+                    self.note_text_edit(&r);
                     ui.end_row();
 
                     ui.label("Display name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.name_input)
+                    let r = ui.add(
+                        fit_text_edit(touch, egui::TextEdit::singleline(&mut self.name_input))
                             .hint_text("shown on the host")
                             .desired_width(240.0),
                     );
+                    self.note_text_edit(&r);
                     ui.end_row();
 
                     ui.label("Pairing code");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.code_input)
+                    let r = ui.add(
+                        fit_text_edit(touch, egui::TextEdit::singleline(&mut self.code_input))
                             .hint_text("8 digits — first time only")
                             .desired_width(240.0),
                     );
+                    self.note_text_edit(&r);
                     ui.end_row();
 
                     ui.label("Quality");
-                    let current = self.config.quality_mode;
-                    let mut chosen = current;
-                    egui::ComboBox::from_id_salt("quality")
-                        .selected_text(current.label())
-                        .show_ui(ui, |ui| {
-                            for mode in [
-                                QualityMode::TextDesktop,
-                                QualityMode::Balanced,
-                                QualityMode::Motion,
-                                QualityMode::LowBandwidth,
-                            ] {
-                                if ui.selectable_label(current == mode, mode.label()).clicked() {
-                                    chosen = mode;
-                                }
-                            }
-                        });
-                    if chosen != current {
-                        self.config.quality_mode = chosen;
-                        self.session.send_control(ControlMsg::QualityChange(chosen));
-                    }
+                    self.quality_combo(ui);
                     ui.end_row();
 
+                    // Hidden where connects never offer multi-monitor (the
+                    // touch preset): no `MonitorList` can arrive there, so any
+                    // choice but Primary could only end in a false "host too
+                    // old" notice.
+                    if !self.monitor_picker_shown() {
+                        return;
+                    }
                     ui.label("Monitors");
                     let current_choice = self.config.monitor_choice;
                     let mut chosen_choice = current_choice;
@@ -1423,9 +1691,11 @@ impl ClientApp {
             ui.add_space(6.0);
             ui.weak("Enter the code shown on the host's 'Pair new device' window.");
             ui.weak("Leave the code blank to reconnect to a host you have paired before.");
-            ui.weak(
-                "Monitors: applied if the host reports more than one — otherwise primary only.",
-            );
+            if self.monitor_picker_shown() {
+                ui.weak(
+                    "Monitors: applied if the host reports more than one — otherwise primary only.",
+                );
+            }
 
             ui.add_space(12.0);
             // The button names the action it will take, so pairing vs. reconnect
@@ -1460,6 +1730,30 @@ impl ClientApp {
         });
     }
 
+    /// The connect form's quality picker (both profiles).
+    fn quality_combo(&mut self, ui: &mut egui::Ui) {
+        let current = self.config.quality_mode;
+        let mut chosen = current;
+        egui::ComboBox::from_id_salt("quality")
+            .selected_text(current.label())
+            .show_ui(ui, |ui| {
+                for mode in [
+                    QualityMode::TextDesktop,
+                    QualityMode::Balanced,
+                    QualityMode::Motion,
+                    QualityMode::LowBandwidth,
+                ] {
+                    if ui.selectable_label(current == mode, mode.label()).clicked() {
+                        chosen = mode;
+                    }
+                }
+            });
+        if chosen != current {
+            self.config.quality_mode = chosen;
+            self.session.send_control(ControlMsg::QualityChange(chosen));
+        }
+    }
+
     /// Shown while the transport driver is racing routes and running the
     /// handshake: a spinner and the live lifecycle label, plus a way out.
     fn connecting_view(&mut self, ui: &mut egui::Ui) {
@@ -1469,6 +1763,10 @@ impl ClientApp {
             ui.add_space(16.0);
             ui.heading(self.state.label());
             ui.weak(format!("Host {}", self.config.host_address));
+            // Touch: the attempt is the automatic one after a resume.
+            if let Some(status) = self.bg_resume.status().filter(|_| self.is_touch()) {
+                ui.weak(status);
+            }
             ui.add_space(20.0);
             if ui.button("Cancel").clicked() {
                 self.disconnect();
@@ -1523,6 +1821,7 @@ impl ClientApp {
         self.udp_port_input = request.udp_port.to_string();
         self.config.save();
 
+        let picker_shown = self.monitor_picker_shown();
         let Some(supervisor) = self.supervisor.as_mut() else {
             self.form_error =
                 Some("no transport is available — cannot connect in this build".into());
@@ -1538,8 +1837,11 @@ impl ClientApp {
         // Seeded once at startup (`ClientApp::new`), but the picker can change
         // the choice afterwards without a reconnect happening in between — push
         // the current config value so this connect carries whatever is showing
-        // in the combo right now, not a stale one from launch.
-        supervisor.set_monitor_choice(self.config.monitor_choice);
+        // in the combo right now, not a stale one from launch. A hidden picker
+        // pushes nothing: its caps never offer multi-monitor anyway.
+        if picker_shown {
+            supervisor.set_monitor_choice(self.config.monitor_choice);
+        }
         supervisor.connect(request);
 
         // The route stays unknown until the transport reports one; the driver
@@ -1555,6 +1857,17 @@ impl ClientApp {
         if let Some(supervisor) = self.supervisor.as_mut() {
             supervisor.disconnect();
         }
+        self.reset_after_disconnect();
+    }
+
+    /// The UI half of [`disconnect`](Self::disconnect): everything but telling
+    /// the supervisor. The touch reconnect-after-background uses it alone, so
+    /// the `connect` that follows *aborts* whatever is left of the old driver
+    /// rather than detaching it.
+    fn reset_after_disconnect(&mut self) {
+        // Touch: lift fingers and keys before capture (and with it the
+        // ability to send their releases) goes.
+        self.touch_session_end();
         self.input.stop_capture();
         self.presenter.reset();
         self.slot.clear();
@@ -1643,6 +1956,627 @@ impl ClientApp {
         self.input.pump();
     }
 
+    // -----------------------------------------------------------------------
+    // Touch profile
+    // -----------------------------------------------------------------------
+
+    /// The touch streaming view: video (zoomed/panned by the gesture layer)
+    /// above, the on-screen keyboard (when toggled on) in a strip below.
+    fn touch_streaming_view(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let now = Instant::now();
+        self.set_keyboard_visible(self.osk_streaming);
+
+        let full = ui.available_rect_before_wrap();
+        let (video_area, keyboard_area) =
+            split_for_keyboard(full, self.keyboard.desired_height(ctx.content_rect()));
+        let (zoom, focus) = (self.touch.zoom(), self.touch.focus());
+        let (viewport, view) = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(video_area), |ui| {
+                self.presenter.draw_zoomed(ui, zoom, focus)
+            })
+            .inner;
+        self.chrome_points = ctx.content_rect().height() - viewport.height();
+
+        if let Some(area) = keyboard_area {
+            let out = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                    self.keyboard.show(ui, KeyboardTarget::Remote, now)
+                })
+                .inner;
+            self.deliver_keyboard(out);
+        }
+
+        let Some(view) = view else {
+            ui.painter_at(viewport).text(
+                viewport.center(),
+                egui::Align2::CENTER_CENTER,
+                "Waiting for the first frame…",
+                egui::FontId::proportional(16.0),
+                egui::Color32::GRAY,
+            );
+            self.touch.reset(self.input.pointer_mut());
+            self.input.pump();
+            return;
+        };
+
+        if self.touch_focus.is_focused() {
+            // Local keyboard events this app injected are not hardware keys.
+            let events = ctx.input(|i| without_injected(&i.events, &self.injected_events));
+            // Fingers that started on the toolbar (its rect is this frame's:
+            // it is drawn before this view) or on any other overlay layer —
+            // a window, the elevation banner — belong to egui, not the video.
+            let toolbar = self.touch_toolbar_rect;
+            let touches = self.touch_filter.filter(&events, |p| {
+                toolbar.is_some_and(|r| r.contains(p))
+                    || ctx
+                        .layer_id_at(p)
+                        .is_some_and(|l| l.order != egui::Order::Background)
+            });
+            self.touch
+                .frame(ui, &touches, viewport, &view, self.input.pointer_mut());
+            // Bluetooth / USB keyboards. Back was stripped in `raw_input_hook`.
+            self.input.forward_key_events(&events);
+            if self.input.is_capturing() {
+                ctx.memory_mut(|mem| {
+                    if let Some(id) = mem.focused() {
+                        mem.surrender_focus(id);
+                    }
+                });
+            }
+        } else {
+            // A real focus loss already released everything (`logic`); keep
+            // the cursor on screen meanwhile.
+            self.touch.paint_cursor(&ui.painter_at(viewport), &view);
+        }
+        self.input.pump();
+    }
+
+    /// The touch connect screen, laid out for a phone with the on-screen
+    /// keyboard (target Local) up whenever a field has focus: a compact form
+    /// in a scroll area that ends at the keyboard (the focused field is
+    /// scrolled into it), and a sticky action row between the two that keeps
+    /// Pair & Connect reachable.
+    fn touch_connect_screen(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let now = Instant::now();
+
+        let focused = ctx.memory(|m| m.focused());
+        let text_focus = focused.filter(|id| self.connect_text_edits.iter().any(|(t, _)| t == id));
+        if text_focus.is_some() && text_focus != self.connect_focus {
+            self.connect_scroll_pending = true;
+        }
+        self.connect_focus = text_focus;
+        self.set_keyboard_visible(text_focus.is_some());
+
+        let full = ui.available_rect_before_wrap();
+        let (form_area, keyboard_area) =
+            split_for_keyboard(full, self.keyboard.desired_height(ctx.content_rect()));
+        let (scroll_area, action_area) = split_action_row(form_area, ACTION_ROW_PTS);
+        self.connect_text_edits.clear();
+        let mut submit = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_area), |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| submit |= self.touch_connect_form(ui));
+        });
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(action_area)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| submit |= self.touch_connect_actions(ui),
+        );
+        if let Some(area) = keyboard_area {
+            let out = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                    self.keyboard.show(ui, KeyboardTarget::Local, now)
+                })
+                .inner;
+            self.deliver_keyboard(out);
+        }
+
+        // Focus is never surrendered by egui in Touch (see `new`), so a tap
+        // that is neither on the keyboard nor on a field drops it here — the
+        // keyboard goes with it on the next frame.
+        if let Some(id) = text_focus {
+            let click = ctx.input(|i| {
+                i.pointer
+                    .any_click()
+                    .then(|| i.pointer.interact_pos())
+                    .flatten()
+            });
+            let fields: Vec<egui::Rect> = self.connect_text_edits.iter().map(|(_, r)| *r).collect();
+            if click.is_some_and(|p| click_dismisses_text_focus(p, keyboard_area, &fields)) {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
+        }
+
+        if submit {
+            self.begin_connect();
+        }
+    }
+
+    /// The touch connect form (inside the scroll area): tight rows, the
+    /// pairing code right under the host, the UDP port behind "Advanced".
+    /// Returns true when Enter in the host or code field asked to connect.
+    fn touch_connect_form(&mut self, ui: &mut egui::Ui) -> bool {
+        const FIELD_W: f32 = 300.0;
+        let mut submit = false;
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.vertical_centered(|ui| {
+            ui.add_space(4.0);
+            ui.heading("DirectDesk");
+            ui.add_space(2.0);
+            egui::Grid::new("touch_connect_form")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Host");
+                    let r = ui.add(
+                        fit_text_edit(true, egui::TextEdit::singleline(&mut self.address_input))
+                            .hint_text("hostname or IP")
+                            .desired_width(FIELD_W),
+                    );
+                    submit |= self.touch_field(&r, connect_form::FormField::Host);
+                    ui.end_row();
+
+                    // Digits, spaces and dashes, as on desktop: the code is
+                    // normalised by `connect_form` at connect time.
+                    ui.label("Pairing code");
+                    let r = ui.add(
+                        fit_text_edit(true, egui::TextEdit::singleline(&mut self.code_input))
+                            .hint_text("8 digits — first time only")
+                            .desired_width(FIELD_W),
+                    );
+                    submit |= self.touch_field(&r, connect_form::FormField::PairingCode);
+                    ui.end_row();
+
+                    ui.label("Display name");
+                    let r = ui.add(
+                        fit_text_edit(true, egui::TextEdit::singleline(&mut self.name_input))
+                            .hint_text("shown on the host")
+                            .desired_width(FIELD_W),
+                    );
+                    submit |= self.touch_field(&r, connect_form::FormField::DisplayName);
+                    ui.end_row();
+
+                    ui.label("Quality");
+                    self.quality_combo(ui);
+                    ui.end_row();
+
+                    ui.toggle_value(&mut self.touch_advanced_open, "Advanced");
+                    ui.end_row();
+                    if self.touch_advanced_open {
+                        ui.label("UDP port");
+                        let r = ui.add(
+                            fit_text_edit(
+                                true,
+                                egui::TextEdit::singleline(&mut self.udp_port_input),
+                            )
+                            .desired_width(90.0),
+                        );
+                        submit |= self.touch_field(&r, connect_form::FormField::UdpPort);
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(2.0);
+            ui.weak("Pairing code: from the host's 'Pair new device' window. Blank = reconnect.");
+            if self.supervisor.is_none() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 170, 60),
+                    "No transport in this build (secret store unavailable) — Connect is disabled.",
+                );
+            }
+            ui.add_space(4.0);
+        });
+        submit
+    }
+
+    /// One touch form field's bookkeeping; true when Enter in it submits.
+    fn touch_field(&mut self, r: &egui::Response, field: connect_form::FormField) -> bool {
+        self.note_text_edit(r);
+        // A singleline `TextEdit` gives up focus on Enter (hardware or
+        // on-screen keyboard), which is how egui reports "done".
+        connect_form::enter_submits(field)
+            && r.lost_focus()
+            && r.ctx.input(|i| i.key_pressed(egui::Key::Enter))
+    }
+
+    /// The sticky action row (right-to-left): Pair & Connect, then the form
+    /// error in whatever room is left. Returns true when the button was hit.
+    fn touch_connect_actions(&mut self, ui: &mut egui::Ui) -> bool {
+        let rect = ui.max_rect();
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+        ui.add_space(12.0);
+        let label = if connect_form::is_pairing_mode(&self.code_input) {
+            "Pair & Connect"
+        } else {
+            "Connect"
+        };
+        let can_connect = !self.address_input.trim().is_empty();
+        let clicked = ui
+            .add_enabled(
+                can_connect,
+                egui::Button::new(egui::RichText::new(label).strong())
+                    .min_size(egui::vec2(TOUCH_TARGET_PTS * 4.0, TOUCH_TARGET_PTS)),
+            )
+            .clicked();
+        ui.add_space(8.0);
+        if let Some(err) = &self.form_error {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(err.as_str()).color(egui::Color32::from_rgb(220, 90, 90)),
+                )
+                .truncate(),
+            );
+        }
+        clicked
+    }
+
+    /// Touch, back from the background while the watchdog is still winding
+    /// the old session down: the reconnect follows on its own.
+    fn touch_resuming_view(&mut self, ui: &mut egui::Ui, status: &str) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(80.0);
+            ui.add(egui::Spinner::new().size(36.0));
+            ui.add_space(12.0);
+            ui.heading(status);
+            ui.weak(format!("Host {}", self.config.host_address));
+            ui.add_space(16.0);
+            if ui
+                .add(
+                    egui::Button::new("Cancel")
+                        .min_size(egui::vec2(TOUCH_TARGET_PTS * 2.5, TOUCH_TARGET_PTS)),
+                )
+                .clicked()
+            {
+                self.bg_resume.cancel();
+            }
+        });
+    }
+
+    /// Touch, once per frame (in `logic`, after the drain): stamp the
+    /// heartbeat, act on the watchdog's report, and keep frames coming
+    /// while a driver runs so a stale heartbeat really means "no window".
+    fn touch_background(&mut self, ctx: &egui::Context, now: Instant) {
+        let Some(bg) = &self.background else {
+            return;
+        };
+        bg.shared.beat(now);
+        let report = bg.shared.take_report();
+        let driver_running = bg.driver.is_running();
+        let connecting = matches!(
+            self.state,
+            ConnectionState::Connecting | ConnectionState::Authenticating
+        );
+        if self.bg_resume.on_frame(report, connecting) == ResumeAction::Reconnect {
+            tracing::info!(
+                host = %self.address_input.trim(),
+                "touch: back from the background after the watchdog ended the session \
+                 — reconnecting once with the saved pairing"
+            );
+            // The supervisor still holds the stopped driver: `begin_connect`
+            // aborts what is left of it. A code is single-use and was
+            // consumed by the original connect; reconnect authenticates.
+            self.reset_after_disconnect();
+            self.code_input.clear();
+            self.begin_connect();
+            if self.state != ConnectionState::Connecting {
+                // Could not even start (no transport, form invalid): the
+                // form shows why.
+                self.bg_resume.cancel();
+            }
+        }
+        if self.bg_resume.status().is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if driver_running {
+            ctx.request_repaint_after(HEARTBEAT_REPAINT);
+        }
+    }
+
+    /// Connect-screen bookkeeping for one text field (Touch only): remember it
+    /// for the keyboard/dismiss logic and scroll it into view once the
+    /// keyboard has taken the bottom of the screen.
+    fn note_text_edit(&mut self, r: &egui::Response) {
+        if !self.is_touch() {
+            return;
+        }
+        self.connect_text_edits.push((r.id, r.rect));
+        if self.connect_scroll_pending && r.has_focus() {
+            self.connect_scroll_pending = false;
+            r.scroll_to_me(Some(egui::Align::Center));
+        }
+    }
+
+    /// Show or hide the on-screen keyboard; hiding releases whatever it held.
+    fn set_keyboard_visible(&mut self, visible: bool) {
+        if self.keyboard.is_visible() == visible {
+            return;
+        }
+        let out = self.keyboard.set_visible(visible);
+        self.deliver_keyboard(out);
+        if visible && self.state.is_live() {
+            // The video viewport is about to shrink under any finger that is
+            // down: end the gesture cleanly rather than mid-drag.
+            self.touch.reset(self.input.pointer_mut());
+        }
+    }
+
+    /// Strokes go to the host (dropped by `send_key` unless capture is on);
+    /// local events wait for the next frame's `raw_input_hook`.
+    fn deliver_keyboard(&mut self, out: KeyboardOutput) {
+        for s in out.strokes {
+            self.input.send_key(s.scan_code, s.extended, s.down);
+        }
+        self.pending_local_events.extend(out.events);
+    }
+
+    /// Lift everything the touch path holds on the host: on-screen keys and
+    /// modifiers, and any gesture button. Call while capture is still on.
+    fn touch_release_input(&mut self) {
+        if !self.is_touch() {
+            return;
+        }
+        let out = self.keyboard.release_all_output();
+        self.deliver_keyboard(out);
+        self.touch.reset(self.input.pointer_mut());
+        self.touch_filter.clear();
+    }
+
+    /// Touch-side teardown at every session-end site (`drain_session`'s
+    /// non-live branch, `Bye`, `disconnect`), before capture stops.
+    fn touch_session_end(&mut self) {
+        if !self.is_touch() {
+            return;
+        }
+        self.osk_streaming = false;
+        self.set_keyboard_visible(false);
+        self.touch_release_input();
+        self.touch.reset_view();
+        self.touch_toolbar.hide();
+        // No capture toggle on a phone: a chord release (hardware keyboard)
+        // lasts for the session it was made in, not forever.
+        self.user_released = false;
+    }
+
+    /// Touch per-frame state, in `logic`: focus edge, Back, capture policy,
+    /// toolbar on go-live, key repeat. `focused` is the debounced focus.
+    fn touch_logic(&mut self, ctx: &egui::Context, focused: bool) {
+        let now = Instant::now();
+        // First: a resume after a background disconnect may start a connect.
+        self.touch_background(ctx, now);
+        let streaming = self.state == ConnectionState::Connected;
+
+        for _ in 0..std::mem::take(&mut self.back_presses) {
+            match back_action(streaming, self.keyboard.is_visible()) {
+                BackAction::ToggleKeyboard => self.osk_streaming = !self.osk_streaming,
+                BackAction::DismissLocalKeyboard => ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                }),
+                BackAction::Nothing => {}
+            }
+        }
+
+        // Capture follows the session: there is no toggle on a phone. Started
+        // here, in `logic`, so it is on before `ui` can produce a single key
+        // for a live session; and nothing reaches the host before it is (both
+        // `send_key` and `forward_key_events` gate on it).
+        let want = touch_wants_capture(self.state.is_live(), focused, self.user_released);
+        if want && !self.input.is_capturing() {
+            tracing::info!("touch: session live and focused — capture on");
+            self.input.start_capture();
+        } else if !want && self.input.is_capturing() {
+            tracing::info!(live = self.state.is_live(), focused, "touch: capture off");
+            self.touch_release_input();
+            self.input.stop_capture();
+        }
+        // Capture can also drop behind this policy's back (the release chord
+        // from a hardware keyboard). Strokes go nowhere meanwhile, so the
+        // on-screen keyboard must not go on believing it holds a key or a
+        // locked modifier down on the host.
+        if streaming && !self.input.is_capturing() {
+            let _ = self.keyboard.release_all_output();
+        }
+
+        // Show the toolbar for a few seconds when a session starts, so the
+        // handle's purpose is discoverable.
+        let live = self.state.is_live();
+        if live && !self.touch_was_live {
+            self.touch_toolbar.show(now);
+        }
+        self.touch_was_live = live;
+
+        // Key repeat on frames where the keyboard is not drawn.
+        let out = self.keyboard.tick(now);
+        self.deliver_keyboard(out);
+        if self.keyboard.is_holding() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if !self.pending_local_events.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// The compact overlay toolbar (Touch): a small handle at the top centre
+    /// that expands into a row of finger-sized buttons and auto-hides. Drawn
+    /// *before* the streaming view so its rect is current when that view
+    /// decides which fingers belong to the video.
+    fn touch_toolbar(&mut self, ctx: &egui::Context) {
+        self.touch_toolbar_rect = None;
+        if self.state != ConnectionState::Connected {
+            return;
+        }
+        let now = Instant::now();
+        let expanded = self.touch_toolbar.is_expanded(now);
+        let shown = egui::Area::new(egui::Id::new("touch_toolbar"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 2.0))
+            .show(ctx, |ui| {
+                if expanded {
+                    self.touch_toolbar_expanded(ui, now);
+                } else {
+                    self.touch_toolbar_handle(ui, now);
+                }
+            });
+        let rect = shown.response.rect;
+        self.touch_toolbar_rect = Some(rect);
+        // A finger resting on (or sliding over) the expanded bar is an
+        // interaction even when it never completes a click on a button.
+        if expanded {
+            let on_bar = ctx.input(|i| {
+                i.pointer.any_down() && i.pointer.interact_pos().is_some_and(|p| rect.contains(p))
+            });
+            if on_bar {
+                self.touch_toolbar.show(now);
+            }
+        }
+        // The handle tap (or a button press) changed the state *after* this
+        // frame decided what to draw: paint again now, not at the deadline.
+        if self.touch_toolbar.is_expanded(now) != expanded {
+            ctx.request_repaint();
+        }
+        if let Some(left) = self.touch_toolbar.remaining(now) {
+            // Wake exactly when the deadline passes so an idle screen hides it.
+            ctx.request_repaint_after(left + Duration::from_millis(5));
+        }
+    }
+
+    fn touch_toolbar_handle(&mut self, ui: &mut egui::Ui, now: Instant) {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(72.0, TOUCH_TARGET_PTS), egui::Sense::click());
+        let pill = egui::Rect::from_center_size(rect.center(), egui::vec2(56.0, 20.0));
+        let painter = ui.painter();
+        let alpha = if resp.hovered() { 200 } else { 140 };
+        painter.rect_filled(pill, 10.0, egui::Color32::from_black_alpha(alpha));
+        for dx in [-12.0, 0.0, 12.0] {
+            painter.circle_filled(
+                pill.center() + egui::vec2(dx, 0.0),
+                2.5,
+                egui::Color32::from_white_alpha(220),
+            );
+        }
+        if resp.clicked() {
+            self.touch_toolbar.show(now);
+        }
+    }
+
+    fn touch_toolbar_expanded(&mut self, ui: &mut egui::Ui, now: Instant) {
+        let button = |label: &str, selected: bool| {
+            egui::Button::new(label)
+                .selected(selected)
+                .min_size(egui::vec2(TOUCH_TARGET_PTS * 1.5, TOUCH_TARGET_PTS))
+        };
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 28, 235))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (color, text) = match &self.state {
+                        ConnectionState::Connected => {
+                            (egui::Color32::from_rgb(90, 200, 120), "Connected")
+                        }
+                        _ => (egui::Color32::GRAY, self.state.label()),
+                    };
+                    ui.colored_label(color, egui::RichText::new(text).strong());
+                    ui.colored_label(
+                        diagnostics::route_color(self.route),
+                        diagnostics::route_text(self.route),
+                    );
+                    ui.separator();
+
+                    let mut touched = false;
+                    if ui.add(button("Keyboard", self.osk_streaming)).clicked() {
+                        self.osk_streaming = !self.osk_streaming;
+                        touched = true;
+                    }
+                    if self.touch.zoom() > 1.0 && ui.add(button("Zoom 1x", false)).clicked() {
+                        self.touch.reset_view();
+                        touched = true;
+                    }
+                    if ui
+                        .add(button("Diagnostics", self.show_diagnostics))
+                        .clicked()
+                    {
+                        self.show_diagnostics = !self.show_diagnostics;
+                        touched = true;
+                    }
+                    if self.mode == SourceMode::LoopbackDemo {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 170, 60),
+                            egui::RichText::new("DEMO").strong(),
+                        );
+                    } else if ui.add(button("Disconnect", false)).clicked() {
+                        self.disconnect();
+                        return;
+                    }
+                    if ui.add(button("Hide", false)).clicked() {
+                        self.touch_toolbar.hide();
+                    } else if touched {
+                        self.touch_toolbar.show(now);
+                    }
+                });
+                if let Some(err) = self.input.last_error() {
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+                } else if let Some(note) = &self.notice {
+                    ui.weak(note);
+                }
+            });
+    }
+
+    /// `App::ui` for the touch profile. No top panel: the toolbar is an
+    /// overlay, drawn first (see `touch_toolbar`).
+    fn touch_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.touch_toolbar(&ctx);
+
+        egui::CentralPanel::no_frame()
+            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+            .show(ui, |ui| match self.state.clone() {
+                ConnectionState::Connected => self.touch_streaming_view(ui),
+                ConnectionState::Connecting | ConnectionState::Authenticating => {
+                    self.set_keyboard_visible(false);
+                    self.connecting_view(ui)
+                }
+                ConnectionState::Failed(reason) => {
+                    self.set_keyboard_visible(false);
+                    self.failed_view(ui, reason)
+                }
+                ConnectionState::Disconnected => match self.bg_resume.status() {
+                    // Back from the background, old session still closing:
+                    // no form to type into until the reconnect starts.
+                    Some(status) => {
+                        self.set_keyboard_visible(false);
+                        self.touch_resuming_view(ui, status)
+                    }
+                    None => self.touch_connect_screen(ui),
+                },
+            });
+
+        // Same lifetime rule as the desktop path (see `ui`).
+        if self.second_window_visible() {
+            let title = self.second_window_title();
+            second_window::show(&ctx, &self.stream1, &title);
+        }
+
+        self.diagnostics_window(&ctx);
+        self.elevation_banner(&ctx);
+
+        // NativeActivity cannot do IME, and the system soft keyboard must
+        // never appear: the egui keyboard is the only text input. A focused
+        // `TextEdit` asks for IME every frame, so the request is withdrawn
+        // every frame, after everything that could have made it.
+        ctx.output_mut(|o| o.ime = None);
+    }
+
     /// Draws the "host wants elevation" banner as a floating, non-modal
     /// overlay above the session view. It never blocks input to the stream
     /// underneath — it's a strip anchored to the top of the window, not a
@@ -1729,7 +2663,14 @@ impl ClientApp {
                 frames_gated: self.stream1_status.frames_gated(),
             });
 
-        diagnostics::show(
+        // Touch: a phone-sized, scrolling variant, and no tiles window (the
+        // touch preset never offers lossless tiles, and two windows do not
+        // fit on a phone).
+        let show = match self.profile {
+            UiProfile::Desktop => diagnostics::show,
+            UiProfile::Touch => diagnostics::show_touch,
+        };
+        show(
             ctx,
             &mut open,
             diagnostics::DiagnosticsInput {
@@ -1753,7 +2694,9 @@ impl ClientApp {
             },
         );
         self.show_diagnostics = open;
-        self.tiles_window(ctx);
+        if self.profile == UiProfile::Desktop {
+            self.tiles_window(ctx);
+        }
     }
 
     /// Lossless-refinement counters, shown alongside the diagnostics window and
@@ -1879,12 +2822,30 @@ impl eframe::App for ClientApp {
         let main_focused = ctx.input(|i| i.focused);
         let any_focused = main_focused || self.second_window_focused(ctx);
 
+        // Touch: the focus every touch decision uses, debounced so Android's
+        // one-frame dropout on resume neither resets a gesture nor drops
+        // capture. A real loss (two frames) releases everything here, once.
+        let touch = self.is_touch();
+        let touch_focused = touch && {
+            let edge = self.touch_focus.update(main_focused);
+            if edge == FocusEdge::Lost {
+                tracing::info!("touch: window focus lost — releasing touch input");
+                self.touch_release_input();
+            }
+            if !main_focused && self.touch_focus.is_focused() {
+                // Settle a possible flicker promptly either way.
+                ctx.request_repaint();
+            }
+            self.touch_focus.is_focused()
+        };
+
         // Wait for focus: the window is not focused on the first frame, and
         // `enforce_capture_invariants` would (correctly) drop capture again.
         // `--hold-capture` installs without waiting for focus (the whole point
         // is to survive not having it); plain `--capture-on-start` still waits
-        // for the first focused frame.
-        if self.capture_on_start && (self.hold_capture || ctx.input(|i| i.focused)) {
+        // for the first focused frame. Desktop only: these are hook test aids,
+        // and Touch capture follows the session (`touch_logic`).
+        if !touch && self.capture_on_start && (self.hold_capture || ctx.input(|i| i.focused)) {
             self.capture_on_start = false;
             tracing::warn!(
                 hold_capture = self.hold_capture,
@@ -1898,7 +2859,7 @@ impl eframe::App for ClientApp {
         // or a failed install all latch it, and before that latch existed this
         // block re-installed the hook on the very next frame, which is exactly
         // why "Ctrl+Alt+Shift+F12 does nothing" was reported from the field.
-        if !self.user_released && !self.capture_on_start {
+        if !touch && !self.user_released && !self.capture_on_start {
             if self.effective_background_capture() {
                 // Capture is meant to survive focus changes here, so the only
                 // job is a backstop: if it fell off (a teardown we missed, or
@@ -1938,8 +2899,10 @@ impl eframe::App for ClientApp {
         // This window's own focus, which is a different question from the one
         // below: it is what releases the modifiers *this* window synthesized
         // when it hands focus over — including to the other DirectDesk window,
-        // where the process-wide answer never changes at all.
-        self.input.set_window_focused(main_focused);
+        // where the process-wide answer never changes at all. (Touch: the
+        // debounced answer, so a flicker does not release them.)
+        self.input
+            .set_window_focused(if touch { touch_focused } else { main_focused });
         // Route capture by focus: when we're foreground the egui key path owns
         // it and the low-level hook passes through; when not, the hook forwards.
         //
@@ -1963,7 +2926,11 @@ impl eframe::App for ClientApp {
                 self.elevation = None;
             }
         }
-        self.enforce_capture_invariants(ctx, any_focused);
+        if touch {
+            self.touch_logic(ctx, touch_focused);
+        } else {
+            self.enforce_capture_invariants(ctx, any_focused);
+        }
         self.presenter.update(ctx, &self.slot);
         self.service_second_window(ctx);
         self.log_metrics(ctx);
@@ -1980,12 +2947,33 @@ impl eframe::App for ClientApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) {
+            self.touch_release_input();
             self.input.stop_capture();
             self.persist();
         }
     }
 
+    /// Touch only, main window only: strip Back (the app's own key, never the
+    /// host's), synthesize a finger from the mouse (Windows test aid), and
+    /// inject the on-screen keyboard's local events queued last frame.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if !self.is_touch() || raw_input.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
+        self.back_presses += strip_back_key(&mut raw_input.events);
+        #[cfg(not(target_os = "android"))]
+        self.mouse_touch.process(&mut raw_input.events);
+        self.injected_events = std::mem::take(&mut self.pending_local_events);
+        raw_input
+            .events
+            .extend(self.injected_events.iter().cloned());
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.is_touch() {
+            self.touch_ui(ui);
+            return;
+        }
         let ctx = ui.ctx().clone();
 
         // In fullscreen the toolbar would steal rows from the video and force
@@ -2039,6 +3027,33 @@ impl Drop for ClientApp {
         self.pipeline.shutdown();
         self.persist();
     }
+}
+
+/// Touch: a finger-height field (egui 0.35 ignores `TextEdit::min_size().y`,
+/// so the height comes from the margin: one ~16 pt row + 2 x 10 pt).
+/// Desktop: unchanged.
+fn fit_text_edit(touch: bool, edit: egui::TextEdit<'_>) -> egui::TextEdit<'_> {
+    if touch {
+        edit.margin(egui::Margin::symmetric(6, 10))
+    } else {
+        edit
+    }
+}
+
+/// The fps a persisted config should impose on the supervisor's caps at
+/// startup: an explicit choice, never "Auto" (0), which defers to the
+/// platform preset instead (`StreamCaps::touch_device` caps Android at 30).
+pub fn persisted_fps_override(config_fps: u32) -> Option<u32> {
+    (config_fps != 0).then_some(config_fps)
+}
+
+/// Does the connect screen offer the monitor picker? Only in the desktop
+/// profile, and only where connects offer `MULTI_MONITOR` at all
+/// (`caps_multi_monitor` is the supervisor's caps; `None` = no supervisor,
+/// where the desktop has always shown it). Where it is hidden, every connect
+/// and notice acts on `Primary` (`ClientApp::effective_monitor_choice`).
+pub fn monitor_picker_offered(profile: UiProfile, caps_multi_monitor: Option<bool>) -> bool {
+    profile == UiProfile::Desktop && caps_multi_monitor.unwrap_or(true)
 }
 
 /// The one wording for "we gave the keyboard back", used by every release path
@@ -2346,6 +3361,37 @@ mod tests {
         ] {
             assert!(!mode.label().is_empty());
         }
+    }
+
+    #[test]
+    fn auto_fps_in_a_fresh_config_keeps_the_platform_preset() {
+        use crate::connect::StreamCaps;
+        let seeded = |preset: StreamCaps, config_fps: u32| {
+            persisted_fps_override(config_fps).unwrap_or(preset.preferred_fps)
+        };
+        // Android: a fresh config (0 = Auto) must not lift the 30 fps cap.
+        assert_eq!(seeded(StreamCaps::touch_device(), 0), 30);
+        // An explicit choice still wins on either platform.
+        assert_eq!(seeded(StreamCaps::touch_device(), 15), 15);
+        assert_eq!(seeded(StreamCaps::default(), 45), 45);
+        // Desktop with Auto: host decides, exactly as before.
+        assert_eq!(seeded(StreamCaps::default(), 0), 0);
+    }
+
+    #[test]
+    fn the_monitor_picker_is_desktop_only_and_needs_multi_monitor_caps() {
+        // Desktop: exactly as before (default caps offer it; no supervisor
+        // still shows it).
+        assert!(monitor_picker_offered(UiProfile::Desktop, Some(true)));
+        assert!(monitor_picker_offered(UiProfile::Desktop, None));
+        assert!(!monitor_picker_offered(UiProfile::Desktop, Some(false)));
+        // Touch never shows it, whatever the caps.
+        assert!(!monitor_picker_offered(UiProfile::Touch, Some(true)));
+        assert!(!monitor_picker_offered(UiProfile::Touch, Some(false)));
+        assert!(!monitor_picker_offered(UiProfile::Touch, None));
+        // And with it hidden the effective choice is Primary, which can
+        // never raise the "host too old" notice.
+        assert_eq!(old_host_notice(false, MonitorChoice::Primary), None);
     }
 
     #[test]

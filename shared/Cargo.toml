@@ -104,7 +104,10 @@ crossbeam-channel = { workspace = true }
 # the tree transitively via quinn-udp 0.5, so this pins no new version.
 socket2 = "0.6"
 
-[dependencies.windows]
+# Windows-only: every Win32 call in this crate is already behind `cfg(windows)`
+# (crypto::storage's DPAPI module, winutil). Declaring the dependency for every
+# target made `shared` uncompilable for Android, which the Android client needs.
+[target.'cfg(windows)'.dependencies.windows]
 workspace = true
 features = [
     "Win32_Foundation",

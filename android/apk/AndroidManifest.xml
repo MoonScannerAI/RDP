@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DirectDesk for Android. Packaged without Gradle by tools/build-android.ps1
+  (aapt2 link -> add lib/<abi>/libdirectdesk_android.so -> zipalign -> apksigner).
+
+  hasCode="false": there is no Java/Kotlin; android.app.NativeActivity loads
+  libdirectdesk_android.so (meta-data lib_name) and android-activity calls our
+  `android_main`.
+
+  configChanges lists every flag an app can declare (as of compileSdk 34), so
+  Android never destroys and re-creates the Activity for a configuration
+  change it lets apps handle: winit 0.30 neither survives an onDestroy nor
+  rebuilds its event loop in the same process. The rest (undeclarable
+  changes, finishes we did not start) is the destroy watchdog's job; see
+  app_main.rs.
+
+  stateNotNeeded="true": nothing is restored from saved state, and it is what
+  makes ActivityManager restart the Activity (instead of dropping it) when
+  the watchdog ends the process mid-relaunch, which has no saved state yet.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.directdesk.client"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <!-- targetSdk 34 is fine for sideloading; Google Play now requires 35. -->
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="DirectDesk"
+        android:hasCode="false"
+        android:extractNativeLibs="true"
+        android:allowBackup="false">
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="DirectDesk"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:windowSoftInputMode="stateAlwaysHidden"
+            android:stateNotNeeded="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|locale|layoutDirection|fontScale|fontWeightAdjustment|colorMode|mcc|mnc|touchscreen|grammaticalGender">
+
+            <meta-data android:name="android.app.lib_name" android:value="directdesk_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -87,7 +87,7 @@ Philippines-client → Ohio-host deployment:
 5. **Wrong host address or stale DDNS.** If using a dynamic DNS hostname,
    confirm it currently resolves to the host's actual current public IP.
 6. **Pairing code expired or already used.** Codes are single-use and
-   120-second-lived by design — generate a fresh one on the host if the
+   5-minute-lived by design — generate a fresh one on the host if the
    client is retrying with an old one.
 7. **Route stuck on "Relayed" or a route report you don't expect.** There
    is no relay server in this MVP — if you ever see a "Relayed" label,

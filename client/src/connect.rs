@@ -46,7 +46,7 @@ use directdesk_shared::protocol::InputMsg;
 
 /// Stream capabilities advertised on every connect. Fixed for now; the host
 /// clamps to what it can actually encode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamCaps {
     pub max_width: u32,
     pub max_height: u32,
@@ -78,6 +78,15 @@ pub struct StreamCaps {
     /// Seeded from [`crate::config::ClientConfig::monitor_choice`] and
     /// updated live by [`ConnectSupervisor::set_monitor_choice`].
     pub monitor_choice: MonitorChoice,
+    /// Offer `features::MULTI_MONITOR` in the `Hello` at all.
+    ///
+    /// Default **true**: today's desktop client offers the bit unconditionally
+    /// (see `ConnectParams::hello_features` for why that is deliberate). A
+    /// client that can only ever show one window — a phone — clears it, so the
+    /// host never sends a `MonitorList`, the handshake skips the selection
+    /// exchange, and no second stream can ever be armed, whatever
+    /// [`monitor_choice`](Self::monitor_choice) says.
+    pub multi_monitor: bool,
 }
 
 impl Default for StreamCaps {
@@ -94,6 +103,22 @@ impl Default for StreamCaps {
             lossless_tiles: true,
             system_audio: true,
             monitor_choice: MonitorChoice::default(),
+            multi_monitor: true,
+        }
+    }
+}
+
+impl StreamCaps {
+    /// The preset for a touch device (Android): one window, no audio
+    /// playback path, no lossless tiles, and a 30 fps ceiling to spare the
+    /// battery and the hardware decoder. Everything else as [`Default`].
+    pub fn touch_device() -> Self {
+        Self {
+            system_audio: false,
+            lossless_tiles: false,
+            multi_monitor: false,
+            preferred_fps: 30,
+            ..Self::default()
         }
     }
 }
@@ -124,6 +149,7 @@ impl ConnectRequest {
             lossless_tiles: caps.lossless_tiles,
             system_audio: caps.system_audio,
             monitor_choice: caps.monitor_choice,
+            multi_monitor: caps.multi_monitor,
         }
     }
 }
@@ -132,6 +158,57 @@ impl ConnectRequest {
 struct Active {
     shutdown: watch::Sender<bool>,
     join: JoinHandle<()>,
+}
+
+/// A cloneable, thread-safe way to stop the connection the supervisor has
+/// installed, for a thread that cannot borrow the supervisor: the touch
+/// profile's background watchdog, which runs exactly when the UI thread does
+/// not (Android has dropped the window, so no `disconnect` can happen there).
+///
+/// [`shut_down`](Self::shut_down) raises the same per-connection shutdown
+/// watch [`ConnectSupervisor::disconnect`] raises, so the driver closes
+/// gracefully (`Bye` to the host) and does not reconnect. It leaves the
+/// supervisor's own bookkeeping to the UI thread: the next
+/// [`ConnectSupervisor::connect`] or `disconnect` replaces it as usual.
+#[derive(Clone, Default)]
+pub struct DisconnectHandle {
+    installed: Arc<parking_lot::Mutex<Option<watch::Sender<bool>>>>,
+}
+
+impl DisconnectHandle {
+    /// A driver is installed, has not returned, and nobody has asked it to
+    /// stop. `run_client` holds the only receiver, so a closed watch means
+    /// it has exited.
+    pub fn is_running(&self) -> bool {
+        self.installed
+            .lock()
+            .as_ref()
+            .is_some_and(|tx| !tx.is_closed() && !*tx.borrow())
+    }
+
+    /// Ask the installed driver to stop. `None` when nothing was running.
+    pub fn shut_down(&self) -> Option<StoppingDriver> {
+        let installed = self.installed.lock();
+        let tx = installed
+            .as_ref()
+            .filter(|tx| !tx.is_closed() && !*tx.borrow())?;
+        tx.send_replace(true);
+        Some(StoppingDriver(tx.clone()))
+    }
+
+    fn install(&self, shutdown: Option<watch::Sender<bool>>) {
+        *self.installed.lock() = shutdown;
+    }
+}
+
+/// A driver [`DisconnectHandle::shut_down`] stopped, to wait out its graceful
+/// close independently of whatever the supervisor installs next.
+pub struct StoppingDriver(watch::Sender<bool>);
+
+impl StoppingDriver {
+    pub fn has_exited(&self) -> bool {
+        self.0.is_closed()
+    }
 }
 
 /// Drives `net::run_client` on a shared runtime in response to UI intent.
@@ -161,6 +238,8 @@ pub struct ConnectSupervisor {
     control_target: watch::Sender<Option<mpsc::Sender<ControlMsg>>>,
 
     current: Option<Active>,
+    /// Mirrors `current`'s shutdown switch for other threads.
+    handle: DisconnectHandle,
 }
 
 impl ConnectSupervisor {
@@ -207,6 +286,7 @@ impl ConnectSupervisor {
             input_target,
             control_target,
             current: None,
+            handle: DisconnectHandle::default(),
         }
     }
 
@@ -216,12 +296,25 @@ impl ConnectSupervisor {
         self.current.is_some()
     }
 
+    /// A handle that can stop whichever connection is installed, from any
+    /// thread. See [`DisconnectHandle`].
+    pub fn disconnect_handle(&self) -> DisconnectHandle {
+        self.handle.clone()
+    }
+
     /// Update the fps the *next* `connect()` carries (a fresh connect, or a
     /// reconnect after a drop). Does not touch a currently-live connection —
     /// applying a choice live is the UI's job, by re-sending `StartStream`
     /// directly on the session's control channel.
     pub fn set_preferred_fps(&mut self, fps: u32) {
         self.caps.preferred_fps = fps;
+    }
+
+    /// Whether connects offer `MULTI_MONITOR` at all. When they do not (the
+    /// touch preset), no `MonitorList` can ever arrive, so the UI hides the
+    /// monitor picker rather than offer a choice that can only degrade.
+    pub fn offers_multi_monitor(&self) -> bool {
+        self.caps.multi_monitor
     }
 
     /// Update the monitor choice the *next* `connect()` carries, for the same
@@ -278,6 +371,7 @@ impl ConnectSupervisor {
         let params = request.into_params(self.caps);
         let store = self.store.clone();
         let (shutdown, shutdown_rx) = watch::channel(false);
+        self.handle.install(Some(shutdown.clone()));
         let join = self
             .rt
             .spawn(net::run_client(endpoints, params, store, shutdown_rx));
@@ -291,6 +385,7 @@ impl ConnectSupervisor {
     /// [`ConnectionState::Disconnected`] on the (supervisor-owned) state channel
     /// so the UI leaves the streaming view immediately.
     pub fn disconnect(&mut self) {
+        self.handle.install(None);
         if let Some(active) = self.current.take() {
             let _ = active.shutdown.send(true);
             let _ = self.input_target.send(None);
@@ -306,6 +401,7 @@ impl ConnectSupervisor {
     /// Hard-cancel any in-flight attempt without emitting UI state. Used on
     /// reconnect (a new attempt is about to install fresh state) and on drop.
     fn cancel_current(&mut self) {
+        self.handle.install(None);
         if let Some(active) = self.current.take() {
             let _ = active.shutdown.send(true);
             active.join.abort();
@@ -384,6 +480,66 @@ mod tests {
         assert!(!request().into_params(quiet).system_audio);
     }
 
+    /// The desktop default is pinned field by field, so adding `multi_monitor`
+    /// (or anything after it) cannot silently change what a Windows client
+    /// asks for; and its `Hello` offer is exactly today's three bits.
+    #[test]
+    fn the_default_caps_and_their_hello_offer_are_unchanged() {
+        use directdesk_shared::protocol::features;
+
+        assert_eq!(
+            StreamCaps::default(),
+            StreamCaps {
+                max_width: 3840,
+                max_height: 2160,
+                preferred_fps: 0,
+                lossless_tiles: true,
+                system_audio: true,
+                monitor_choice: MonitorChoice::Primary,
+                multi_monitor: true,
+            }
+        );
+        assert_eq!(
+            request()
+                .into_params(StreamCaps::default())
+                .hello_features(false),
+            features::LOSSLESS_TILES | features::SYSTEM_AUDIO | features::MULTI_MONITOR
+        );
+    }
+
+    /// The touch preset declines every optional layer in the `Hello` itself —
+    /// asked through the real `into_params` + `hello_features`, not a copy —
+    /// and differs from the default only where it says it does.
+    #[test]
+    fn touch_device_offers_no_audio_tiles_or_monitors() {
+        use directdesk_shared::protocol::features;
+
+        let touch = StreamCaps::touch_device();
+        assert_eq!(
+            touch,
+            StreamCaps {
+                system_audio: false,
+                lossless_tiles: false,
+                multi_monitor: false,
+                preferred_fps: 30,
+                ..StreamCaps::default()
+            }
+        );
+
+        let params = request().into_params(touch);
+        assert_eq!(params.preferred_fps, 30);
+        let bits = params.hello_features(false);
+        assert_eq!(bits & features::SYSTEM_AUDIO, 0, "no audio offer");
+        assert_eq!(bits & features::LOSSLESS_TILES, 0, "no tiles offer");
+        assert_eq!(bits & features::MULTI_MONITOR, 0, "no monitors offer");
+        assert_eq!(bits, 0, "nothing else is offered either");
+        // Pairing stays orthogonal to the caps.
+        assert_eq!(
+            params.hello_features(true),
+            crate::net::FEATURE_PAIRING_REQUEST
+        );
+    }
+
     #[test]
     fn connect_then_disconnect_toggles_active_and_emits_disconnected() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -410,6 +566,54 @@ mod tests {
             last_route = r;
         }
         assert_eq!(last_route, None);
+    }
+
+    /// The handle stops the installed driver from another thread through the
+    /// driver's own shutdown watch, once, and reports when it has exited.
+    #[test]
+    fn the_disconnect_handle_stops_the_installed_driver_from_another_thread() {
+        let handle = DisconnectHandle::default();
+        assert!(!handle.is_running(), "nothing installed");
+        assert!(handle.shut_down().is_none());
+
+        // Stand-in for `run_client`: it owns the only receiver.
+        let (tx, mut rx) = watch::channel(false);
+        handle.install(Some(tx));
+        assert!(handle.is_running());
+
+        let remote = handle.clone();
+        let stopping = std::thread::spawn(move || remote.shut_down())
+            .join()
+            .unwrap()
+            .expect("a running driver was stopped");
+        assert!(*rx.borrow_and_update(), "the driver sees the shutdown");
+        assert!(!handle.is_running(), "asked to stop: no longer running");
+        assert!(handle.shut_down().is_none(), "never asked twice");
+        assert!(!stopping.has_exited());
+        drop(rx); // `run_client` returns
+        assert!(stopping.has_exited());
+    }
+
+    /// The supervisor keeps the handle pointing at exactly the driver it has
+    /// installed: a new one on connect, none after disconnect.
+    #[test]
+    fn the_disconnect_handle_follows_connect_and_disconnect() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_session, mut sup) = supervisor(&rt);
+        let handle = sup.disconnect_handle();
+        sup.connect(request());
+        let first = handle.installed.lock().clone().expect("installed");
+        sup.connect(request());
+        let second = handle.installed.lock().clone().expect("installed");
+        assert!(
+            !first.same_channel(&second),
+            "a reconnect installs a new driver"
+        );
+        assert!(*first.borrow(), "the replaced driver was told to stop");
+        sup.disconnect();
+        assert!(handle.installed.lock().is_none());
+        assert!(!handle.is_running());
+        assert!(handle.shut_down().is_none());
     }
 
     #[test]
